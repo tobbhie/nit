@@ -13,6 +13,16 @@ export type TokenId = string & { readonly __brand: 'TokenId' };
 export type TokenArtworkId = string & { readonly __brand: 'TokenArtworkId' };
 export type MarketSnapshotId = string & { readonly __brand: 'MarketSnapshotId' };
 export type CreatorProfileId = string & { readonly __brand: 'CreatorProfileId' };
+export type SignalId = string & { readonly __brand: 'SignalId' };
+export type EvidenceId = string & { readonly __brand: 'EvidenceId' };
+export type StrategyRunId = string & { readonly __brand: 'StrategyRunId' };
+export type PortfolioId = string & { readonly __brand: 'PortfolioId' };
+export type OrderId = string & { readonly __brand: 'OrderId' };
+export type FillId = string & { readonly __brand: 'FillId' };
+export type PositionId = string & { readonly __brand: 'PositionId' };
+export type AgentRunId = string & { readonly __brand: 'AgentRunId' };
+export type AgentTaskId = string & { readonly __brand: 'AgentTaskId' };
+export type AgentToolCallId = string & { readonly __brand: 'AgentToolCallId' };
 
 /**
  * External identifier types - received from providers
@@ -147,6 +157,52 @@ export function generateMarketSnapshotId(): MarketSnapshotId {
 
 export function generateCreatorProfileId(): CreatorProfileId {
   return uuidv7() as CreatorProfileId;
+}
+
+/**
+ * V2 intelligence, trading, and agent identifiers. These are persisted domain
+ * entities or append-only records, so UUIDv7 keeps their primary-key indexes
+ * local and gives operators a useful creation-order tie-break without making
+ * timestamps implicit authority.
+ */
+export function generateSignalId(): SignalId {
+  return uuidv7() as SignalId;
+}
+
+export function generateEvidenceId(): EvidenceId {
+  return uuidv7() as EvidenceId;
+}
+
+export function generateStrategyRunId(): StrategyRunId {
+  return uuidv7() as StrategyRunId;
+}
+
+export function generatePortfolioId(): PortfolioId {
+  return uuidv7() as PortfolioId;
+}
+
+export function generateOrderId(): OrderId {
+  return uuidv7() as OrderId;
+}
+
+export function generateFillId(): FillId {
+  return uuidv7() as FillId;
+}
+
+export function generatePositionId(): PositionId {
+  return uuidv7() as PositionId;
+}
+
+export function generateAgentRunId(): AgentRunId {
+  return uuidv7() as AgentRunId;
+}
+
+export function generateAgentTaskId(): AgentTaskId {
+  return uuidv7() as AgentTaskId;
+}
+
+export function generateAgentToolCallId(): AgentToolCallId {
+  return uuidv7() as AgentToolCallId;
 }
 
 /**

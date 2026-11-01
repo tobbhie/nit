@@ -86,6 +86,19 @@ importers:
         specifier: ^1.0.0
         version: 1.6.1(@types/node@20.19.43)
 
+  packages/agent-contracts:
+    dependencies:
+      '@nit/domain':
+        specifier: workspace:*
+        version: link:../domain
+    devDependencies:
+      typescript:
+        specifier: ^5.3.0
+        version: 5.9.3
+      vitest:
+        specifier: ^1.0.0
+        version: 1.6.1(@types/node@20.19.43)
+
   packages/composition:
     dependencies:
       '@nit/config':
@@ -292,6 +305,38 @@ importers:
       '@types/pg':
         specifier: ^8.10.9
         version: 8.20.4
+      typescript:
+        specifier: ^5.3.0
+        version: 5.9.3
+      vitest:
+        specifier: ^1.0.0
+        version: 1.6.1(@types/node@20.19.43)
+
+  packages/signals:
+    dependencies:
+      '@nit/domain':
+        specifier: workspace:*
+        version: link:../domain
+      zod:
+        specifier: ^3.22.4
+        version: 3.25.76
+    devDependencies:
+      typescript:
+        specifier: ^5.3.0
+        version: 5.9.3
+      vitest:
+        specifier: ^1.0.0
+        version: 1.6.1(@types/node@20.19.43)
+
+  packages/trading:
+    dependencies:
+      '@nit/domain':
+        specifier: workspace:*
+        version: link:../domain
+      '@nit/signals':
+        specifier: workspace:*
+        version: link:../signals
+    devDependencies:
       typescript:
         specifier: ^5.3.0
         version: 5.9.3
