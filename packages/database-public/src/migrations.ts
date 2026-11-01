@@ -427,6 +427,496 @@ export const MIGRATIONS: readonly Migration[] = [
         ON creator_profiles (chain, launch_count DESC, last_launch_at DESC);
     `,
   },
+  {
+    id: '0013_signals_and_candidate_resolutions',
+    description: 'Immutable normalized signals and candidate-resolution versions',
+    up: `
+      CREATE TABLE IF NOT EXISTS signals (
+        signal_id UUID PRIMARY KEY,
+        source TEXT NOT NULL,
+        source_version TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        chain TEXT NOT NULL,
+        token_mint TEXT,
+        canonical_narrative_id TEXT,
+        occurred_at TIMESTAMPTZ NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        available_at TIMESTAMPTZ NOT NULL,
+        origin_kind TEXT NOT NULL,
+        provider TEXT,
+        reference_id TEXT,
+        transaction_signature TEXT,
+        instruction_index INTEGER,
+        log_index INTEGER,
+        origin_key TEXT NOT NULL,
+        evidence_ids UUID[] NOT NULL DEFAULT '{}'::uuid[],
+        payload JSONB NOT NULL,
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT signals_origin_key UNIQUE (origin_key),
+        CONSTRAINT signals_source_allowed CHECK (
+          source IN ('nit', 'wallet_tracker', 'market')
+          OR source ~ '^plugin:[a-z0-9][a-z0-9_-]*$'
+        ),
+        CONSTRAINT signals_kind_allowed CHECK (
+          kind IN ('narrative', 'wallet_buy', 'wallet_sell', 'market', 'candidate_update')
+        ),
+        CONSTRAINT signals_chain_allowed CHECK (chain = 'solana'),
+        CONSTRAINT signals_instruction_index_nonnegative CHECK (
+          instruction_index IS NULL OR instruction_index >= 0
+        ),
+        CONSTRAINT signals_log_index_nonnegative CHECK (log_index IS NULL OR log_index >= 0),
+        CONSTRAINT signals_time_order CHECK (
+          occurred_at <= observed_at AND observed_at <= available_at
+        ),
+        CONSTRAINT signals_required_subject CHECK (
+          (kind IN ('wallet_buy', 'wallet_sell', 'market') AND token_mint IS NOT NULL)
+          OR
+          (kind IN ('narrative', 'candidate_update') AND canonical_narrative_id IS NOT NULL)
+        ),
+        CONSTRAINT signals_origin_shape CHECK (
+          (
+            origin_kind = 'provider'
+            AND provider IS NOT NULL
+            AND reference_id IS NOT NULL
+            AND transaction_signature IS NULL
+            AND instruction_index IS NULL
+            AND log_index IS NULL
+          )
+          OR
+          (
+            origin_kind = 'chain'
+            AND provider IS NULL
+            AND reference_id IS NULL
+            AND transaction_signature IS NOT NULL
+            AND num_nonnulls(instruction_index, log_index) = 1
+          )
+        )
+      );
+      CREATE INDEX IF NOT EXISTS signals_available_idx ON signals (available_at, signal_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS signals_provider_origin_idx
+        ON signals (provider, reference_id) WHERE origin_kind = 'provider';
+      CREATE UNIQUE INDEX IF NOT EXISTS signals_chain_instruction_origin_idx
+        ON signals (chain, transaction_signature, instruction_index)
+        WHERE origin_kind = 'chain' AND instruction_index IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS signals_chain_log_origin_idx
+        ON signals (chain, transaction_signature, log_index)
+        WHERE origin_kind = 'chain' AND log_index IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS signals_token_idx
+        ON signals (chain, token_mint, available_at) WHERE token_mint IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS signals_narrative_idx
+        ON signals (canonical_narrative_id, available_at)
+        WHERE canonical_narrative_id IS NOT NULL;
+
+      DROP TRIGGER IF EXISTS signals_append_only ON signals;
+      CREATE TRIGGER signals_append_only
+        BEFORE UPDATE OR DELETE ON signals
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+
+      CREATE TABLE IF NOT EXISTS candidate_resolution_events (
+        resolution_id UUID PRIMARY KEY,
+        canonical_narrative_id TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK (version > 0),
+        source_signal_id UUID NOT NULL REFERENCES signals (signal_id),
+        action_state TEXT NOT NULL CHECK (
+          action_state IN ('trade_eligible', 'watch', 'manual_review', 'blocked', 'no_candidate')
+        ),
+        candidates JSONB NOT NULL CHECK (jsonb_typeof(candidates) = 'array'),
+        evidence_ids UUID[] NOT NULL DEFAULT '{}'::uuid[],
+        reason_codes TEXT[] NOT NULL DEFAULT '{}'::text[],
+        occurred_at TIMESTAMPTZ NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        available_at TIMESTAMPTZ NOT NULL,
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT candidate_resolution_version_key UNIQUE (canonical_narrative_id, version),
+        CONSTRAINT candidate_resolution_time_order CHECK (
+          occurred_at <= observed_at AND observed_at <= available_at
+        ),
+        CONSTRAINT candidate_resolution_empty_state CHECK (
+          action_state <> 'no_candidate' OR jsonb_array_length(candidates) = 0
+        )
+      );
+      CREATE INDEX IF NOT EXISTS candidate_resolution_available_idx
+        ON candidate_resolution_events (available_at, resolution_id);
+
+      DROP TRIGGER IF EXISTS candidate_resolution_events_append_only
+        ON candidate_resolution_events;
+      CREATE TRIGGER candidate_resolution_events_append_only
+        BEFORE UPDATE OR DELETE ON candidate_resolution_events
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+    `,
+  },
+  {
+    id: '0014_strategy_registry_and_runs',
+    description: 'Immutable strategy registry with isolated paper runs and portfolios',
+    up: `
+      CREATE TABLE IF NOT EXISTS strategy_entry_versions (
+        entry_version_id UUID PRIMARY KEY,
+        entry_id TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK (version > 0),
+        config JSONB NOT NULL,
+        code_hash CHAR(64) NOT NULL CHECK (code_hash ~ '^[0-9a-f]{64}$'),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT strategy_entry_version_key UNIQUE (entry_id, version)
+      );
+      CREATE TABLE IF NOT EXISTS strategy_exit_versions (
+        exit_version_id UUID PRIMARY KEY,
+        exit_id TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK (version > 0),
+        config JSONB NOT NULL,
+        code_hash CHAR(64) NOT NULL CHECK (code_hash ~ '^[0-9a-f]{64}$'),
+        compatible_entry_ids TEXT[],
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT strategy_exit_version_key UNIQUE (exit_id, version)
+      );
+      CREATE TABLE IF NOT EXISTS strategy_protection_versions (
+        protection_version_id UUID PRIMARY KEY,
+        policy_id TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK (version > 0),
+        config JSONB NOT NULL,
+        code_hash CHAR(64) NOT NULL CHECK (code_hash ~ '^[0-9a-f]{64}$'),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT strategy_protection_version_key UNIQUE (policy_id, version)
+      );
+      CREATE TABLE IF NOT EXISTS strategy_risk_versions (
+        risk_version_id UUID PRIMARY KEY,
+        policy_id TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK (version > 0),
+        config JSONB NOT NULL,
+        code_hash CHAR(64) NOT NULL CHECK (code_hash ~ '^[0-9a-f]{64}$'),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT strategy_risk_version_key UNIQUE (policy_id, version)
+      );
+
+      DROP TRIGGER IF EXISTS strategy_entry_versions_append_only ON strategy_entry_versions;
+      CREATE TRIGGER strategy_entry_versions_append_only
+        BEFORE UPDATE OR DELETE ON strategy_entry_versions
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+      DROP TRIGGER IF EXISTS strategy_exit_versions_append_only ON strategy_exit_versions;
+      CREATE TRIGGER strategy_exit_versions_append_only
+        BEFORE UPDATE OR DELETE ON strategy_exit_versions
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+      DROP TRIGGER IF EXISTS strategy_protection_versions_append_only
+        ON strategy_protection_versions;
+      CREATE TRIGGER strategy_protection_versions_append_only
+        BEFORE UPDATE OR DELETE ON strategy_protection_versions
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+      DROP TRIGGER IF EXISTS strategy_risk_versions_append_only ON strategy_risk_versions;
+      CREATE TRIGGER strategy_risk_versions_append_only
+        BEFORE UPDATE OR DELETE ON strategy_risk_versions
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+
+      CREATE TABLE IF NOT EXISTS strategy_combinations (
+        combination_id UUID PRIMARY KEY,
+        entry_version_id UUID NOT NULL REFERENCES strategy_entry_versions (entry_version_id),
+        exit_version_id UUID NOT NULL REFERENCES strategy_exit_versions (exit_version_id),
+        protection_version_id UUID NOT NULL
+          REFERENCES strategy_protection_versions (protection_version_id),
+        risk_version_id UUID NOT NULL REFERENCES strategy_risk_versions (risk_version_id),
+        display_id TEXT NOT NULL,
+        config_hash CHAR(64) NOT NULL CHECK (config_hash ~ '^[0-9a-f]{64}$'),
+        compatibility_status TEXT NOT NULL CHECK (
+          compatibility_status IN ('compatible', 'incompatible')
+        ),
+        incompatibility_reason_codes TEXT[] NOT NULL DEFAULT '{}'::text[],
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT strategy_combination_versions_key UNIQUE (
+          entry_version_id, exit_version_id, protection_version_id, risk_version_id
+        ),
+        CONSTRAINT strategy_combination_hash_key UNIQUE (combination_id, config_hash),
+        CONSTRAINT strategy_combination_compatibility_reason CHECK (
+          (compatibility_status = 'compatible' AND cardinality(incompatibility_reason_codes) = 0)
+          OR
+          (compatibility_status = 'incompatible' AND cardinality(incompatibility_reason_codes) > 0)
+        )
+      );
+      CREATE INDEX IF NOT EXISTS strategy_combinations_display_idx
+        ON strategy_combinations (display_id);
+
+      CREATE OR REPLACE FUNCTION strategy_combination_validate_compatibility()
+        RETURNS TRIGGER AS $$
+      DECLARE
+        selected_entry_id TEXT;
+        allowed_entry_ids TEXT[];
+        is_compatible BOOLEAN;
+      BEGIN
+        SELECT entry_id INTO selected_entry_id
+          FROM strategy_entry_versions WHERE entry_version_id = NEW.entry_version_id;
+        SELECT compatible_entry_ids INTO allowed_entry_ids
+          FROM strategy_exit_versions WHERE exit_version_id = NEW.exit_version_id;
+        is_compatible := allowed_entry_ids IS NULL OR selected_entry_id = ANY(allowed_entry_ids);
+
+        IF is_compatible <> (NEW.compatibility_status = 'compatible') THEN
+          RAISE EXCEPTION 'combination compatibility status disagrees with the pinned exit policy'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS strategy_combinations_validate_compatibility
+        ON strategy_combinations;
+      CREATE TRIGGER strategy_combinations_validate_compatibility
+        BEFORE INSERT ON strategy_combinations
+        FOR EACH ROW EXECUTE FUNCTION strategy_combination_validate_compatibility();
+
+      DROP TRIGGER IF EXISTS strategy_combinations_append_only ON strategy_combinations;
+      CREATE TRIGGER strategy_combinations_append_only
+        BEFORE UPDATE OR DELETE ON strategy_combinations
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+
+      CREATE OR REPLACE FUNCTION strategy_run_reject_incompatible()
+        RETURNS TRIGGER AS $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM strategy_combinations
+          WHERE combination_id = NEW.combination_id
+            AND config_hash = NEW.config_hash
+            AND compatibility_status = 'compatible'
+        ) THEN
+          RAISE EXCEPTION 'strategy run requires a compatible combination and exact config hash'
+            USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      CREATE TABLE IF NOT EXISTS strategy_runs (
+        run_id UUID PRIMARY KEY,
+        combination_id UUID NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('historical', 'forward_paper')),
+        config_hash CHAR(64) NOT NULL,
+        code_commit_sha TEXT NOT NULL CHECK (length(code_commit_sha) > 0),
+        period_start TIMESTAMPTZ NOT NULL,
+        period_end TIMESTAMPTZ NOT NULL,
+        status TEXT NOT NULL CHECK (
+          status IN ('planned', 'running', 'completed', 'failed', 'cancelled')
+        ),
+        started_at TIMESTAMPTZ,
+        ended_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT strategy_run_period CHECK (period_start <= period_end),
+        CONSTRAINT strategy_run_combination_hash_fk
+          FOREIGN KEY (combination_id, config_hash)
+          REFERENCES strategy_combinations (combination_id, config_hash),
+        CONSTRAINT strategy_run_combination_key UNIQUE (run_id, combination_id)
+      );
+      CREATE INDEX IF NOT EXISTS strategy_runs_status_idx ON strategy_runs (status, created_at);
+
+      CREATE OR REPLACE FUNCTION strategy_run_reject_scope_mutation()
+        RETURNS TRIGGER AS $$
+      BEGIN
+        IF NEW.combination_id IS DISTINCT FROM OLD.combination_id
+          OR NEW.mode IS DISTINCT FROM OLD.mode
+          OR NEW.config_hash IS DISTINCT FROM OLD.config_hash
+          OR NEW.code_commit_sha IS DISTINCT FROM OLD.code_commit_sha
+          OR NEW.period_start IS DISTINCT FROM OLD.period_start
+          OR NEW.period_end IS DISTINCT FROM OLD.period_end THEN
+          RAISE EXCEPTION 'strategy run scope is immutable after creation'
+            USING ERRCODE = 'restrict_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS strategy_runs_scope_immutable ON strategy_runs;
+      CREATE TRIGGER strategy_runs_scope_immutable
+        BEFORE UPDATE ON strategy_runs
+        FOR EACH ROW EXECUTE FUNCTION strategy_run_reject_scope_mutation();
+
+      DROP TRIGGER IF EXISTS strategy_runs_compatible_only ON strategy_runs;
+      CREATE TRIGGER strategy_runs_compatible_only
+        BEFORE INSERT OR UPDATE OF combination_id, config_hash ON strategy_runs
+        FOR EACH ROW EXECUTE FUNCTION strategy_run_reject_incompatible();
+
+      CREATE TABLE IF NOT EXISTS paper_portfolios (
+        portfolio_id UUID PRIMARY KEY,
+        run_id UUID NOT NULL,
+        combination_id UUID NOT NULL,
+        cash_asset TEXT NOT NULL,
+        initial_cash NUMERIC(38, 18) NOT NULL CHECK (initial_cash >= 0),
+        current_cash NUMERIC(38, 18) NOT NULL CHECK (current_cash >= 0),
+        capital_constraints JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT paper_portfolio_run_combination_fk
+          FOREIGN KEY (run_id, combination_id)
+          REFERENCES strategy_runs (run_id, combination_id),
+        CONSTRAINT paper_portfolio_authority_key UNIQUE (run_id, combination_id),
+        CONSTRAINT paper_portfolio_scope_key UNIQUE (
+          portfolio_id, run_id, combination_id
+        )
+      );
+
+      CREATE OR REPLACE FUNCTION paper_portfolio_reject_scope_mutation()
+        RETURNS TRIGGER AS $$
+      BEGIN
+        IF NEW.run_id IS DISTINCT FROM OLD.run_id
+          OR NEW.combination_id IS DISTINCT FROM OLD.combination_id
+          OR NEW.cash_asset IS DISTINCT FROM OLD.cash_asset
+          OR NEW.initial_cash IS DISTINCT FROM OLD.initial_cash
+          OR NEW.capital_constraints IS DISTINCT FROM OLD.capital_constraints THEN
+          RAISE EXCEPTION 'paper portfolio authority and starting scope are immutable'
+            USING ERRCODE = 'restrict_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS paper_portfolios_scope_immutable ON paper_portfolios;
+      CREATE TRIGGER paper_portfolios_scope_immutable
+        BEFORE UPDATE ON paper_portfolios
+        FOR EACH ROW EXECUTE FUNCTION paper_portfolio_reject_scope_mutation();
+    `,
+  },
+  {
+    id: '0015_trading_ledger',
+    description: 'Auditable decisions, orders, fills, positions, and position events',
+    up: `
+      CREATE TABLE IF NOT EXISTS strategy_decisions (
+        decision_id UUID PRIMARY KEY,
+        run_id UUID NOT NULL,
+        portfolio_id UUID NOT NULL,
+        combination_id UUID NOT NULL,
+        source_signal_id UUID NOT NULL REFERENCES signals (signal_id),
+        decision_type TEXT NOT NULL CHECK (
+          decision_type IN ('enter', 'abstain', 'watch', 'review', 'block', 'reduce', 'exit')
+        ),
+        evidence_ids UUID[] NOT NULL DEFAULT '{}'::uuid[],
+        reason_codes TEXT[] NOT NULL DEFAULT '{}'::text[],
+        risk_gate_results JSONB NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        decided_at TIMESTAMPTZ NOT NULL,
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT strategy_decision_portfolio_scope_fk
+          FOREIGN KEY (portfolio_id, run_id, combination_id)
+          REFERENCES paper_portfolios (portfolio_id, run_id, combination_id),
+        CONSTRAINT strategy_decision_idempotency_key UNIQUE (portfolio_id, idempotency_key),
+        CONSTRAINT strategy_decision_scope_key UNIQUE (
+          decision_id, run_id, portfolio_id, combination_id
+        )
+      );
+      CREATE INDEX IF NOT EXISTS strategy_decisions_signal_idx
+        ON strategy_decisions (source_signal_id, decided_at);
+
+      DROP TRIGGER IF EXISTS strategy_decisions_append_only ON strategy_decisions;
+      CREATE TRIGGER strategy_decisions_append_only
+        BEFORE UPDATE OR DELETE ON strategy_decisions
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+
+      CREATE TABLE IF NOT EXISTS orders (
+        order_id UUID PRIMARY KEY,
+        decision_id UUID NOT NULL,
+        run_id UUID NOT NULL,
+        portfolio_id UUID NOT NULL,
+        combination_id UUID NOT NULL,
+        token_mint TEXT NOT NULL,
+        side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
+        quantity_asset TEXT NOT NULL,
+        quantity NUMERIC(38, 18) NOT NULL CHECK (quantity > 0),
+        quote_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT order_decision_scope_fk
+          FOREIGN KEY (decision_id, run_id, portfolio_id, combination_id)
+          REFERENCES strategy_decisions (decision_id, run_id, portfolio_id, combination_id),
+        CONSTRAINT order_idempotency_key UNIQUE (portfolio_id, idempotency_key)
+      );
+      CREATE INDEX IF NOT EXISTS orders_portfolio_idx
+        ON orders (portfolio_id, created_at);
+
+      DROP TRIGGER IF EXISTS orders_append_only ON orders;
+      CREATE TRIGGER orders_append_only
+        BEFORE UPDATE OR DELETE ON orders
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+
+      CREATE TABLE IF NOT EXISTS order_events (
+        order_event_id UUID PRIMARY KEY,
+        order_id UUID NOT NULL REFERENCES orders (order_id),
+        status TEXT NOT NULL CHECK (
+          status IN (
+            'created', 'accepted', 'partially_filled', 'filled',
+            'rejected', 'failed', 'cancelled'
+          )
+        ),
+        detail JSONB,
+        occurred_at TIMESTAMPTZ NOT NULL,
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS order_events_order_idx
+        ON order_events (order_id, occurred_at, order_event_id);
+
+      DROP TRIGGER IF EXISTS order_events_append_only ON order_events;
+      CREATE TRIGGER order_events_append_only
+        BEFORE UPDATE OR DELETE ON order_events
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+
+      CREATE TABLE IF NOT EXISTS order_fills (
+        fill_id UUID PRIMARY KEY,
+        order_id UUID NOT NULL REFERENCES orders (order_id),
+        status TEXT NOT NULL CHECK (status IN ('partially_filled', 'filled')),
+        input_asset TEXT NOT NULL,
+        input_quantity NUMERIC(38, 18) NOT NULL CHECK (input_quantity > 0),
+        output_asset TEXT NOT NULL,
+        output_quantity NUMERIC(38, 18) NOT NULL CHECK (output_quantity > 0),
+        fees JSONB NOT NULL,
+        venue TEXT NOT NULL,
+        transaction_reference TEXT,
+        recorded_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS order_fills_order_idx ON order_fills (order_id, recorded_at);
+
+      DROP TRIGGER IF EXISTS order_fills_append_only ON order_fills;
+      CREATE TRIGGER order_fills_append_only
+        BEFORE UPDATE OR DELETE ON order_fills
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+
+      CREATE TABLE IF NOT EXISTS positions (
+        position_id UUID PRIMARY KEY,
+        portfolio_id UUID NOT NULL REFERENCES paper_portfolios (portfolio_id),
+        token_mint TEXT NOT NULL,
+        original_quantity NUMERIC(38, 18) NOT NULL CHECK (original_quantity > 0),
+        open_quantity NUMERIC(38, 18) NOT NULL CHECK (
+          open_quantity >= 0 AND open_quantity <= original_quantity
+        ),
+        cost_basis NUMERIC(38, 18) NOT NULL CHECK (cost_basis >= 0),
+        high_water_price NUMERIC(38, 18) NOT NULL CHECK (high_water_price >= 0),
+        state TEXT NOT NULL CHECK (
+          state IN ('open', 'partially_closed', 'moonbag', 'closed')
+        ),
+        protection_config JSONB NOT NULL,
+        stop_price NUMERIC(38, 18) CHECK (stop_price >= 0),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL,
+        CONSTRAINT position_portfolio_token_key UNIQUE (portfolio_id, token_mint)
+      );
+
+      CREATE TABLE IF NOT EXISTS position_events (
+        position_event_id UUID PRIMARY KEY,
+        position_id UUID NOT NULL REFERENCES positions (position_id),
+        order_id UUID REFERENCES orders (order_id),
+        fill_id UUID REFERENCES order_fills (fill_id),
+        event_type TEXT NOT NULL CHECK (
+          event_type IN (
+            'opened', 'increased', 'partial_sell', 'moonbag_armed',
+            'stop_changed', 'exit_failed', 'closed'
+          )
+        ),
+        quantity_delta NUMERIC(38, 18) NOT NULL,
+        detail JSONB NOT NULL,
+        occurred_at TIMESTAMPTZ NOT NULL,
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS position_events_position_idx
+        ON position_events (position_id, occurred_at, position_event_id);
+
+      DROP TRIGGER IF EXISTS position_events_append_only ON position_events;
+      CREATE TRIGGER position_events_append_only
+        BEFORE UPDATE OR DELETE ON position_events
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+    `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
@@ -441,6 +931,21 @@ export const REQUIRED_TABLES: readonly string[] = [
   'token_artwork',
   'market_snapshots',
   'creator_profiles',
+  'signals',
+  'candidate_resolution_events',
+  'strategy_entry_versions',
+  'strategy_exit_versions',
+  'strategy_protection_versions',
+  'strategy_risk_versions',
+  'strategy_combinations',
+  'strategy_runs',
+  'paper_portfolios',
+  'strategy_decisions',
+  'orders',
+  'order_events',
+  'order_fills',
+  'positions',
+  'position_events',
 ];
 
 export class Migrator {

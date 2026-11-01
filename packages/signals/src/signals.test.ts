@@ -1,4 +1,9 @@
-import { Chain, ValidationError, type EvidenceId, type SignalId } from '@nit/domain';
+import {
+  Chain,
+  ValidationError,
+  generateEvidenceId,
+  generateSignalId,
+} from '@nit/domain';
 import { describe, expect, it } from 'vitest';
 import { parseSignalEnvelope, signalOriginKey, SignalKind } from '.';
 
@@ -6,7 +11,7 @@ const mint = '11111111111111111111111111111111';
 
 function walletSignal(): Record<string, unknown> {
   return {
-    eventId: 'signal-1' as SignalId,
+    eventId: generateSignalId(),
     source: 'wallet_tracker',
     sourceVersion: '1.0.0',
     kind: SignalKind.WALLET_BUY,
@@ -21,7 +26,7 @@ function walletSignal(): Record<string, unknown> {
       transactionSignature: 'tx-1',
       instructionIndex: 3,
     },
-    evidenceIds: ['evidence-1' as EvidenceId],
+    evidenceIds: [generateEvidenceId()],
     payload: { side: 'buy' },
   };
 }

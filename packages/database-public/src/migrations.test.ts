@@ -271,6 +271,95 @@ describe('market schema', () => {
   });
 });
 
+describe('V2 signal and trading schema', () => {
+  const signals = ddl(
+    MIGRATIONS.find((migration) => migration.id === '0013_signals_and_candidate_resolutions')
+  );
+  const registry = ddl(
+    MIGRATIONS.find((migration) => migration.id === '0014_strategy_registry_and_runs')
+  );
+  const ledger = ddl(MIGRATIONS.find((migration) => migration.id === '0015_trading_ledger'));
+
+  it('preserves source, receipt, and first-usable signal time independently', () => {
+    for (const column of ['occurred_at', 'observed_at', 'available_at']) {
+      expect(signals).toContain(`${column} TIMESTAMPTZ NOT NULL`);
+    }
+    expect(signals).toContain('occurred_at <= observed_at AND observed_at <= available_at');
+    expect(signals).toContain('ON signals (available_at, signal_id)');
+  });
+
+  it('deduplicates exact source occurrences rather than token mints', () => {
+    expect(signals).toContain('UNIQUE (origin_key)');
+    expect(signals).toContain('ON signals (provider, reference_id)');
+    expect(signals).toContain('ON signals (chain, transaction_signature, instruction_index)');
+    expect(signals).toContain('ON signals (chain, transaction_signature, log_index)');
+    expect(signals).not.toContain('UNIQUE (token_mint)');
+    expect(signals).toContain('num_nonnulls(instruction_index, log_index) = 1');
+  });
+
+  it('makes signals and candidate-resolution versions append-only', () => {
+    expect(signals).toContain('BEFORE UPDATE OR DELETE ON signals');
+    expect(signals).toContain('BEFORE UPDATE OR DELETE ON candidate_resolution_events');
+    expect(signals).toContain('UNIQUE (canonical_narrative_id, version)');
+  });
+
+  it('pins four immutable policy versions into every strategy combination', () => {
+    for (const table of [
+      'strategy_entry_versions',
+      'strategy_exit_versions',
+      'strategy_protection_versions',
+      'strategy_risk_versions',
+      'strategy_combinations',
+    ]) {
+      expect(registry).toContain(`BEFORE UPDATE OR DELETE ON ${table}`);
+    }
+    expect(registry).toContain('UNIQUE (combination_id, config_hash)');
+    expect(registry).toContain('strategy_combination_validate_compatibility');
+    expect(registry).toContain('selected_entry_id = ANY(allowed_entry_ids)');
+  });
+
+  it('fails closed on incompatible or live strategy runs', () => {
+    expect(registry).toContain("mode IN ('historical', 'forward_paper')");
+    expect(registry).not.toContain("mode IN ('historical', 'forward_paper', 'live')");
+    expect(registry).toContain("compatibility_status = 'compatible'");
+    expect(registry).toContain('strategy_run_reject_incompatible');
+  });
+
+  it('allows one authoritative paper portfolio for each run and combination', () => {
+    expect(registry).toContain('UNIQUE (run_id, combination_id)');
+    expect(registry).toContain('REFERENCES strategy_runs (run_id, combination_id)');
+    expect(registry).toContain('strategy_run_reject_scope_mutation');
+    expect(registry).toContain('paper_portfolio_reject_scope_mutation');
+  });
+
+  it('stores monetary values as exact numerics throughout the trading ledger', () => {
+    const monetarySchema = `${registry}\n${ledger}`;
+    expect(monetarySchema).toContain('initial_cash NUMERIC(38, 18)');
+    expect(monetarySchema).toContain('quantity NUMERIC(38, 18)');
+    expect(monetarySchema).toContain('input_quantity NUMERIC(38, 18)');
+    expect(monetarySchema).toContain('open_quantity NUMERIC(38, 18)');
+    expect(monetarySchema).not.toMatch(/DOUBLE PRECISION|\bREAL\b|\bFLOAT\b/);
+  });
+
+  it('keeps intents and histories immutable while positions remain a projection', () => {
+    for (const table of [
+      'strategy_decisions',
+      'orders',
+      'order_events',
+      'order_fills',
+      'position_events',
+    ]) {
+      expect(ledger).toContain(`BEFORE UPDATE OR DELETE ON ${table}`);
+    }
+    expect(ledger).not.toContain('BEFORE UPDATE OR DELETE ON positions');
+  });
+
+  it('scopes decision and order idempotency to an isolated portfolio', () => {
+    expect(ledger).toContain('UNIQUE (portfolio_id, idempotency_key)');
+    expect(ledger).toContain('REFERENCES paper_portfolios (portfolio_id, run_id, combination_id)');
+  });
+});
+
 describe('REQUIRED_TABLES', () => {
   it('lists each required table exactly once', () => {
     expect(new Set(REQUIRED_TABLES).size).toBe(REQUIRED_TABLES.length);

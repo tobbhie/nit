@@ -3,6 +3,9 @@ import { z } from 'zod';
 import { SignalEnvelope, SignalKind } from './types';
 
 const SolanaAddressSchema = z.string().regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
+const UuidSchema = z
+  .string()
+  .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
 
 const SignalOriginSchema = z.union([
   z.object({
@@ -31,7 +34,7 @@ const SignalOriginSchema = z.union([
 
 export const SignalEnvelopeSchema = z
   .object({
-    eventId: z.string().min(1),
+    eventId: UuidSchema,
     source: z.string().regex(/^(nit|wallet_tracker|market|plugin:[a-z0-9][a-z0-9_-]*)$/),
     sourceVersion: z.string().min(1),
     kind: z.nativeEnum(SignalKind),
@@ -42,7 +45,7 @@ export const SignalEnvelopeSchema = z
     observedAt: z.date(),
     availableAt: z.date(),
     origin: SignalOriginSchema,
-    evidenceIds: z.array(z.string().min(1)),
+    evidenceIds: z.array(UuidSchema),
     payload: z.unknown(),
   })
   .superRefine((signal, context) => {

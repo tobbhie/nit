@@ -157,6 +157,9 @@ importers:
       '@nit/events':
         specifier: workspace:*
         version: link:../events
+      '@nit/signals':
+        specifier: workspace:*
+        version: link:../signals
       pg:
         specifier: ^8.11.3
         version: 8.22.0

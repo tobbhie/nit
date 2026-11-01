@@ -22,6 +22,7 @@
   "dependencies": {
     "@nit/domain": "workspace:*",
     "@nit/events": "workspace:*",
+    "@nit/signals": "workspace:*",
     "pg": "^8.11.3"
   },
   "devDependencies": {

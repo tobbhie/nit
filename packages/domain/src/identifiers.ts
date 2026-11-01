@@ -15,11 +15,17 @@ export type MarketSnapshotId = string & { readonly __brand: 'MarketSnapshotId' }
 export type CreatorProfileId = string & { readonly __brand: 'CreatorProfileId' };
 export type SignalId = string & { readonly __brand: 'SignalId' };
 export type EvidenceId = string & { readonly __brand: 'EvidenceId' };
+export type CandidateResolutionId = string & { readonly __brand: 'CandidateResolutionId' };
+export type StrategyPolicyVersionId = string & { readonly __brand: 'StrategyPolicyVersionId' };
+export type StrategyCombinationId = string & { readonly __brand: 'StrategyCombinationId' };
 export type StrategyRunId = string & { readonly __brand: 'StrategyRunId' };
 export type PortfolioId = string & { readonly __brand: 'PortfolioId' };
+export type DecisionId = string & { readonly __brand: 'DecisionId' };
 export type OrderId = string & { readonly __brand: 'OrderId' };
+export type OrderEventId = string & { readonly __brand: 'OrderEventId' };
 export type FillId = string & { readonly __brand: 'FillId' };
 export type PositionId = string & { readonly __brand: 'PositionId' };
+export type PositionEventId = string & { readonly __brand: 'PositionEventId' };
 export type AgentRunId = string & { readonly __brand: 'AgentRunId' };
 export type AgentTaskId = string & { readonly __brand: 'AgentTaskId' };
 export type AgentToolCallId = string & { readonly __brand: 'AgentToolCallId' };
@@ -173,6 +179,18 @@ export function generateEvidenceId(): EvidenceId {
   return uuidv7() as EvidenceId;
 }
 
+export function generateCandidateResolutionId(): CandidateResolutionId {
+  return uuidv7() as CandidateResolutionId;
+}
+
+export function generateStrategyPolicyVersionId(): StrategyPolicyVersionId {
+  return uuidv7() as StrategyPolicyVersionId;
+}
+
+export function generateStrategyCombinationId(): StrategyCombinationId {
+  return uuidv7() as StrategyCombinationId;
+}
+
 export function generateStrategyRunId(): StrategyRunId {
   return uuidv7() as StrategyRunId;
 }
@@ -181,8 +199,16 @@ export function generatePortfolioId(): PortfolioId {
   return uuidv7() as PortfolioId;
 }
 
+export function generateDecisionId(): DecisionId {
+  return uuidv7() as DecisionId;
+}
+
 export function generateOrderId(): OrderId {
   return uuidv7() as OrderId;
+}
+
+export function generateOrderEventId(): OrderEventId {
+  return uuidv7() as OrderEventId;
 }
 
 export function generateFillId(): FillId {
@@ -191,6 +217,10 @@ export function generateFillId(): FillId {
 
 export function generatePositionId(): PositionId {
   return uuidv7() as PositionId;
+}
+
+export function generatePositionEventId(): PositionEventId {
+  return uuidv7() as PositionEventId;
 }
 
 export function generateAgentRunId(): AgentRunId {

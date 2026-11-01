@@ -9,6 +9,11 @@ export enum AggregateType {
   TOKEN = 'token',
   MARKET_EVENT = 'market_event',
   ALERT = 'alert',
+  SIGNAL = 'signal',
+  STRATEGY_RUN = 'strategy_run',
+  PORTFOLIO = 'portfolio',
+  ORDER = 'order',
+  POSITION = 'position',
 }
 
 export enum EventType {
@@ -42,6 +47,7 @@ export enum EventType {
   CREATOR_PROFILE_UPDATED = 'token.creator_profile_updated',
   LIQUIDITY_UPDATED = 'token.liquidity_updated',
   MARKET_SNAPSHOT_CREATED = 'token.market_snapshot_created',
+  SIGNAL_PUBLISHED = 'signal.published',
 }
 
 /**
