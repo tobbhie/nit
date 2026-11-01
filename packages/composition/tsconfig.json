@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"],
+  "references": [
+    { "path": "../domain" },
+    { "path": "../config" },
+    { "path": "../database-public" },
+    { "path": "../observability" },
+    { "path": "../observation" },
+    { "path": "../provider-interfaces" },
+    { "path": "../queue" }
+  ]
+}

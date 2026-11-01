@@ -1,0 +1,26 @@
+# Sensitive material must never be committed or retained in this export.
+.env
+.env.*
+!.env.example
+private/
+config/production/
+docs/private/
+*.log
+*.pem
+*.key
+*.p12
+.DS_Store
+coverage/
+dist/
+node_modules/
+
+# Local development guidance and design work are not part of the public source
+# export. Product-facing documentation belongs in README.md.
+docs/
+AGENTS.md
+.agentignore
+
+# Compiler and tool caches are reproducible local artifacts.
+*.tsbuildinfo
+.eslintcache
+

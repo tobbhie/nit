@@ -1,0 +1,64 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "commonjs",
+    "lib": ["ES2023"],
+    "moduleResolution": "node",
+    "types": ["node"],
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "composite": true,
+    "incremental": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "baseUrl": ".",
+    "paths": {
+      "@nit/domain": ["packages/domain/src"],
+      "@nit/config": ["packages/config/src"],
+      "@nit/database-public": ["packages/database-public/src"],
+      // Mapped explicitly because moduleResolution is "node", which predates
+      // package `exports` maps and so cannot follow the subpath on its own.
+      // Runtime resolution does honour the export map, so this only teaches the
+      // compiler what Node and vitest already work out for themselves.
+      "@nit/database-public/testing": ["packages/database-public/src/testing"],
+      "@nit/events": ["packages/events/src"],
+      "@nit/queue": ["packages/queue/src"],
+      "@nit/observation": ["packages/observation/src"],
+      "@nit/market": ["packages/market/src"],
+      "@nit/observability": ["packages/observability/src"],
+      "@nit/composition": ["packages/composition/src"],
+      "@nit/provider-interfaces": ["packages/provider-interfaces/src"]
+    }
+  },
+  "files": [],
+  "include": [],
+  "references": [
+    { "path": "packages/domain" },
+    { "path": "packages/config" },
+    { "path": "packages/events" },
+    { "path": "packages/database-public" },
+    { "path": "packages/queue" },
+    { "path": "packages/observability" },
+    { "path": "packages/provider-interfaces" },
+    { "path": "packages/observation" },
+    { "path": "packages/market" },
+    { "path": "packages/composition" },
+    { "path": "apps/ingestion-worker" },
+    { "path": "apps/control-api" }
+  ],
+  "exclude": ["node_modules", "dist", "**/dist", "**/node_modules"]
+}

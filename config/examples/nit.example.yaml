@@ -1,0 +1,13 @@
+# Fake development values only. Do not copy production values here.
+environment: development
+database:
+  url: "postgresql://nit_dev:nit_dev@localhost:5432/nit_dev"
+telegram:
+  token: "FAKE_TELEGRAM_TOKEN"
+  default_chat_id: "000000000"
+providers:
+  social:
+    enabled: false
+intelligence:
+  implementation: toy
+

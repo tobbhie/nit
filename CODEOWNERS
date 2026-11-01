@@ -1,0 +1,9 @@
+# Security-boundary review is required before any merge or export.
+* @tobbhie
+/AGENTS.md @tobbhie
+/.agentignore @tobbhie
+/.gitignore @tobbhie
+/CODEOWNERS @tobbhie
+/scripts/verify-boundaries.ps1 @tobbhie
+/scripts/scan-agent-export.ps1 @tobbhie
+

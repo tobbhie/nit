@@ -1,0 +1,27 @@
+{
+  // NOT INHERITED BY ANYTHING. Every package extends ../../tsconfig.json
+  // directly, so nothing in this file takes effect. It is kept only as the
+  // record of one deferred decision.
+  //
+  // Everything here that is compatible with the live CommonJS build has been
+  // folded into tsconfig.json: ES2023 target and lib, types, isolatedModules,
+  // noImplicitOverride, noFallthroughCasesInSwitch, noUnusedLocals and
+  // noUnusedParameters. All of those passed with zero errors, so the repo now
+  // actually enforces the strictness this file only described.
+  //
+  // What is left is the module system. verbatimModuleSyntax requires ESM
+  // ("module": "NodeNext" plus "type": "module" in every package.json); under
+  // the current "module": "commonjs" it rejects every import statement in the
+  // repo (TS1295). That migration also forces explicit file extensions on
+  // relative imports and `import type` on every type-only import, so it touches
+  // every source file and is a change to make deliberately, not as a side
+  // effect of a config tidy-up.
+  //
+  // Once that migration happens, delete this file and move these settings into
+  // tsconfig.json. If it is abandoned, delete this file anyway.
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "verbatimModuleSyntax": true
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@nit/observation",
+  "version": "0.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@nit/database-public": "workspace:*",
+    "@nit/domain": "workspace:*",
+    "@nit/events": "workspace:*",
+    "@nit/provider-interfaces": "workspace:*",
+    "@nit/queue": "workspace:*",
+    "pg": "^8.11.3",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.10.9",
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0"
+  }
+}
