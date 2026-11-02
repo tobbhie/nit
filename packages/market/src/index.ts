@@ -26,3 +26,4 @@ export * from './enrichment-repository';
 export * from './enrichment-handlers';
 export * from './synthetic-enrichment';
 export * from './lifecycle';
+export * from './reconciliation';

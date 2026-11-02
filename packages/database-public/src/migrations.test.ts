@@ -387,6 +387,23 @@ describe('token market lifecycle schema', () => {
   });
 });
 
+describe('Solana reconciliation cursor schema', () => {
+  const cursor = ddl(
+    MIGRATIONS.find((migration) => migration.id === '0017_solana_reconciliation_cursors')
+  );
+
+  it('keys one finalized-slot watermark per launch feed', () => {
+    expect(cursor).toContain('CREATE TABLE IF NOT EXISTS solana_reconciliation_cursors');
+    expect(cursor).toContain('PRIMARY KEY (chain, launch_source)');
+    expect(cursor).toContain('finalized_slot BIGINT NOT NULL');
+  });
+
+  it('rejects a cursor regression in PostgreSQL', () => {
+    expect(cursor).toContain('reject_solana_cursor_regression');
+    expect(cursor).toContain('NEW.finalized_slot < OLD.finalized_slot');
+  });
+});
+
 describe('REQUIRED_TABLES', () => {
   it('lists each required table exactly once', () => {
     expect(new Set(REQUIRED_TABLES).size).toBe(REQUIRED_TABLES.length);

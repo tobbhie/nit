@@ -1070,6 +1070,38 @@ export const MIGRATIONS: readonly Migration[] = [
         FOR EACH ROW EXECUTE FUNCTION reject_mutation();
     `,
   },
+  {
+    id: '0017_solana_reconciliation_cursors',
+    description: 'Monotonic finalized-slot cursors for Solana launch reconciliation',
+    up: `
+      CREATE TABLE IF NOT EXISTS solana_reconciliation_cursors (
+        chain TEXT NOT NULL CHECK (chain = 'solana'),
+        launch_source TEXT NOT NULL CHECK (launch_source IN ('pump_fun', 'pumpswap')),
+        finalized_slot BIGINT NOT NULL CHECK (finalized_slot >= 0),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT solana_reconciliation_cursor_key PRIMARY KEY (chain, launch_source)
+      );
+
+      CREATE OR REPLACE FUNCTION reject_solana_cursor_regression()
+        RETURNS TRIGGER AS $$
+      BEGIN
+        IF NEW.chain IS DISTINCT FROM OLD.chain
+          OR NEW.launch_source IS DISTINCT FROM OLD.launch_source
+          OR NEW.finalized_slot < OLD.finalized_slot THEN
+          RAISE EXCEPTION 'Solana reconciliation cursor cannot regress or change identity'
+            USING ERRCODE = 'restrict_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS solana_reconciliation_cursor_monotonic
+        ON solana_reconciliation_cursors;
+      CREATE TRIGGER solana_reconciliation_cursor_monotonic
+        BEFORE UPDATE ON solana_reconciliation_cursors
+        FOR EACH ROW EXECUTE FUNCTION reject_solana_cursor_regression();
+    `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
@@ -1082,6 +1114,7 @@ export const REQUIRED_TABLES: readonly string[] = [
   'media',
   'tokens',
   'token_markets',
+  'solana_reconciliation_cursors',
   'token_artwork',
   'market_snapshots',
   'creator_profiles',
