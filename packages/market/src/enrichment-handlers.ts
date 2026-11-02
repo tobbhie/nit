@@ -1,5 +1,6 @@
 import {
   Chain,
+  MarketVenue,
   QueueName,
   Result,
   Timestamp,
@@ -59,6 +60,7 @@ import { EnrichmentTransactor } from './unit-of-work';
  */
 
 const CHAINS = new Set<string>(Object.values(Chain));
+const MARKET_VENUES = new Set<string>(Object.values(MarketVenue));
 
 export interface EnrichmentHandlerOptions {
   /** Recorded on every event as its origin. */
@@ -82,6 +84,7 @@ export interface ArtworkEnrichmentSummary {
 /** What one market job did. */
 export interface MarketEnrichmentSummary {
   tokenId: string;
+  venue: MarketVenue;
   source: string;
   observedAt: string;
   /** False when this exact observation was already stored. */
@@ -107,9 +110,7 @@ export interface CreatorEnrichmentSummary {
  */
 function requireVersion(job: Job<unknown>, expected: string, queue: string): void {
   if (job.payloadVersion !== expected) {
-    throw new PermanentJobFailure(
-      `Unsupported ${queue} payload version '${job.payloadVersion}'`
-    );
+    throw new PermanentJobFailure(`Unsupported ${queue} payload version '${job.payloadVersion}'`);
   }
 }
 
@@ -138,6 +139,13 @@ function requireChain(chain: Chain, queue: string): Chain {
     throw new PermanentJobFailure(`${queue} payload has unknown chain '${String(chain)}'`);
   }
   return chain;
+}
+
+function requireMarketVenue(venue: MarketVenue, queue: string): MarketVenue {
+  if (!MARKET_VENUES.has(venue)) {
+    throw new PermanentJobFailure(`${queue} payload has unknown venue '${String(venue)}'`);
+  }
+  return venue;
 }
 
 /**
@@ -251,9 +259,7 @@ export class ArtworkEnrichmentHandler implements JobHandler<TokenArtworkPayload>
    * Separate from `handle` so the work can be exercised without a job envelope, and
    * so the summary is a return value rather than something only a log sees.
    */
-  async enrich(
-    payload: TokenArtworkPayload
-  ): Promise<Result<ArtworkEnrichmentSummary, Error>> {
+  async enrich(payload: TokenArtworkPayload): Promise<Result<ArtworkEnrichmentSummary, Error>> {
     const queue = QueueName.TOKEN_ARTWORK;
     const tokenId = requireText(payload.tokenId, 'tokenId', queue);
     const sourceUrl = requireText(payload.artworkUrl, 'artworkUrl', queue);
@@ -369,9 +375,10 @@ export class MarketEnrichmentHandler implements JobHandler<TokenLiquidityPayload
     const tokenId = requireText(payload.tokenId, 'tokenId', queue);
     const address = requireText(payload.address, 'address', queue);
     const chain = requireChain(payload.chain, queue);
+    const venue = requireMarketVenue(payload.venue, queue);
 
     // Outside the transaction, for the reason the artwork handler gives.
-    const fetched = await this.provider.fetchSnapshot({ chain, address });
+    const fetched = await this.provider.fetchSnapshot({ chain, address, venue });
     if (fetched.kind === 'failure') {
       return failure(fetched.error);
     }
@@ -384,7 +391,7 @@ export class MarketEnrichmentHandler implements JobHandler<TokenLiquidityPayload
       // Read before writing. After the insert this token's newest snapshot is the one
       // just stored, and comparing a reading against itself would report that
       // liquidity never moves.
-      const latest = await snapshots.findLatest(typedTokenId, source);
+      const latest = await snapshots.findLatest(typedTokenId, venue, source);
       if (latest.kind === 'failure') {
         return failure(latest.error);
       }
@@ -393,6 +400,7 @@ export class MarketEnrichmentHandler implements JobHandler<TokenLiquidityPayload
       const inserted = await snapshots.insert({
         snapshotId: generateMarketSnapshotId(),
         tokenId: typedTokenId,
+        venue,
         observedAt: reading.observedAt,
         source,
         ...pickMetrics(reading),
@@ -404,6 +412,7 @@ export class MarketEnrichmentHandler implements JobHandler<TokenLiquidityPayload
 
       const summary: MarketEnrichmentSummary = {
         tokenId,
+        venue,
         source,
         observedAt: reading.observedAt.toISOString(),
         stored: inserted.value.inserted,
@@ -422,6 +431,7 @@ export class MarketEnrichmentHandler implements JobHandler<TokenLiquidityPayload
         marketSnapshotCreatedEvent({
           tokenId: typedTokenId,
           snapshotId,
+          venue,
           source,
           observedAt: reading.observedAt,
           ...pickMetrics(reading),
@@ -451,6 +461,7 @@ export class MarketEnrichmentHandler implements JobHandler<TokenLiquidityPayload
         liquidityUpdatedEvent({
           tokenId: typedTokenId,
           snapshotId,
+          venue,
           source,
           observedAt: reading.observedAt,
           ...optional('previousLiquidityUsd', previous.liquidityUsd),
@@ -522,9 +533,7 @@ export class CreatorEnrichmentHandler implements JobHandler<TokenCreatorPayload>
         // triggered it was committed in the same transaction that enqueued this job,
         // so its absence is not a race — it is a payload that does not describe
         // anything, and it will not start describing something on a retry.
-        throw new PermanentJobFailure(
-          `No launches found for creator ${chain}/${creatorWallet}`
-        );
+        throw new PermanentJobFailure(`No launches found for creator ${chain}/${creatorWallet}`);
       }
       const computed = stats.value;
 

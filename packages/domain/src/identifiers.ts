@@ -10,6 +10,7 @@ export type CorrelationId = string & { readonly __brand: 'CorrelationId' };
 export type ObservationId = string & { readonly __brand: 'ObservationId' };
 export type MediaId = string & { readonly __brand: 'MediaId' };
 export type TokenId = string & { readonly __brand: 'TokenId' };
+export type TokenMarketId = string & { readonly __brand: 'TokenMarketId' };
 export type TokenArtworkId = string & { readonly __brand: 'TokenArtworkId' };
 export type MarketSnapshotId = string & { readonly __brand: 'MarketSnapshotId' };
 export type CreatorProfileId = string & { readonly __brand: 'CreatorProfileId' };
@@ -151,6 +152,10 @@ export function generateMediaId(): MediaId {
  */
 export function generateTokenId(): TokenId {
   return uuidv7() as TokenId;
+}
+
+export function generateTokenMarketId(): TokenMarketId {
+  return uuidv7() as TokenMarketId;
 }
 
 export function generateTokenArtworkId(): TokenArtworkId {

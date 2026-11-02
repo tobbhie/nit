@@ -3,17 +3,24 @@ import {
   CreatorProfileId,
   JobStatus,
   LaunchSource,
+  MarketVenue,
   Result,
   Timestamp,
   TokenArtworkId,
   TokenId,
+  TokenMarketId,
   failure,
   generateJobId,
   success,
 } from '@nit/domain';
 import { EventEnvelope, EventStore } from '@nit/events';
 import { EnqueueRequest, Job } from '@nit/queue';
-import { LaunchFetchRequest, LaunchSourceAdapter, SourceTokenLaunch } from './contracts';
+import {
+  LaunchFetchRequest,
+  LaunchSourceAdapter,
+  SourceTokenLaunch,
+  SourceTokenMarket,
+} from './contracts';
 import {
   JobEnqueuer,
   MarketDataAdapter,
@@ -36,6 +43,7 @@ import {
 import { NormalizedTokenLaunch } from './normalize';
 import { TokenInsertOutcome, TokenRepository, TokenSearch } from './repository';
 import { LaunchOrigin } from './service';
+import { OpenTokenMarket, TokenMarketInterval, TokenMarketRepository } from './lifecycle';
 import { Token } from './types';
 import {
   DiscoveryUnitOfWork,
@@ -69,6 +77,7 @@ export interface LaunchOverrides {
   creatorWallet?: string;
   description?: string;
   artworkUrl?: string;
+  market?: SourceTokenMarket;
 }
 
 /**
@@ -100,6 +109,9 @@ export function launch(overrides: LaunchOverrides = {}): SourceTokenLaunch {
   if (overrides.artworkUrl !== undefined) {
     built.artworkUrl = overrides.artworkUrl;
   }
+  if (overrides.market !== undefined) {
+    built.market = overrides.market;
+  }
   return built;
 }
 
@@ -109,6 +121,7 @@ export function launch(overrides: LaunchOverrides = {}): SourceTokenLaunch {
  */
 export class Store {
   tokens = new Map<string, NormalizedTokenLaunch>();
+  markets: TokenMarketInterval[] = [];
   events: EventEnvelope[] = [];
   /** Keyed by token, matching `token_artwork`'s UNIQUE (token_id). */
   artwork = new Map<string, TokenArtwork>();
@@ -138,9 +151,7 @@ export class InMemoryTokenRepository implements TokenRepository {
     }
 
     this.store.tokens.set(key, token);
-    return Promise.resolve(
-      success<TokenInsertOutcome>({ inserted: true, tokenId: token.tokenId })
-    );
+    return Promise.resolve(success<TokenInsertOutcome>({ inserted: true, tokenId: token.tokenId }));
   }
 
   findById(tokenId: TokenId): Promise<Result<Token | null, Error>> {
@@ -193,6 +204,92 @@ export class InMemoryTokenRepository implements TokenRepository {
       .slice(0, criteria.limit)
       .map(toToken);
     return Promise.resolve(success(matches));
+  }
+}
+
+export class InMemoryTokenMarketRepository implements TokenMarketRepository {
+  constructor(private readonly store: Store) {}
+
+  open(
+    input: OpenTokenMarket
+  ): Promise<Result<{ inserted: boolean; tokenMarketId: TokenMarketId }, Error>> {
+    const existing = this.byOrigin(input);
+    if (existing !== undefined) {
+      return Promise.resolve(success({ inserted: false, tokenMarketId: existing.tokenMarketId }));
+    }
+    if (
+      this.store.markets.some(
+        (market) => market.tokenId === input.tokenId && market.activeUntil === undefined
+      )
+    ) {
+      return Promise.resolve(
+        failure(new Error(`Token ${input.tokenId} already has an active market`))
+      );
+    }
+    const interval: TokenMarketInterval = {
+      ...input,
+      recordedAt: DISCOVERED,
+    };
+    this.store.markets.push(interval);
+    return Promise.resolve(success({ inserted: true, tokenMarketId: input.tokenMarketId }));
+  }
+
+  transition(
+    input: OpenTokenMarket
+  ): Promise<Result<{ inserted: boolean; tokenMarketId: TokenMarketId }, Error>> {
+    const existing = this.byOrigin(input);
+    if (existing !== undefined) {
+      return Promise.resolve(success({ inserted: false, tokenMarketId: existing.tokenMarketId }));
+    }
+    const currentIndex = this.store.markets.findIndex(
+      (market) => market.tokenId === input.tokenId && market.activeUntil === undefined
+    );
+    const current = this.store.markets[currentIndex];
+    if (current === undefined || current.activeFrom.getTime() >= input.activeFrom.getTime()) {
+      return Promise.resolve(
+        failure(new Error(`Token ${input.tokenId} has no earlier active market to transition`))
+      );
+    }
+    this.store.markets[currentIndex] = { ...current, activeUntil: input.activeFrom };
+    return this.open(input);
+  }
+
+  findCurrent(tokenId: TokenId): Promise<Result<TokenMarketInterval | null, Error>> {
+    return Promise.resolve(
+      success(
+        this.store.markets.find(
+          (market) => market.tokenId === tokenId && market.activeUntil === undefined
+        ) ?? null
+      )
+    );
+  }
+
+  findAt(tokenId: TokenId, at: Timestamp): Promise<Result<TokenMarketInterval | null, Error>> {
+    return Promise.resolve(
+      success(
+        this.store.markets.find(
+          (market) =>
+            market.tokenId === tokenId &&
+            market.activeFrom.getTime() <= at.getTime() &&
+            (market.activeUntil === undefined || at.getTime() < market.activeUntil.getTime())
+        ) ?? null
+      )
+    );
+  }
+
+  list(tokenId: TokenId): Promise<Result<TokenMarketInterval[], Error>> {
+    return Promise.resolve(
+      success(
+        this.store.markets
+          .filter((market) => market.tokenId === tokenId)
+          .sort((left, right) => left.activeFrom.getTime() - right.activeFrom.getTime())
+      )
+    );
+  }
+
+  private byOrigin(input: OpenTokenMarket): TokenMarketInterval | undefined {
+    const key = JSON.stringify(input.origin);
+    return this.store.markets.find((market) => JSON.stringify(market.origin) === key);
   }
 }
 
@@ -358,7 +455,7 @@ export class InMemoryTokenArtworkRepository implements TokenArtworkRepository {
   }
 }
 
-/** Mirrors `market_snapshots`: append-only, unique on token + source + observation. */
+/** Mirrors `market_snapshots`: append-only, unique on token + venue + source + observation. */
 export class InMemoryMarketSnapshotRepository implements MarketSnapshotRepository {
   constructor(private readonly store: Store) {}
 
@@ -366,6 +463,7 @@ export class InMemoryMarketSnapshotRepository implements MarketSnapshotRepositor
     const existing = this.store.snapshots.find(
       (row) =>
         row.tokenId === snapshot.tokenId &&
+        row.venue === snapshot.venue &&
         row.source === snapshot.source &&
         row.observedAt.getTime() === snapshot.observedAt.getTime()
     );
@@ -379,6 +477,7 @@ export class InMemoryMarketSnapshotRepository implements MarketSnapshotRepositor
     const stored: MarketSnapshot = {
       snapshotId: snapshot.snapshotId,
       tokenId: snapshot.tokenId,
+      venue: snapshot.venue,
       observedAt: snapshot.observedAt,
       source: snapshot.source,
       recordedAt: DISCOVERED,
@@ -405,8 +504,14 @@ export class InMemoryMarketSnapshotRepository implements MarketSnapshotRepositor
     );
   }
 
-  findLatest(tokenId: TokenId, source: string): Promise<Result<MarketSnapshot | null, Error>> {
-    const matches = this.forToken(tokenId).filter((row) => row.source === source);
+  findLatest(
+    tokenId: TokenId,
+    venue: MarketVenue,
+    source: string
+  ): Promise<Result<MarketSnapshot | null, Error>> {
+    const matches = this.forToken(tokenId).filter(
+      (row) => row.venue === venue && row.source === source
+    );
     return Promise.resolve(success(matches[0] ?? null));
   }
 
@@ -465,10 +570,7 @@ export class InMemoryCreatorProfileRepository implements CreatorProfileRepositor
     return Promise.resolve(success(stored.creatorProfileId));
   }
 
-  findByWallet(
-    chain: Chain,
-    creatorWallet: string
-  ): Promise<Result<CreatorProfile | null, Error>> {
+  findByWallet(chain: Chain, creatorWallet: string): Promise<Result<CreatorProfile | null, Error>> {
     return Promise.resolve(
       success(this.store.profiles.get(this.store.key(chain, creatorWallet)) ?? null)
     );
@@ -498,6 +600,7 @@ export class FakeUnitOfWork implements UnitOfWork {
 
     const result = await work({
       tokens: new InMemoryTokenRepository(this.store),
+      markets: new InMemoryTokenMarketRepository(this.store),
       events: new InMemoryEventStore(this.store, this.appendFails),
       jobs: new InMemoryJobEnqueuer(this.store, this.enqueueFails),
     });
@@ -558,6 +661,7 @@ export class FakeEnrichmentUnitOfWork implements EnrichmentTransactor {
 
 interface StoreSnapshot {
   tokens: Map<string, NormalizedTokenLaunch>;
+  markets: TokenMarketInterval[];
   events: EventEnvelope[];
   artwork: Map<string, TokenArtwork>;
   snapshots: MarketSnapshot[];
@@ -574,6 +678,7 @@ interface StoreSnapshot {
 function snapshotOf(store: Store): StoreSnapshot {
   return {
     tokens: new Map(store.tokens),
+    markets: [...store.markets],
     events: [...store.events],
     artwork: new Map(store.artwork),
     snapshots: [...store.snapshots],
@@ -584,6 +689,7 @@ function snapshotOf(store: Store): StoreSnapshot {
 
 function restore(store: Store, snapshot: StoreSnapshot): void {
   store.tokens = snapshot.tokens;
+  store.markets = snapshot.markets;
   store.events = snapshot.events;
   store.artwork = snapshot.artwork;
   store.snapshots = snapshot.snapshots;

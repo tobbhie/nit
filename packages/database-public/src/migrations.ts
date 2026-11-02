@@ -917,6 +917,159 @@ export const MIGRATIONS: readonly Migration[] = [
         FOR EACH ROW EXECUTE FUNCTION reject_mutation();
     `,
   },
+  {
+    id: '0016_token_market_lifecycle',
+    description: 'Venue-aware token lifecycle and market snapshots',
+    up: `
+      CREATE TABLE IF NOT EXISTS token_markets (
+        token_market_id UUID PRIMARY KEY,
+        token_id UUID NOT NULL REFERENCES tokens (token_id),
+        venue TEXT NOT NULL CHECK (venue IN ('pump_fun_bonding_curve', 'pumpswap')),
+        market_address TEXT,
+        active_from TIMESTAMPTZ NOT NULL,
+        active_until TIMESTAMPTZ,
+        source_event_kind TEXT NOT NULL CHECK (source_event_kind IN ('chain', 'legacy')),
+        source_event_key TEXT NOT NULL,
+        transaction_signature TEXT,
+        instruction_index INTEGER,
+        log_index INTEGER,
+        slot BIGINT,
+        provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT token_markets_source_event_key UNIQUE (source_event_key),
+        CONSTRAINT token_markets_interval_valid CHECK (
+          active_until IS NULL OR active_until > active_from
+        ),
+        CONSTRAINT token_markets_instruction_index_nonnegative CHECK (
+          instruction_index IS NULL OR instruction_index >= 0
+        ),
+        CONSTRAINT token_markets_log_index_nonnegative CHECK (
+          log_index IS NULL OR log_index >= 0
+        ),
+        CONSTRAINT token_markets_slot_nonnegative CHECK (slot IS NULL OR slot >= 0),
+        CONSTRAINT token_markets_source_shape CHECK (
+          (
+            source_event_kind = 'chain'
+            AND transaction_signature IS NOT NULL
+            AND market_address IS NOT NULL
+            AND num_nonnulls(instruction_index, log_index) = 1
+            AND slot IS NOT NULL
+          )
+          OR
+          (
+            source_event_kind = 'legacy'
+            AND transaction_signature IS NULL
+            AND instruction_index IS NULL
+            AND log_index IS NULL
+            AND slot IS NULL
+          )
+        ),
+        CONSTRAINT token_markets_interval_key UNIQUE (
+          token_id, venue, market_address, active_from
+        )
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS token_markets_current_idx
+        ON token_markets (token_id) WHERE active_until IS NULL;
+      CREATE INDEX IF NOT EXISTS token_markets_timeline_idx
+        ON token_markets (token_id, active_from DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS token_markets_chain_instruction_idx
+        ON token_markets (transaction_signature, instruction_index)
+        WHERE source_event_kind = 'chain' AND instruction_index IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS token_markets_chain_log_idx
+        ON token_markets (transaction_signature, log_index)
+        WHERE source_event_kind = 'chain' AND log_index IS NOT NULL;
+
+      -- Existing token rows predate source-occurrence capture. Preserve that fact
+      -- explicitly as legacy provenance rather than manufacturing a chain identity.
+      INSERT INTO token_markets (
+        token_market_id, token_id, venue, market_address, active_from,
+        source_event_kind, source_event_key, provenance
+      )
+      SELECT token_id,
+             token_id,
+             CASE launch_source
+               WHEN 'pump_fun' THEN 'pump_fun_bonding_curve'
+               ELSE 'pumpswap'
+             END,
+             NULL::TEXT,
+             launch_time,
+             'legacy',
+             'legacy:token:' || token_id::text,
+             jsonb_build_object('migration', '0016_token_market_lifecycle')
+        FROM tokens
+      ON CONFLICT (source_event_key) DO NOTHING;
+
+      CREATE OR REPLACE FUNCTION token_market_allow_close_only()
+        RETURNS TRIGGER AS $$
+      BEGIN
+        IF TG_OP = 'DELETE' THEN
+          RAISE EXCEPTION 'token market intervals cannot be deleted'
+            USING ERRCODE = 'restrict_violation';
+        END IF;
+        IF OLD.active_until IS NOT NULL
+          OR NEW.active_until IS NULL
+          OR NEW.active_until <= OLD.active_from
+          OR NEW.token_market_id IS DISTINCT FROM OLD.token_market_id
+          OR NEW.token_id IS DISTINCT FROM OLD.token_id
+          OR NEW.venue IS DISTINCT FROM OLD.venue
+          OR NEW.market_address IS DISTINCT FROM OLD.market_address
+          OR NEW.active_from IS DISTINCT FROM OLD.active_from
+          OR NEW.source_event_kind IS DISTINCT FROM OLD.source_event_kind
+          OR NEW.source_event_key IS DISTINCT FROM OLD.source_event_key
+          OR NEW.transaction_signature IS DISTINCT FROM OLD.transaction_signature
+          OR NEW.instruction_index IS DISTINCT FROM OLD.instruction_index
+          OR NEW.log_index IS DISTINCT FROM OLD.log_index
+          OR NEW.slot IS DISTINCT FROM OLD.slot
+          OR NEW.provenance IS DISTINCT FROM OLD.provenance
+          OR NEW.recorded_at IS DISTINCT FROM OLD.recorded_at THEN
+          RAISE EXCEPTION 'token market intervals may only be closed once'
+            USING ERRCODE = 'restrict_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS token_markets_close_only ON token_markets;
+      CREATE TRIGGER token_markets_close_only
+        BEFORE UPDATE OR DELETE ON token_markets
+        FOR EACH ROW EXECUTE FUNCTION token_market_allow_close_only();
+
+      DROP TRIGGER IF EXISTS market_snapshots_append_only ON market_snapshots;
+      ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS venue TEXT;
+      UPDATE market_snapshots AS snapshot
+         SET venue = (
+          SELECT venue
+            FROM token_markets
+           WHERE token_id = snapshot.token_id
+             AND active_from <= snapshot.observed_at
+             AND (active_until IS NULL OR snapshot.observed_at < active_until)
+           ORDER BY active_from DESC
+           LIMIT 1
+         )
+       WHERE snapshot.venue IS NULL;
+      UPDATE market_snapshots AS snapshot
+         SET venue = (
+          SELECT venue
+            FROM token_markets
+           WHERE token_id = snapshot.token_id
+           ORDER BY active_from DESC
+           LIMIT 1
+         )
+       WHERE snapshot.venue IS NULL;
+      ALTER TABLE market_snapshots ALTER COLUMN venue SET NOT NULL;
+      ALTER TABLE market_snapshots DROP CONSTRAINT IF EXISTS market_snapshots_venue_allowed;
+      ALTER TABLE market_snapshots ADD CONSTRAINT market_snapshots_venue_allowed
+        CHECK (venue IN ('pump_fun_bonding_curve', 'pumpswap'));
+      ALTER TABLE market_snapshots DROP CONSTRAINT IF EXISTS market_snapshots_observation_key;
+      ALTER TABLE market_snapshots ADD CONSTRAINT market_snapshots_observation_key
+        UNIQUE (token_id, venue, source, observed_at);
+      CREATE INDEX IF NOT EXISTS market_snapshots_venue_timeline_idx
+        ON market_snapshots (token_id, venue, observed_at DESC);
+      CREATE TRIGGER market_snapshots_append_only
+        BEFORE UPDATE OR DELETE ON market_snapshots
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+    `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
@@ -928,6 +1081,7 @@ export const REQUIRED_TABLES: readonly string[] = [
   'observations',
   'media',
   'tokens',
+  'token_markets',
   'token_artwork',
   'market_snapshots',
   'creator_profiles',
@@ -964,18 +1118,17 @@ export class Migrator {
 
     for (const migration of MIGRATIONS) {
       const outcome = await this.db.transaction(async (client) => {
-        const existing = await client.query(
-          'SELECT id FROM schema_migrations WHERE id = $1',
-          [migration.id]
-        );
+        const existing = await client.query('SELECT id FROM schema_migrations WHERE id = $1', [
+          migration.id,
+        ]);
         if (existing.rowCount !== null && existing.rowCount > 0) {
           return false;
         }
         await client.query(migration.up);
-        await client.query(
-          'INSERT INTO schema_migrations (id, description) VALUES ($1, $2)',
-          [migration.id, migration.description]
-        );
+        await client.query('INSERT INTO schema_migrations (id, description) VALUES ($1, $2)', [
+          migration.id,
+          migration.description,
+        ]);
         return true;
       });
 

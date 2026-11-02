@@ -6,6 +6,7 @@ import {
   CreatorProfileId,
   EventType,
   MarketSnapshotId,
+  MarketVenue,
   Timestamp,
   TokenArtworkId,
   TokenId,
@@ -150,6 +151,7 @@ export function tokenArtworkProcessedEvent(
 export interface MarketSnapshotCreatedPayload {
   tokenId: string;
   snapshotId: string;
+  venue: MarketVenue;
   /** The provider that answered. Part of the snapshot's identity. */
   source: string;
   observedAt: string;
@@ -163,6 +165,7 @@ export interface MarketSnapshotCreatedPayload {
 export const marketSnapshotCreatedPayloadSchema = z.object({
   tokenId: z.string().uuid(),
   snapshotId: z.string().uuid(),
+  venue: z.nativeEnum(MarketVenue),
   source: z.string().min(1),
   observedAt: z.string().datetime(),
   priceUsd: decimalSchema.optional(),
@@ -175,6 +178,7 @@ export const marketSnapshotCreatedPayloadSchema = z.object({
 export interface MarketSnapshotCreatedInput {
   tokenId: TokenId;
   snapshotId: MarketSnapshotId;
+  venue: MarketVenue;
   source: string;
   observedAt: Timestamp;
   priceUsd?: Decimal;
@@ -191,6 +195,7 @@ export function marketSnapshotCreatedEvent(
   const payload: MarketSnapshotCreatedPayload = {
     tokenId: input.tokenId,
     snapshotId: input.snapshotId,
+    venue: input.venue,
     source: input.source,
     observedAt: input.observedAt.toISOString(),
   };
@@ -246,6 +251,7 @@ export interface LiquidityUpdatedPayload {
   tokenId: string;
   /** The snapshot that carried the new value, so the two events can be joined. */
   snapshotId: string;
+  venue: MarketVenue;
   source: string;
   observedAt: string;
   previousLiquidityUsd?: Decimal;
@@ -257,6 +263,7 @@ export interface LiquidityUpdatedPayload {
 export const liquidityUpdatedPayloadSchema = z.object({
   tokenId: z.string().uuid(),
   snapshotId: z.string().uuid(),
+  venue: z.nativeEnum(MarketVenue),
   source: z.string().min(1),
   observedAt: z.string().datetime(),
   previousLiquidityUsd: decimalSchema.optional(),
@@ -267,6 +274,7 @@ export const liquidityUpdatedPayloadSchema = z.object({
 export interface LiquidityUpdatedInput {
   tokenId: TokenId;
   snapshotId: MarketSnapshotId;
+  venue: MarketVenue;
   source: string;
   observedAt: Timestamp;
   previousLiquidityUsd?: Decimal;
@@ -281,6 +289,7 @@ export function liquidityUpdatedEvent(
   const payload: LiquidityUpdatedPayload = {
     tokenId: input.tokenId,
     snapshotId: input.snapshotId,
+    venue: input.venue,
     source: input.source,
     observedAt: input.observedAt.toISOString(),
     previousObservedAt: input.previousObservedAt.toISOString(),

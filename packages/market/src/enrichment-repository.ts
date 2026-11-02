@@ -2,6 +2,7 @@ import {
   Chain,
   CreatorProfileId,
   MarketSnapshotId,
+  MarketVenue,
   Result,
   Timestamp,
   TokenArtworkId,
@@ -20,7 +21,7 @@ import { Decimal } from './enrichment-contracts';
  *
  * - `token_artwork` is UNIQUE (token_id) and mutable, so a re-run updates the one row
  *   in place and never accumulates versions.
- * - `market_snapshots` is UNIQUE (token_id, source, observed_at) and append-only, so a
+ * - `market_snapshots` is UNIQUE (token_id, venue, source, observed_at) and append-only, so a
  *   re-run of the same observation is absorbed rather than stored twice.
  * - `creator_profiles` is UNIQUE (chain, creator_wallet) and mutable, and every column
  *   is recomputed by counting rows in the append-only `tokens`, so a re-run produces
@@ -81,6 +82,7 @@ export interface TokenArtworkRepository {
 export interface MarketSnapshotInsert {
   snapshotId: MarketSnapshotId;
   tokenId: TokenId;
+  venue: MarketVenue;
   /** The provider's timestamp for the reading. Part of the row's identity. */
   observedAt: Timestamp;
   source: string;
@@ -95,6 +97,7 @@ export interface MarketSnapshotInsert {
 export interface MarketSnapshot {
   snapshotId: MarketSnapshotId;
   tokenId: TokenId;
+  venue: MarketVenue;
   observedAt: Timestamp;
   source: string;
   priceUsd?: Decimal;
@@ -121,7 +124,7 @@ export interface MarketSnapshotInsertOutcome {
 }
 
 export interface MarketSnapshotRepository {
-  /** Idempotent on `(tokenId, source, observedAt)`. */
+  /** Idempotent on `(tokenId, venue, source, observedAt)`. */
   insert(snapshot: MarketSnapshotInsert): Promise<Result<MarketSnapshotInsertOutcome, Error>>;
 
   /**
@@ -131,7 +134,11 @@ export interface MarketSnapshotRepository {
    * against: two providers disagreeing about liquidity is normal, and comparing one's
    * reading to the other's would report a move that never happened.
    */
-  findLatest(tokenId: TokenId, source: string): Promise<Result<MarketSnapshot | null, Error>>;
+  findLatest(
+    tokenId: TokenId,
+    venue: MarketVenue,
+    source: string
+  ): Promise<Result<MarketSnapshot | null, Error>>;
 
   /** A token's snapshots, newest observation first. */
   listForToken(tokenId: TokenId, limit: number): Promise<Result<MarketSnapshot[], Error>>;
@@ -183,10 +190,7 @@ export interface CreatorProfileRepository {
   /** Store or refresh a profile, returning the identifier of the row holding it. */
   upsert(profile: CreatorProfileUpsert): Promise<Result<CreatorProfileId, Error>>;
 
-  findByWallet(
-    chain: Chain,
-    creatorWallet: string
-  ): Promise<Result<CreatorProfile | null, Error>>;
+  findByWallet(chain: Chain, creatorWallet: string): Promise<Result<CreatorProfile | null, Error>>;
 }
 
 interface TokenArtworkRow {
@@ -321,6 +325,7 @@ function toArtwork(row: TokenArtworkRow): TokenArtwork {
 interface MarketSnapshotRow {
   snapshot_id: string;
   token_id: string;
+  venue: string;
   observed_at: Date;
   source: string;
   /** NUMERIC. The driver returns it as text so no digits are lost to a double. */
@@ -335,6 +340,7 @@ interface MarketSnapshotRow {
 const SELECT_SNAPSHOT = `
   SELECT snapshot_id,
          token_id,
+         venue,
          observed_at,
          source,
          price_usd,
@@ -358,14 +364,15 @@ export class PostgresMarketSnapshotRepository implements MarketSnapshotRepositor
     // the existing identifier needs the follow-up SELECT.
     const inserted = await this.exec.query<{ snapshot_id: string }>(
       `INSERT INTO market_snapshots (
-         snapshot_id, token_id, observed_at, source, price_usd, liquidity_usd,
+         snapshot_id, token_id, venue, observed_at, source, price_usd, liquidity_usd,
          market_cap_usd, volume_24h_usd, holder_count, raw_payload
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-       ON CONFLICT (token_id, source, observed_at) DO NOTHING
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       ON CONFLICT (token_id, venue, source, observed_at) DO NOTHING
        RETURNING snapshot_id`,
       [
         snapshot.snapshotId,
         snapshot.tokenId,
+        snapshot.venue,
         snapshot.observedAt,
         snapshot.source,
         snapshot.priceUsd ?? null,
@@ -383,8 +390,8 @@ export class PostgresMarketSnapshotRepository implements MarketSnapshotRepositor
     if (inserted.value.length === 0) {
       const existing = await this.exec.query<{ snapshot_id: string }>(
         `SELECT snapshot_id FROM market_snapshots
-          WHERE token_id = $1 AND source = $2 AND observed_at = $3`,
-        [snapshot.tokenId, snapshot.source, snapshot.observedAt]
+          WHERE token_id = $1 AND venue = $2 AND source = $3 AND observed_at = $4`,
+        [snapshot.tokenId, snapshot.venue, snapshot.source, snapshot.observedAt]
       );
       if (existing.kind === 'failure') {
         return failure(existing.error);
@@ -405,11 +412,12 @@ export class PostgresMarketSnapshotRepository implements MarketSnapshotRepositor
 
   async findLatest(
     tokenId: TokenId,
+    venue: MarketVenue,
     source: string
   ): Promise<Result<MarketSnapshot | null, Error>> {
     const found = await this.select(
-      ' WHERE token_id = $1 AND source = $2 ORDER BY observed_at DESC LIMIT 1',
-      [tokenId, source]
+      ' WHERE token_id = $1 AND venue = $2 AND source = $3 ORDER BY observed_at DESC LIMIT 1',
+      [tokenId, venue, source]
     );
     if (found.kind === 'failure') {
       return failure(found.error);
@@ -418,16 +426,10 @@ export class PostgresMarketSnapshotRepository implements MarketSnapshotRepositor
   }
 
   async listForToken(tokenId: TokenId, limit: number): Promise<Result<MarketSnapshot[], Error>> {
-    return this.select(' WHERE token_id = $1 ORDER BY observed_at DESC LIMIT $2', [
-      tokenId,
-      limit,
-    ]);
+    return this.select(' WHERE token_id = $1 ORDER BY observed_at DESC LIMIT $2', [tokenId, limit]);
   }
 
-  private async select(
-    where: string,
-    params: unknown[]
-  ): Promise<Result<MarketSnapshot[], Error>> {
+  private async select(where: string, params: unknown[]): Promise<Result<MarketSnapshot[], Error>> {
     const result = await this.exec.query<MarketSnapshotRow>(SELECT_SNAPSHOT + where, params);
     if (result.kind === 'failure') {
       return failure(result.error);
@@ -440,6 +442,7 @@ function toSnapshot(row: MarketSnapshotRow): MarketSnapshot {
   const snapshot: MarketSnapshot = {
     snapshotId: row.snapshot_id as MarketSnapshotId,
     tokenId: row.token_id as TokenId,
+    venue: row.venue as MarketVenue,
     observedAt: row.observed_at,
     source: row.source,
     recordedAt: row.recorded_at,

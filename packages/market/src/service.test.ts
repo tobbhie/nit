@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { Chain, LaunchSource } from '@nit/domain';
+import { Chain, EventType, LaunchSource } from '@nit/domain';
 import { EventEnvelope } from '@nit/events';
 import { TokenDiscoveredPayload } from './events';
 import { DISCOVERED, FakeUnitOfWork, PUMP_FUN, launch } from './in-memory.fixtures';
@@ -112,15 +112,33 @@ describe('MarketDiscoveryService.discover', () => {
     const onPumpFun = await service.discover(PUMP_FUN, mint);
     const onPumpSwap = await service.discover(
       { chain: Chain.SOLANA, launchSource: LaunchSource.PUMPSWAP },
-      mint
+      launch({
+        address: mint.address,
+        launchTime: new Date(mint.launchTime.getTime() + 60_000),
+        market: {
+          marketAddress: 'PoolGraduate1',
+          origin: {
+            kind: 'chain',
+            position: { transactionSignature: 'graduation-signature', logIndex: 7 },
+            slot: 350_001_000,
+          },
+        },
+      })
     );
     if (onPumpFun.kind === 'failure' || onPumpSwap.kind === 'failure') {
       throw new Error('Expected both discoveries to succeed');
     }
 
-    expect(onPumpSwap.value.status).toBe('duplicate');
+    expect(onPumpSwap.value.status).toBe('graduated');
     expect(onPumpSwap.value.tokenId).toBe(onPumpFun.value.tokenId);
     expect(uow.store.tokens.size).toBe(1);
+    expect(uow.store.markets).toHaveLength(2);
+    expect(uow.store.markets[1]?.marketAddress).toBe('PoolGraduate1');
+    expect(uow.store.markets[0]?.activeUntil).toEqual(new Date(mint.launchTime.getTime() + 60_000));
+    expect(uow.store.events.map((event) => event.eventType)).toEqual([
+      EventType.TOKEN_DISCOVERED,
+      EventType.TOKEN_GRADUATED,
+    ]);
   });
 
   it('persists nothing when the event cannot be appended', async () => {
@@ -186,9 +204,7 @@ describe('MarketDiscoveryService outbox', () => {
       throw result.error;
     }
 
-    expect(keysIn(uow)).toEqual([
-      `token_liquidity/token_liquidity:${result.value.tokenId}:launch`,
-    ]);
+    expect(keysIn(uow)).toEqual([`token_liquidity/token_liquidity:${result.value.tokenId}:launch`]);
   });
 
   it('enqueues nothing when the token could not be committed', async () => {
@@ -244,11 +260,7 @@ describe('MarketDiscoveryService.discoverBatch', () => {
       launch({ address: 'second', launchTime: new Date('2026-08-20T09:00:01.000Z') }),
     ]);
 
-    expect(payloads(uow).map((payload) => payload.address)).toEqual([
-      'first',
-      'second',
-      'third',
-    ]);
+    expect(payloads(uow).map((payload) => payload.address)).toEqual(['first', 'second', 'third']);
   });
 
   it('orders launches sharing a launch time deterministically', async () => {
@@ -321,11 +333,11 @@ describe('MarketDiscoveryService.discoverBatch', () => {
     const uow = new FakeUnitOfWork();
     const batch = await serviceOn(uow).discoverBatch(PUMP_FUN, []);
 
-    expect(batch).toEqual({ discovered: [], duplicates: [], failures: [] });
+    expect(batch).toEqual({ discovered: [], graduated: [], duplicates: [], failures: [] });
     expect(uow.transactions).toBe(0);
   });
 
-  it('does not reorder the caller\'s array', async () => {
+  it("does not reorder the caller's array", async () => {
     // The sort is on a copy. A caller that polled a window and kept the array for
     // its own bookkeeping would otherwise find it silently rearranged.
     const launches = [

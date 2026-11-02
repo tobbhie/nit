@@ -1,7 +1,18 @@
-import { Chain, LaunchSource, Result, Timestamp, TokenId, failure, now, success } from '@nit/domain';
+import {
+  Chain,
+  LaunchSource,
+  MarketVenue,
+  Result,
+  Timestamp,
+  TokenId,
+  failure,
+  generateTokenMarketId,
+  now,
+  success,
+} from '@nit/domain';
 import { SourceTokenLaunch } from './contracts';
 import { enrichmentJobsFor } from './enrichment-jobs';
-import { tokenDiscoveredEvent } from './events';
+import { tokenDiscoveredEvent, tokenGraduatedEvent } from './events';
 import { normalizeSourceLaunch } from './normalize';
 import { UnitOfWork } from './unit-of-work';
 
@@ -12,8 +23,8 @@ export interface LaunchOrigin {
 }
 
 export interface DiscoveryOutcome {
-  /** `duplicate` means `(chain, address)` was already stored. */
-  status: 'discovered' | 'duplicate';
+  /** `graduated` keeps the token identity and advances only its market lifecycle. */
+  status: 'discovered' | 'duplicate' | 'graduated';
   tokenId: TokenId;
 }
 
@@ -23,6 +34,7 @@ export interface DiscoveryOutcome {
  */
 export interface DiscoveryBatchOutcome {
   discovered: TokenId[];
+  graduated: TokenId[];
   duplicates: TokenId[];
   failures: Array<{ address: string; error: Error }>;
 }
@@ -81,22 +93,88 @@ export class MarketDiscoveryService {
     }
     const token = normalized.value;
 
-    return this.unitOfWork.transact(async ({ tokens, events, jobs }) => {
+    return this.unitOfWork.transact(async ({ tokens, markets, events, jobs }) => {
       const inserted = await tokens.insert(token);
       if (inserted.kind === 'failure') {
         return failure(inserted.error);
       }
 
-      // Already stored. Return without republishing: the event was appended in
+      // Already stored. A PumpSwap sighting can be the lifecycle transition of a
+      // pump.fun token; an ordinary overlap remains a no-op.
       // the transaction that first inserted the row, so a second one would be a
       // duplicate announcement of a single fact — and would re-enqueue every
       // enrichment for a token that has already been through them. Committing an
       // empty transaction is correct: nothing was written and nothing is undone.
       if (!inserted.value.inserted) {
+        if (origin.launchSource === LaunchSource.PUMPSWAP) {
+          const current = await markets.findCurrent(inserted.value.tokenId);
+          if (current.kind === 'failure') {
+            return failure(current.error);
+          }
+          if (current.value?.venue === MarketVenue.PUMP_FUN_BONDING_CURVE) {
+            const transitioned = await markets.transition({
+              tokenMarketId: generateTokenMarketId(),
+              tokenId: inserted.value.tokenId,
+              venue: MarketVenue.PUMPSWAP,
+              ...(token.market === undefined ? {} : { marketAddress: token.market.marketAddress }),
+              activeFrom: token.launchTime,
+              origin: token.market?.origin ?? {
+                kind: 'legacy',
+                key: `graduation:${inserted.value.tokenId}:${token.launchTime.toISOString()}`,
+              },
+              provenance: {
+                adapterContract: 'source-token-launch-v1',
+                launchSource: token.launchSource,
+              },
+            });
+            if (transitioned.kind === 'failure') {
+              return failure(transitioned.error);
+            }
+            if (transitioned.value.inserted) {
+              const graduated = await events.append(
+                tokenGraduatedEvent({
+                  tokenId: inserted.value.tokenId,
+                  ...(token.market === undefined
+                    ? {}
+                    : { marketAddress: token.market.marketAddress }),
+                  graduatedAt: token.launchTime,
+                  producer: this.options.producer,
+                })
+              );
+              if (graduated.kind === 'failure') {
+                return failure(graduated.error);
+              }
+            }
+            return success({ status: 'graduated', tokenId: inserted.value.tokenId });
+          }
+        }
         return success<DiscoveryOutcome>({
           status: 'duplicate',
           tokenId: inserted.value.tokenId,
         });
+      }
+
+      const venue =
+        token.launchSource === LaunchSource.PUMP_FUN
+          ? MarketVenue.PUMP_FUN_BONDING_CURVE
+          : MarketVenue.PUMPSWAP;
+      const market = await markets.open({
+        tokenMarketId: generateTokenMarketId(),
+        tokenId: inserted.value.tokenId,
+        venue,
+        ...(token.market === undefined ? {} : { marketAddress: token.market.marketAddress }),
+        activeFrom: token.launchTime,
+        origin: token.market?.origin ?? {
+          kind: 'legacy',
+          key: `discovery:${inserted.value.tokenId}`,
+        },
+        provenance: {
+          adapterContract: 'source-token-launch-v1',
+          launchSource: token.launchSource,
+        },
+      });
+      if (market.kind === 'failure') {
+        return failure(market.error);
       }
 
       const appended = await events.append(
@@ -163,7 +241,12 @@ export class MarketDiscoveryService {
       return byTime !== 0 ? byTime : left.address.localeCompare(right.address);
     });
 
-    const batch: DiscoveryBatchOutcome = { discovered: [], duplicates: [], failures: [] };
+    const batch: DiscoveryBatchOutcome = {
+      discovered: [],
+      graduated: [],
+      duplicates: [],
+      failures: [],
+    };
 
     for (const launch of ordered) {
       const result = await this.discover(origin, launch);
@@ -171,6 +254,8 @@ export class MarketDiscoveryService {
         batch.failures.push({ address: launch.address, error: result.error });
       } else if (result.value.status === 'discovered') {
         batch.discovered.push(result.value.tokenId);
+      } else if (result.value.status === 'graduated') {
+        batch.graduated.push(result.value.tokenId);
       } else {
         batch.duplicates.push(result.value.tokenId);
       }

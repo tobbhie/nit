@@ -72,6 +72,47 @@ describe('normalizeSourceLaunch', () => {
     expect(token.rawPayload).toEqual({ mint: 'Raw1', source: 'fixture' });
   });
 
+  it('preserves an exact chain occurrence for the market interval', () => {
+    const token = normalized({
+      market: {
+        marketAddress: 'Curve111',
+        origin: {
+          kind: 'chain',
+          position: { transactionSignature: 'signature-1', instructionIndex: 4 },
+          slot: 350_000_000,
+        },
+      },
+    });
+
+    expect(token.market).toEqual({
+      marketAddress: 'Curve111',
+      origin: {
+        kind: 'chain',
+        position: { transactionSignature: 'signature-1', instructionIndex: 4 },
+        slot: 350_000_000,
+      },
+    });
+  });
+
+  it('rejects an ambiguous chain occurrence index', () => {
+    const error = rejection({
+      market: {
+        marketAddress: 'Curve111',
+        origin: {
+          kind: 'chain',
+          position: {
+            transactionSignature: 'signature-1',
+            instructionIndex: 4,
+            logIndex: 5,
+          } as never,
+          slot: 350_000_000,
+        },
+      },
+    });
+
+    expect(error.message).toContain('market origin');
+  });
+
   it('preserves the case of a mint address', () => {
     // Base58 is case-sensitive: case-folding an address produces one that does
     // not exist on chain while looking entirely plausible.

@@ -12,6 +12,7 @@ import {
   TokenArtworkRepository,
 } from './enrichment-repository';
 import { PostgresTokenRepository, TokenRepository } from './repository';
+import { PostgresTokenMarketRepository, TokenMarketRepository } from './lifecycle';
 
 /**
  * The writes that make up one discovery, bound to a single transaction.
@@ -23,6 +24,7 @@ import { PostgresTokenRepository, TokenRepository } from './repository';
  */
 export interface DiscoveryUnitOfWork {
   readonly tokens: TokenRepository;
+  readonly markets: TokenMarketRepository;
   readonly events: EventStore;
   readonly jobs: JobEnqueuer;
 }
@@ -77,15 +79,15 @@ export class PostgresUnitOfWork implements UnitOfWork {
     return transactResult(this.db, (executor, client) =>
       work({
         tokens: new PostgresTokenRepository(executor),
+        markets: new PostgresTokenMarketRepository(executor),
         events: new PostgresEventStore(executor),
         // The client, not the executor: `JobQueue` enlists on a raw `PoolClient`,
         // and binding it here is what stops the code inside the transaction from
         // enqueueing onto a different connection by accident. Written as a generic
         // arrow rather than passed as a bound method so the payload type survives.
         jobs: {
-          enqueue: <TPayload>(
-            request: EnqueueRequest<TPayload>
-          ): Promise<Result<Job, Error>> => this.enqueuer.enqueue(request, client),
+          enqueue: <TPayload>(request: EnqueueRequest<TPayload>): Promise<Result<Job, Error>> =>
+            this.enqueuer.enqueue(request, client),
         },
       })
     );

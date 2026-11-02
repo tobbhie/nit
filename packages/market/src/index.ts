@@ -25,3 +25,4 @@ export * from './enrichment-jobs';
 export * from './enrichment-repository';
 export * from './enrichment-handlers';
 export * from './synthetic-enrichment';
+export * from './lifecycle';

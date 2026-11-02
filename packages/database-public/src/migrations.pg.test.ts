@@ -81,7 +81,9 @@ describe.skipIf(!hasTestDatabase())('Migrator against Postgres', () => {
     // The same key in a different queue is a different job.
     expect(await insert('scoring')).toBe('ok');
 
-    const cleaned = await harness.db.query("DELETE FROM durable_jobs WHERE idempotency_key = 'dup-key'");
+    const cleaned = await harness.db.query(
+      "DELETE FROM durable_jobs WHERE idempotency_key = 'dup-key'"
+    );
     expect(cleaned.kind).toBe('success');
   });
 
@@ -147,9 +149,9 @@ describe.skipIf(!hasTestDatabase())('Migrator against Postgres', () => {
     it('links a quote to its target whichever arrives first', async () => {
       // The reason the column holds a provider id rather than a foreign key. An
       // FK would have rejected the first insert below outright.
-      expect(await insertObservation('quote-early', { quoted_provider_post_id: 'target-late' })).toBe(
-        'ok'
-      );
+      expect(
+        await insertObservation('quote-early', { quoted_provider_post_id: 'target-late' })
+      ).toBe('ok');
       expect(await insertObservation('target-late')).toBe('ok');
 
       const resolved = await harness.db.query<{ quoted: string | null }>(
@@ -300,8 +302,10 @@ describe.skipIf(!hasTestDatabase())('Migrator against Postgres', () => {
 
       const orphanSnapshot = await harness.db.query(
         `INSERT INTO market_snapshots (
-           snapshot_id, token_id, observed_at, source, raw_payload
-         ) VALUES (gen_random_uuid(), gen_random_uuid(), NOW(), 'pumpswap', '{}'::jsonb)`
+           snapshot_id, token_id, venue, observed_at, source, raw_payload
+         ) VALUES (
+           gen_random_uuid(), gen_random_uuid(), 'pumpswap', NOW(), 'pumpswap', '{}'::jsonb
+         )`
       );
       expect(orphanSnapshot.kind).toBe('failure');
     });
@@ -334,16 +338,21 @@ describe.skipIf(!hasTestDatabase())('Migrator against Postgres', () => {
       expect(analysed.kind).toBe('success');
     });
 
-    it('keeps one snapshot per source per instant', async () => {
+    it('keeps one snapshot per venue, source and instant', async () => {
       expect(await insertToken('addr-snap')).toBe('ok');
       const tokenId = await tokenIdFor('addr-snap');
       const observedAt = '2026-08-19T10:00:00.000Z';
 
-      const insertSnapshot = async (source: string, at = observedAt): Promise<'ok' | 'rejected'> => {
+      const insertSnapshot = async (
+        source: string,
+        at = observedAt
+      ): Promise<'ok' | 'rejected'> => {
         const result = await harness.db.query(
           `INSERT INTO market_snapshots (
-             snapshot_id, token_id, observed_at, source, liquidity_usd, raw_payload
-           ) VALUES (gen_random_uuid(), $1, $2, $3, 1000, '{}'::jsonb)`,
+             snapshot_id, token_id, venue, observed_at, source, liquidity_usd, raw_payload
+           ) VALUES (
+             gen_random_uuid(), $1, 'pump_fun_bonding_curve', $2, $3, 1000, '{}'::jsonb
+           )`,
           [tokenId, at, source]
         );
         return result.kind === 'success' ? 'ok' : 'rejected';
@@ -362,8 +371,11 @@ describe.skipIf(!hasTestDatabase())('Migrator against Postgres', () => {
       const tokenId = await tokenIdFor('addr-snap-immutable');
       const inserted = await harness.db.query(
         `INSERT INTO market_snapshots (
-           snapshot_id, token_id, observed_at, source, liquidity_usd, raw_payload
-         ) VALUES (gen_random_uuid(), $1, NOW(), 'pumpswap', 1000, '{}'::jsonb)`,
+           snapshot_id, token_id, venue, observed_at, source, liquidity_usd, raw_payload
+         ) VALUES (
+           gen_random_uuid(), $1, 'pump_fun_bonding_curve', NOW(),
+           'pumpswap', 1000, '{}'::jsonb
+         )`,
         [tokenId]
       );
       expect(inserted.kind).toBe('success');
@@ -387,8 +399,12 @@ describe.skipIf(!hasTestDatabase())('Migrator against Postgres', () => {
       const tokenId = await tokenIdFor('addr-precise');
       const inserted = await harness.db.query(
         `INSERT INTO market_snapshots (
-           snapshot_id, token_id, observed_at, source, price_usd, market_cap_usd, raw_payload
-         ) VALUES (gen_random_uuid(), $1, NOW(), 'pumpswap', 0.000000000123456789, 1234567.891234, '{}'::jsonb)`,
+           snapshot_id, token_id, venue, observed_at, source,
+           price_usd, market_cap_usd, raw_payload
+         ) VALUES (
+           gen_random_uuid(), $1, 'pump_fun_bonding_curve', NOW(), 'pumpswap',
+           0.000000000123456789, 1234567.891234, '{}'::jsonb
+         )`,
         [tokenId]
       );
       expect(inserted.kind).toBe('success');

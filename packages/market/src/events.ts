@@ -5,6 +5,7 @@ import {
   Chain,
   EventType,
   LaunchSource,
+  MarketVenue,
   Timestamp,
   TokenId,
   generateEventId,
@@ -19,6 +20,7 @@ import {
 
 /** Payload schema version carried in the envelope's `version` field. */
 export const TOKEN_DISCOVERED_VERSION = '1';
+export const TOKEN_GRADUATED_VERSION = '1';
 
 /**
  * What `TokenDiscovered` announces.
@@ -111,6 +113,50 @@ export function tokenDiscoveredEvent(
   };
 }
 
+export interface TokenGraduatedPayload {
+  tokenId: string;
+  fromVenue: MarketVenue.PUMP_FUN_BONDING_CURVE;
+  toVenue: MarketVenue.PUMPSWAP;
+  marketAddress?: string;
+  graduatedAt: string;
+}
+
+export const tokenGraduatedPayloadSchema = z.object({
+  tokenId: z.string().uuid(),
+  fromVenue: z.literal(MarketVenue.PUMP_FUN_BONDING_CURVE),
+  toVenue: z.literal(MarketVenue.PUMPSWAP),
+  marketAddress: z.string().min(1).optional(),
+  graduatedAt: z.string().datetime(),
+});
+
+export interface TokenGraduatedInput {
+  tokenId: TokenId;
+  marketAddress?: string;
+  graduatedAt: Timestamp;
+  producer: string;
+}
+
+export function tokenGraduatedEvent(
+  input: TokenGraduatedInput
+): EventEnvelope<TokenGraduatedPayload> {
+  return {
+    eventId: generateEventId(),
+    eventType: EventType.TOKEN_GRADUATED,
+    aggregateType: AggregateType.TOKEN,
+    aggregateId: input.tokenId as string as AggregateId,
+    version: TOKEN_GRADUATED_VERSION,
+    occurredAt: input.graduatedAt,
+    producer: input.producer,
+    payload: {
+      tokenId: input.tokenId,
+      fromVenue: MarketVenue.PUMP_FUN_BONDING_CURVE,
+      toVenue: MarketVenue.PUMPSWAP,
+      graduatedAt: input.graduatedAt.toISOString(),
+      ...(input.marketAddress === undefined ? {} : { marketAddress: input.marketAddress }),
+    },
+  };
+}
+
 /**
  * Register this package's payload schemas.
  *
@@ -118,13 +164,15 @@ export function tokenDiscoveredEvent(
  * a side effect of loading a module is a registry whose contents depend on import
  * order.
  *
- * All five of this stage's events are here — discovery's one and enrichment's four.
+ * All six of this stage's events are here — discovery and graduation, plus
+ * enrichment's four.
  * Registration is what makes a payload validated on the way into the log, so an
  * event type this package can publish and has not registered is one that reaches
  * `domain_events` unchecked.
  */
 export function registerMarketSchemas(registry: PayloadSchemaRegistry): void {
   registry.register(EventType.TOKEN_DISCOVERED, tokenDiscoveredPayloadSchema);
+  registry.register(EventType.TOKEN_GRADUATED, tokenGraduatedPayloadSchema);
   registry.register(EventType.TOKEN_ARTWORK_PROCESSED, tokenArtworkProcessedPayloadSchema);
   registry.register(EventType.MARKET_SNAPSHOT_CREATED, marketSnapshotCreatedPayloadSchema);
   registry.register(EventType.LIQUIDITY_UPDATED, liquidityUpdatedPayloadSchema);

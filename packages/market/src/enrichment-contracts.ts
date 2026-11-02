@@ -1,4 +1,4 @@
-import { Chain, Result, Timestamp } from '@nit/domain';
+import { Chain, MarketVenue, Result, Timestamp } from '@nit/domain';
 import { PoolClient } from '@nit/database-public';
 import { EnqueueRequest, Job } from '@nit/queue';
 import { ProviderIdentity } from '@nit/provider-interfaces';
@@ -63,9 +63,7 @@ export function decimalsEqual(left: Decimal, right: Decimal): boolean {
   }
 
   const fractionWidth = Math.max(leftFraction.length, rightFraction.length);
-  return (
-    leftFraction.padEnd(fractionWidth, '0') === rightFraction.padEnd(fractionWidth, '0')
-  );
+  return leftFraction.padEnd(fractionWidth, '0') === rightFraction.padEnd(fractionWidth, '0');
 }
 
 /**
@@ -135,6 +133,8 @@ export interface SourceMarketSnapshot {
 export interface MarketDataRequest {
   chain: Chain;
   address: string;
+  /** The venue selects the correct reserve/quote path for this token at this time. */
+  venue: MarketVenue;
 }
 
 /**

@@ -10,6 +10,7 @@ import {
   success,
 } from '@nit/domain';
 import { SourceTokenLaunch } from './contracts';
+import { ChainEventOrigin } from './lifecycle';
 
 /**
  * A launch ready to insert. Close to the canonical `Token`, plus the raw payload,
@@ -27,6 +28,7 @@ export interface NormalizedTokenLaunch {
   creatorWallet?: string;
   description?: string;
   artworkUrl?: string;
+  market?: { marketAddress: string; origin: ChainEventOrigin };
   rawPayload: Record<string, unknown>;
 }
 
@@ -99,9 +101,11 @@ export function normalizeSourceLaunch(
   }
 
   if (!Number.isFinite(launch.launchTime.getTime())) {
-    return failure(new ValidationError('Token launchTime is not a valid date', {
-      address: address.value,
-    }));
+    return failure(
+      new ValidationError('Token launchTime is not a valid date', {
+        address: address.value,
+      })
+    );
   }
 
   const normalized: NormalizedTokenLaunch = {
@@ -129,6 +133,31 @@ export function normalizeSourceLaunch(
   const artworkUrl = optionalText(launch.artworkUrl);
   if (artworkUrl !== undefined) {
     normalized.artworkUrl = artworkUrl;
+  }
+  if (launch.market !== undefined) {
+    const marketAddress = requireText(launch.market.marketAddress, 'marketAddress');
+    if (marketAddress.kind === 'failure') {
+      return marketAddress;
+    }
+    const { origin } = launch.market;
+    const instructionIndex = origin.position.instructionIndex;
+    const logIndex = origin.position.logIndex;
+    if (
+      !Number.isSafeInteger(origin.slot) ||
+      origin.slot < 0 ||
+      (instructionIndex === undefined) === (logIndex === undefined) ||
+      (instructionIndex !== undefined &&
+        (!Number.isSafeInteger(instructionIndex) || instructionIndex < 0)) ||
+      (logIndex !== undefined && (!Number.isSafeInteger(logIndex) || logIndex < 0)) ||
+      origin.position.transactionSignature.trim().length === 0
+    ) {
+      return failure(
+        new ValidationError('Token market origin is invalid', {
+          address: address.value,
+        })
+      );
+    }
+    normalized.market = { marketAddress: marketAddress.value, origin };
   }
 
   return success(normalized);

@@ -97,7 +97,9 @@ describe('MIGRATIONS', () => {
   it('gives the event log a unique tie-break for replay order', () => {
     // Ordering by occurred_at alone leaves ties, and a paging boundary over a
     // column with ties skips rows rather than merely reordering them.
-    const order = ddl(MIGRATIONS.find((migration) => migration.id === '0008_domain_events_sequence'));
+    const order = ddl(
+      MIGRATIONS.find((migration) => migration.id === '0008_domain_events_sequence')
+    );
     expect(order).toContain('ADD COLUMN IF NOT EXISTS sequence BIGSERIAL');
     expect(order).toContain('CREATE UNIQUE INDEX IF NOT EXISTS domain_events_sequence_idx');
     expect(order).toContain('ON domain_events (occurred_at, sequence)');
@@ -357,6 +359,31 @@ describe('V2 signal and trading schema', () => {
   it('scopes decision and order idempotency to an isolated portfolio', () => {
     expect(ledger).toContain('UNIQUE (portfolio_id, idempotency_key)');
     expect(ledger).toContain('REFERENCES paper_portfolios (portfolio_id, run_id, combination_id)');
+  });
+});
+
+describe('token market lifecycle schema', () => {
+  const lifecycle = ddl(
+    MIGRATIONS.find((migration) => migration.id === '0016_token_market_lifecycle')
+  );
+
+  it('stores venue intervals with one current market per token', () => {
+    expect(lifecycle).toContain('CREATE TABLE IF NOT EXISTS token_markets');
+    expect(lifecycle).toContain('active_until TIMESTAMPTZ');
+    expect(lifecycle).toContain('WHERE active_until IS NULL');
+    expect(lifecycle).toContain("venue IN ('pump_fun_bonding_curve', 'pumpswap')");
+  });
+
+  it('deduplicates exact chain occurrences and permits only interval closure', () => {
+    expect(lifecycle).toContain('num_nonnulls(instruction_index, log_index) = 1');
+    expect(lifecycle).toContain('token_markets_chain_instruction_idx');
+    expect(lifecycle).toContain('token_markets_chain_log_idx');
+    expect(lifecycle).toContain('token_market_allow_close_only');
+  });
+
+  it('makes market snapshot identity venue-aware', () => {
+    expect(lifecycle).toContain('UNIQUE (token_id, venue, source, observed_at)');
+    expect(lifecycle).toContain('market_snapshots_venue_timeline_idx');
   });
 });
 

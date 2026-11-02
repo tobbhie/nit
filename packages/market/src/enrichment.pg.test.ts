@@ -1,7 +1,16 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { PostgresEventStore } from '@nit/database-public';
 import { createTestDatabase, hasTestDatabase, TestDatabase } from '@nit/database-public/testing';
-import { Chain, EventType, QueueName, Result, Timestamp, TokenId, success } from '@nit/domain';
+import {
+  Chain,
+  EventType,
+  MarketVenue,
+  QueueName,
+  Result,
+  Timestamp,
+  TokenId,
+  success,
+} from '@nit/domain';
 import { EventEnvelope, PayloadSchemaRegistry } from '@nit/events';
 import { BackoffPolicy, Job, JobQueue } from '@nit/queue';
 import { SourceMarketSnapshot } from './enrichment-contracts';
@@ -99,7 +108,7 @@ describe.skipIf(!hasTestDatabase())('Market intelligence against Postgres', () =
     // TRUNCATE fires no row-level DELETE trigger, so the append-only triggers on
     // `tokens` and `market_snapshots` do not block the reset.
     const truncated = await harness.db.query(
-      `TRUNCATE token_artwork, market_snapshots, creator_profiles, tokens,
+      `TRUNCATE token_artwork, market_snapshots, token_markets, creator_profiles, tokens,
                 domain_events, job_history, durable_jobs RESTART IDENTITY`
     );
     expect(truncated.kind).toBe('success');
@@ -164,6 +173,7 @@ describe.skipIf(!hasTestDatabase())('Market intelligence against Postgres', () =
     tokenId,
     chain: Chain.SOLANA,
     address,
+    venue: MarketVenue.PUMP_FUN_BONDING_CURVE,
   });
 
   const creatorJob = (tokenId: TokenId): TokenCreatorPayload => ({
@@ -237,6 +247,7 @@ describe.skipIf(!hasTestDatabase())('Market intelligence against Postgres', () =
       const stored = unwrap(
         await new PostgresMarketSnapshotRepository(harness.db).findLatest(
           tokenId,
+          MarketVenue.PUMP_FUN_BONDING_CURVE,
           'stub-market-source'
         )
       );
@@ -421,6 +432,7 @@ describe.skipIf(!hasTestDatabase())('Market intelligence against Postgres', () =
       const survivor = unwrap(
         await new PostgresMarketSnapshotRepository(harness.db).findLatest(
           tokenId,
+          MarketVenue.PUMP_FUN_BONDING_CURVE,
           'stub-market-source'
         )
       );

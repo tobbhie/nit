@@ -5,6 +5,7 @@ import {
   JobId,
   JobStatus,
   LaunchSource,
+  MarketVenue,
   QueueName,
   Timestamp,
   TokenId,
@@ -280,9 +281,9 @@ describe('ArtworkEnrichmentHandler', () => {
     const analyser = new SyntheticArtworkAnalyser();
     const handler = new ArtworkEnrichmentHandler(analyser, uow, OPTIONS);
 
-    await expect(
-      handler.handle(jobFor(QueueName.TOKEN_ARTWORK, payload(), '2'))
-    ).rejects.toThrow(PermanentJobFailure);
+    await expect(handler.handle(jobFor(QueueName.TOKEN_ARTWORK, payload(), '2'))).rejects.toThrow(
+      PermanentJobFailure
+    );
     await expect(handler.enrich(payload({ artworkUrl: '   ' }))).rejects.toThrow(
       PermanentJobFailure
     );
@@ -311,13 +312,19 @@ describe('MarketEnrichmentHandler', () => {
     tokenId: overrides.tokenId ?? TOKEN,
     chain: overrides.chain ?? Chain.SOLANA,
     address: overrides.address ?? ADDRESS,
+    venue: overrides.venue ?? MarketVenue.PUMP_FUN_BONDING_CURVE,
   });
 
   /** A handler over a scripted provider, so a test can state both of two readings. */
-  function scripted(...answers: Array<{ kind: 'success'; value: SourceMarketSnapshot } | {
-    kind: 'failure';
-    error: Error;
-  }>): { handler: MarketEnrichmentHandler; uow: FakeEnrichmentUnitOfWork } {
+  function scripted(
+    ...answers: Array<
+      | { kind: 'success'; value: SourceMarketSnapshot }
+      | {
+          kind: 'failure';
+          error: Error;
+        }
+    >
+  ): { handler: MarketEnrichmentHandler; uow: FakeEnrichmentUnitOfWork } {
     const uow = new FakeEnrichmentUnitOfWork();
     return {
       handler: new MarketEnrichmentHandler(new StubMarketSource(answers), uow, OPTIONS),
@@ -358,7 +365,8 @@ describe('MarketEnrichmentHandler', () => {
   });
 
   it('absorbs a re-poll that found the same observation', async () => {
-    // `market_snapshots` is append-only and UNIQUE (token_id, source, observed_at), so
+    // `market_snapshots` is append-only and UNIQUE
+    // (token_id, venue, source, observed_at), so
     // a redelivered job that re-fetched an unchanged provider must not grow the
     // history — and must not announce the reading a second time either.
     const uow = new FakeEnrichmentUnitOfWork();
@@ -521,11 +529,14 @@ describe('MarketEnrichmentHandler', () => {
     const source = new SyntheticMarketDataSource();
     const handler = new MarketEnrichmentHandler(source, uow, OPTIONS);
 
-    await expect(
-      handler.handle(jobFor(QueueName.TOKEN_LIQUIDITY, payload(), '2'))
-    ).rejects.toThrow(PermanentJobFailure);
+    await expect(handler.handle(jobFor(QueueName.TOKEN_LIQUIDITY, payload(), '1'))).rejects.toThrow(
+      PermanentJobFailure
+    );
     await expect(handler.enrich(payload({ address: '' }))).rejects.toThrow(PermanentJobFailure);
     await expect(handler.enrich(payload({ chain: 'ethereum' as Chain }))).rejects.toThrow(
+      PermanentJobFailure
+    );
+    await expect(handler.enrich(payload({ venue: 'unknown' as MarketVenue }))).rejects.toThrow(
       PermanentJobFailure
     );
 
@@ -554,7 +565,11 @@ describe('MarketEnrichmentHandler', () => {
 describe('the synthetic readings this file compares', () => {
   it('report different liquidity at consecutive observations', async () => {
     const source = new SyntheticMarketDataSource();
-    const request = { chain: Chain.SOLANA, address: ADDRESS };
+    const request = {
+      chain: Chain.SOLANA,
+      address: ADDRESS,
+      venue: MarketVenue.PUMP_FUN_BONDING_CURVE,
+    };
 
     const first = value(await source.fetchSnapshot(request));
     source.advanceObservation();
@@ -766,9 +781,9 @@ describe('CreatorEnrichmentHandler', () => {
     await expect(
       handler.handle(jobFor(QueueName.TOKEN_CREATOR, payloadFor(token), '2'))
     ).rejects.toThrow(PermanentJobFailure);
-    await expect(
-      handler.enrich({ ...payloadFor(token), creatorWallet: '  ' })
-    ).rejects.toThrow(PermanentJobFailure);
+    await expect(handler.enrich({ ...payloadFor(token), creatorWallet: '  ' })).rejects.toThrow(
+      PermanentJobFailure
+    );
     await expect(
       handler.enrich({ ...payloadFor(token), chain: 'ethereum' as Chain })
     ).rejects.toThrow(PermanentJobFailure);
@@ -870,6 +885,7 @@ describe('enrichmentJobsFor', () => {
       tokenId: token.tokenId,
       chain: Chain.SOLANA,
       address: 'Payloads1',
+      venue: MarketVenue.PUMP_FUN_BONDING_CURVE,
     });
     expect(artwork?.payload).toEqual({
       tokenId: token.tokenId,

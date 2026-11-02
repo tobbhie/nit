@@ -1,5 +1,13 @@
 import { Chain, LaunchSource, Result, Timestamp } from '@nit/domain';
 import { ProviderIdentity } from '@nit/provider-interfaces';
+import { ChainEventOrigin } from './lifecycle';
+
+export interface SourceTokenMarket {
+  /** Bonding-curve account or DEX pool, not the token mint. */
+  marketAddress: string;
+  /** Exact Solana occurrence that opened this venue interval. */
+  origin: ChainEventOrigin;
+}
 
 /**
  * A token launch exactly as an adapter read it, before normalization.
@@ -18,6 +26,7 @@ export interface SourceTokenLaunch {
   creatorWallet?: string;
   description?: string;
   artworkUrl?: string;
+  market?: SourceTokenMarket;
   /**
    * The launchpad's response for this token, verbatim. Persisted to
    * `tokens.raw_payload` so a later worker can extract a field nobody thought to

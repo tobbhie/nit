@@ -5,6 +5,7 @@ import {
   Chain,
   EventType,
   LaunchSource,
+  MarketVenue,
   QueueName,
   Timestamp,
   TokenId,
@@ -13,7 +14,12 @@ import {
 } from '@nit/domain';
 import { BackoffPolicy, JobQueue } from '@nit/queue';
 import { SourceTokenLaunch } from './contracts';
-import { TokenArtworkPayload, TokenCreatorPayload, TokenLiquidityPayload } from './enrichment-jobs';
+import {
+  TOKEN_LIQUIDITY_PAYLOAD_VERSION,
+  TokenArtworkPayload,
+  TokenCreatorPayload,
+  TokenLiquidityPayload,
+} from './enrichment-jobs';
 import { TokenDiscoveredPayload, tokenDiscoveredEvent } from './events';
 import { LaunchOverrides, PUMP_FUN, launch } from './in-memory.fixtures';
 import { normalizeSourceLaunch } from './normalize';
@@ -86,7 +92,7 @@ describe.skipIf(!hasTestDatabase())('Market discovery against Postgres', () => {
     // block the reset. The queue tables are here because discovery now writes to
     // them: the enrichment jobs commit with the token.
     const truncated = await harness.db.query(
-      `TRUNCATE token_artwork, market_snapshots, creator_profiles, tokens,
+      `TRUNCATE token_artwork, market_snapshots, token_markets, creator_profiles, tokens,
                 domain_events, job_history, durable_jobs RESTART IDENTITY`
     );
     expect(truncated.kind).toBe('success');
@@ -215,16 +221,33 @@ describe.skipIf(!hasTestDatabase())('Market discovery against Postgres', () => {
       // one token with one history instead of two with the evidence split.
       const mint = launch({ address: 'Graduate1' });
       const onPumpFun = await discover(mint);
-      const onPumpSwap = await service.discover(PUMPSWAP, mint);
+      const graduatedAt = new Date(mint.launchTime.getTime() + 60_000);
+      const onPumpSwap = await service.discover(
+        PUMPSWAP,
+        launch({
+          address: mint.address,
+          launchTime: graduatedAt,
+          market: {
+            marketAddress: 'PoolGraduate1',
+            origin: {
+              kind: 'chain',
+              position: { transactionSignature: 'graduation-signature', logIndex: 7 },
+              slot: 350_001_000,
+            },
+          },
+        })
+      );
       if (onPumpSwap.kind === 'failure') {
         throw onPumpSwap.error;
       }
 
-      expect(onPumpSwap.value.status).toBe('duplicate');
+      expect(onPumpSwap.value.status).toBe('graduated');
       expect(onPumpSwap.value.tokenId).toBe(onPumpFun);
       expect(await countOf('tokens')).toBe(1);
       // The venue it was first seen on is what stays recorded.
       expect((await read('Graduate1')).launchSource).toBe(LaunchSource.PUMP_FUN);
+      expect(await countOf('token_markets')).toBe(2);
+      expect(await countOf('domain_events')).toBe(2);
     });
 
     it('does not announce a duplicate a second time', async () => {
@@ -304,8 +327,13 @@ describe.skipIf(!hasTestDatabase())('Market discovery against Postgres', () => {
         // enriching a token that does not exist.
         const enqueued = await uow.jobs.enqueue<TokenLiquidityPayload>({
           queueName: QueueName.TOKEN_LIQUIDITY,
-          payload: { tokenId: inserted.value.tokenId, chain: token.chain, address: token.address },
-          payloadVersion: '1',
+          payload: {
+            tokenId: inserted.value.tokenId,
+            chain: token.chain,
+            address: token.address,
+            venue: MarketVenue.PUMP_FUN_BONDING_CURVE,
+          },
+          payloadVersion: TOKEN_LIQUIDITY_PAYLOAD_VERSION,
           idempotencyKey: `token_liquidity:${inserted.value.tokenId}:launch`,
         });
         if (enqueued.kind === 'failure') {
@@ -321,7 +349,7 @@ describe.skipIf(!hasTestDatabase())('Market discovery against Postgres', () => {
       expect(await countOf('durable_jobs')).toBe(0);
     });
 
-    it('returns the caller\'s error rather than the rollback signal', async () => {
+    it("returns the caller's error rather than the rollback signal", async () => {
       const sentinel = new Error('the reason the caller cares about');
       const rolled = await new PostgresUnitOfWork(harness.db, queue).transact(() =>
         Promise.resolve(failure(sentinel))
@@ -356,7 +384,11 @@ describe.skipIf(!hasTestDatabase())('Market discovery against Postgres', () => {
         `token_creator:${tokenId}`,
         `token_liquidity:${tokenId}:launch`,
       ]);
-      expect(jobs.every((job) => job.payload_version === '1')).toBe(true);
+      expect(jobs.map((job) => job.payload_version)).toEqual([
+        '1',
+        '1',
+        TOKEN_LIQUIDITY_PAYLOAD_VERSION,
+      ]);
 
       // The driver parses JSONB back into JS values, so a payload is the object the
       // planner built — which is what makes carrying the address instead of only a
@@ -410,8 +442,13 @@ describe.skipIf(!hasTestDatabase())('Market discovery against Postgres', () => {
       const replanned = await new PostgresUnitOfWork(harness.db, queue).transact((uow) =>
         uow.jobs.enqueue<TokenLiquidityPayload>({
           queueName: QueueName.TOKEN_LIQUIDITY,
-          payload: { tokenId, chain: Chain.SOLANA, address: 'Outbox1' },
-          payloadVersion: '1',
+          payload: {
+            tokenId,
+            chain: Chain.SOLANA,
+            address: 'Outbox1',
+            venue: MarketVenue.PUMP_FUN_BONDING_CURVE,
+          },
+          payloadVersion: TOKEN_LIQUIDITY_PAYLOAD_VERSION,
           idempotencyKey: `token_liquidity:${tokenId}:launch`,
         })
       );
@@ -431,7 +468,7 @@ describe.skipIf(!hasTestDatabase())('Market discovery against Postgres', () => {
       if (claimed.kind === 'failure') {
         throw claimed.error;
       }
-      expect(claimed.value?.payloadVersion).toBe('1');
+      expect(claimed.value?.payloadVersion).toBe(TOKEN_LIQUIDITY_PAYLOAD_VERSION);
       expect((claimed.value?.payload as TokenLiquidityPayload | undefined)?.address).toBe(
         'Outbox1'
       );

@@ -1,4 +1,4 @@
-import { Chain, QueueName, TokenId } from '@nit/domain';
+import { Chain, LaunchSource, MarketVenue, QueueName, TokenId } from '@nit/domain';
 import { EnqueueRequest } from '@nit/queue';
 import { NormalizedTokenLaunch } from './normalize';
 
@@ -22,7 +22,7 @@ import { NormalizedTokenLaunch } from './normalize';
  */
 
 export const TOKEN_ARTWORK_PAYLOAD_VERSION = '1';
-export const TOKEN_LIQUIDITY_PAYLOAD_VERSION = '1';
+export const TOKEN_LIQUIDITY_PAYLOAD_VERSION = '2';
 export const TOKEN_CREATOR_PAYLOAD_VERSION = '1';
 
 /** One image to fetch, hash, store and read text out of. */
@@ -39,6 +39,7 @@ export interface TokenLiquidityPayload {
   tokenId: string;
   chain: Chain;
   address: string;
+  venue: MarketVenue;
 }
 
 /**
@@ -62,9 +63,7 @@ export interface TokenCreatorPayload {
  * fields would make every handler re-check what the planner already knows.
  */
 export type EnrichmentJobPayload =
-  | TokenArtworkPayload
-  | TokenLiquidityPayload
-  | TokenCreatorPayload;
+  TokenArtworkPayload | TokenLiquidityPayload | TokenCreatorPayload;
 
 /**
  * The union sits at the payload rather than around the whole request, and it has to.
@@ -136,6 +135,10 @@ export function enrichmentJobsFor(launch: NormalizedTokenLaunch): EnrichmentJobR
         tokenId: launch.tokenId,
         chain: launch.chain,
         address: launch.address,
+        venue:
+          launch.launchSource === LaunchSource.PUMP_FUN
+            ? MarketVenue.PUMP_FUN_BONDING_CURVE
+            : MarketVenue.PUMPSWAP,
       },
       payloadVersion: TOKEN_LIQUIDITY_PAYLOAD_VERSION,
       idempotencyKey: liquidityKey(launch.tokenId),
