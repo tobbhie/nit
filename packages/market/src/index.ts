@@ -27,3 +27,5 @@ export * from './enrichment-handlers';
 export * from './synthetic-enrichment';
 export * from './lifecycle';
 export * from './reconciliation';
+export * from './reconciliation-handler';
+export * from './solana-rpc';
