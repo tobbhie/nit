@@ -29,3 +29,6 @@ export * from './lifecycle';
 export * from './reconciliation';
 export * from './reconciliation-handler';
 export * from './solana-rpc';
+export * from './pump-events';
+export * from './confirmed-ingestion';
+export * from './reconciliation-scheduler';

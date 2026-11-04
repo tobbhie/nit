@@ -24,6 +24,7 @@ describe('ConfigSchema validation', () => {
         pollIntervalMs: 5000,
       },
       providers: {},
+      solanaMarket: { enabled: false },
       featureFlags: {
         privateIntelligence: false,
         productionAlerts: false,
@@ -58,7 +59,49 @@ describe('ConfigSchema validation', () => {
       expect(result.data.featureFlags.execution).toBe(false);
       expect(result.data.queue.leaseTimeoutMs).toBe(30000);
       expect(result.data.logLevel).toBe('info');
+      expect(result.data.solanaMarket).toEqual({ enabled: false });
     }
+  });
+
+  it('requires complete credential-free endpoints and program addresses when Solana market intake is enabled', () => {
+    const base = {
+      environment: 'development',
+      version: { schemaVersion: '1.0.0', buildId: 'test' },
+      database: {
+        host: 'localhost',
+        port: 5432,
+        database: 'nit',
+        user: 'nit',
+        password: 'pass',
+      },
+      queue: {},
+      featureFlags: {},
+    };
+    const valid = ConfigSchema.safeParse({
+      ...base,
+      solanaMarket: {
+        enabled: true,
+        httpEndpoint: 'https://rpc.example.test/path?api-key=from-secret-manager',
+        websocketEndpoint: 'wss://rpc.example.test/path?api-key=from-secret-manager',
+        pumpFunProgramAddress: 'configured-pump-program',
+        pumpSwapProgramAddress: 'configured-migration-program',
+      },
+    });
+    const embeddedCredential = ConfigSchema.safeParse({
+      ...base,
+      solanaMarket: {
+        enabled: true,
+        httpEndpoint: 'https://user:secret@rpc.example.test',
+        websocketEndpoint: 'wss://rpc.example.test',
+        pumpFunProgramAddress: 'configured-pump-program',
+        pumpSwapProgramAddress: 'configured-migration-program',
+      },
+    });
+    const incomplete = ConfigSchema.safeParse({ ...base, solanaMarket: { enabled: true } });
+
+    expect(valid.success).toBe(true);
+    expect(embeddedCredential.success).toBe(false);
+    expect(incomplete.success).toBe(false);
   });
 
   it('rejects missing required fields', () => {

@@ -11,7 +11,12 @@ import {
 import { Executor } from '@nit/database-public';
 
 export type ChainEventPosition =
-  | { transactionSignature: string; instructionIndex: number; logIndex?: never }
+  | {
+      transactionSignature: string;
+      instructionIndex: number;
+      innerInstructionIndex?: number;
+      logIndex?: never;
+    }
   | { transactionSignature: string; logIndex: number; instructionIndex?: never };
 
 export interface ChainEventOrigin {
@@ -72,6 +77,7 @@ interface TokenMarketRow {
   source_event_key: string;
   transaction_signature: string | null;
   instruction_index: number | null;
+  inner_instruction_index: number | null;
   log_index: number | null;
   slot: string | null;
   provenance: Record<string, unknown>;
@@ -81,27 +87,38 @@ interface TokenMarketRow {
 const SELECT_MARKET = `
   SELECT token_market_id, token_id, venue, market_address, active_from, active_until,
          source_event_kind, source_event_key, transaction_signature, instruction_index,
-         log_index, slot, provenance, recorded_at
+         inner_instruction_index, log_index, slot, provenance, recorded_at
     FROM token_markets
 `;
 
+export function chainEventKey(position: ChainEventPosition): string {
+  const index =
+    position.instructionIndex !== undefined
+      ? `instruction:${position.instructionIndex}${
+          position.innerInstructionIndex === undefined
+            ? ''
+            : `:inner:${position.innerInstructionIndex}`
+        }`
+      : `log:${position.logIndex}`;
+  return `solana:${position.transactionSignature}:${index}`;
+}
+
 function originKey(origin: TokenMarketOrigin): string {
   if (origin.kind === 'legacy') return `legacy:${origin.key}`;
-  const index =
-    origin.position.instructionIndex !== undefined
-      ? `instruction:${origin.position.instructionIndex}`
-      : `log:${origin.position.logIndex}`;
-  return `solana:${origin.position.transactionSignature}:${index}`;
+  return chainEventKey(origin.position);
 }
 
 function originParams(
   origin: TokenMarketOrigin
-): [string, string | null, number | null, number | null, number | null] {
-  if (origin.kind === 'legacy') return ['legacy', null, null, null, null];
+): [string, string | null, number | null, number | null, number | null, number | null] {
+  if (origin.kind === 'legacy') return ['legacy', null, null, null, null, null];
   return [
     'chain',
     origin.position.transactionSignature,
     origin.position.instructionIndex ?? null,
+    'innerInstructionIndex' in origin.position
+      ? (origin.position.innerInstructionIndex ?? null)
+      : null,
     origin.position.logIndex ?? null,
     origin.slot,
   ];
@@ -125,7 +142,9 @@ export class PostgresTokenMarketRepository implements TokenMarketRepository {
       return success({ inserted: false, tokenMarketId: duplicate.value.tokenMarketId });
     }
 
-    const [kind, signature, instructionIndex, logIndex, slot] = originParams(input.origin);
+    const [kind, signature, instructionIndex, innerInstructionIndex, logIndex, slot] = originParams(
+      input.origin
+    );
     const key = originKey(input.origin);
     const inserted = await this.exec.query<{ token_market_id: string }>(
       `WITH closed AS (
@@ -137,9 +156,9 @@ export class PostgresTokenMarketRepository implements TokenMarketRepository {
        INSERT INTO token_markets (
          token_market_id, token_id, venue, market_address, active_from,
          source_event_kind, source_event_key, transaction_signature,
-         instruction_index, log_index, slot, provenance
+         instruction_index, inner_instruction_index, log_index, slot, provenance
        )
-       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
          FROM closed
        RETURNING token_market_id`,
       [
@@ -152,6 +171,7 @@ export class PostgresTokenMarketRepository implements TokenMarketRepository {
         key,
         signature,
         instructionIndex,
+        innerInstructionIndex,
         logIndex,
         slot,
         JSON.stringify(input.provenance),
@@ -188,14 +208,16 @@ export class PostgresTokenMarketRepository implements TokenMarketRepository {
   private async insert(
     input: OpenTokenMarket
   ): Promise<Result<{ inserted: boolean; tokenMarketId: TokenMarketId }, Error>> {
-    const [kind, signature, instructionIndex, logIndex, slot] = originParams(input.origin);
+    const [kind, signature, instructionIndex, innerInstructionIndex, logIndex, slot] = originParams(
+      input.origin
+    );
     const key = originKey(input.origin);
     const inserted = await this.exec.query<{ token_market_id: string }>(
       `INSERT INTO token_markets (
          token_market_id, token_id, venue, market_address, active_from,
          source_event_kind, source_event_key, transaction_signature,
-         instruction_index, log_index, slot, provenance
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         instruction_index, inner_instruction_index, log_index, slot, provenance
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        ON CONFLICT (source_event_key) DO NOTHING
        RETURNING token_market_id`,
       [
@@ -208,6 +230,7 @@ export class PostgresTokenMarketRepository implements TokenMarketRepository {
         key,
         signature,
         instructionIndex,
+        innerInstructionIndex,
         logIndex,
         slot,
         JSON.stringify(input.provenance),
@@ -251,6 +274,9 @@ function toInterval(row: TokenMarketRow): TokenMarketInterval {
               ? {
                   transactionSignature: row.transaction_signature!,
                   instructionIndex: row.instruction_index,
+                  ...(row.inner_instruction_index === null
+                    ? {}
+                    : { innerInstructionIndex: row.inner_instruction_index }),
                 }
               : { transactionSignature: row.transaction_signature!, logIndex: row.log_index! },
           slot: Number(row.slot),

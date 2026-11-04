@@ -1,8 +1,9 @@
 import { Chain, LaunchSource, Result, failure, success } from '@nit/domain';
 import { Executor } from '@nit/database-public';
 import { ProviderIdentity } from '@nit/provider-interfaces';
-import { SourceTokenLaunch, SourceTokenMarket } from './contracts';
+import { SourceTokenGraduation, SourceTokenLaunch, SourceTokenMarket } from './contracts';
 import { DiscoveryBatchOutcome, LaunchOrigin } from './service';
+import { ChainEventOrigin, chainEventKey } from './lifecycle';
 
 export interface SolanaReconciliationCursor {
   chain: Chain.SOLANA;
@@ -90,6 +91,16 @@ function toCursor(row: CursorRow): SolanaReconciliationCursor {
 }
 
 export type ReconciledLaunch = SourceTokenLaunch & { market: SourceTokenMarket };
+export type ReconciledGraduation = SourceTokenGraduation & { market: SourceTokenMarket };
+
+export type DecodedMarketOccurrence =
+  | { kind: 'launch'; launch: ReconciledLaunch }
+  | { kind: 'graduation'; graduation: ReconciledGraduation };
+
+export type ReconciledMarketOccurrence = DecodedMarketOccurrence & {
+  programAddress: string;
+  observedAt: Date;
+};
 
 export interface SolanaReconciliationPageRequest {
   fromSlotInclusive: number;
@@ -99,7 +110,7 @@ export interface SolanaReconciliationPageRequest {
 }
 
 export interface SolanaReconciliationPage {
-  launches: readonly ReconciledLaunch[];
+  occurrences: readonly ReconciledMarketOccurrence[];
   /** True once pagination has crossed the requested slot floor. */
   reachedFloor: boolean;
   /** Required when more pages remain; passed as `before` on the next RPC request. */
@@ -120,6 +131,89 @@ export interface ReconciliationDiscovery {
     origin: LaunchOrigin,
     launches: readonly SourceTokenLaunch[]
   ): Promise<DiscoveryBatchOutcome>;
+  graduateBatch(
+    origin: LaunchOrigin,
+    graduations: readonly SourceTokenGraduation[]
+  ): Promise<DiscoveryBatchOutcome>;
+}
+
+export interface SolanaMarketOccurrenceRepository {
+  record(
+    chain: Chain.SOLANA,
+    launchSource: LaunchSource,
+    occurrence: ReconciledMarketOccurrence
+  ): Promise<Result<boolean, Error>>;
+}
+
+interface OccurrenceRow {
+  source_event_key: string;
+  chain: string;
+  launch_source: string;
+  event_kind: string;
+  program_address: string;
+  transaction_signature: string;
+  instruction_index: number | null;
+  inner_instruction_index: number | null;
+  log_index: number | null;
+  slot: string;
+  block_time: Date;
+  raw_payload: Record<string, unknown>;
+  observed_at: Date;
+}
+
+export class PostgresSolanaMarketOccurrenceRepository implements SolanaMarketOccurrenceRepository {
+  constructor(private readonly exec: Executor) {}
+
+  async record(
+    chain: Chain.SOLANA,
+    launchSource: LaunchSource,
+    occurrence: ReconciledMarketOccurrence
+  ): Promise<Result<boolean, Error>> {
+    const fact = occurrenceFact(occurrence);
+    const position = fact.origin.position;
+    const key = chainEventKey(position);
+    const inserted = await this.exec.query<{ source_event_key: string }>(
+      `INSERT INTO solana_market_occurrences (
+         source_event_key, chain, launch_source, event_kind, program_address,
+         transaction_signature, instruction_index, inner_instruction_index,
+         log_index, slot, block_time, raw_payload, observed_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       ON CONFLICT (source_event_key) DO NOTHING
+       RETURNING source_event_key`,
+      [
+        key,
+        chain,
+        launchSource,
+        occurrence.kind,
+        occurrence.programAddress,
+        position.transactionSignature,
+        position.instructionIndex ?? null,
+        'innerInstructionIndex' in position ? (position.innerInstructionIndex ?? null) : null,
+        position.logIndex ?? null,
+        fact.origin.slot,
+        fact.at,
+        JSON.stringify(fact.raw),
+        occurrence.observedAt,
+      ]
+    );
+    if (inserted.kind === 'failure') return failure(inserted.error);
+    if (inserted.value.length > 0) return success(true);
+
+    const existing = await this.exec.query<OccurrenceRow>(
+      `SELECT source_event_key, chain, launch_source, event_kind, program_address,
+              transaction_signature, instruction_index, inner_instruction_index,
+              log_index, slot, block_time, raw_payload, observed_at
+         FROM solana_market_occurrences
+        WHERE source_event_key = $1`,
+      [key]
+    );
+    if (existing.kind === 'failure') return failure(existing.error);
+    const row = existing.value[0];
+    if (row === undefined || !sameOccurrence(row, chain, launchSource, occurrence)) {
+      return failure(new Error(`Solana occurrence identity collision for '${key}'`));
+    }
+    return success(false);
+  }
 }
 
 export interface SolanaReconciliationOptions {
@@ -149,6 +243,7 @@ export class SolanaLaunchReconciler {
   constructor(
     private readonly source: SolanaReconciliationSource,
     private readonly cursors: SolanaReconciliationCursorRepository,
+    private readonly occurrences: SolanaMarketOccurrenceRepository,
     private readonly discovery: ReconciliationDiscovery,
     private readonly options: SolanaReconciliationOptions = {}
   ) {}
@@ -195,39 +290,62 @@ export class SolanaLaunchReconciler {
       const page = await this.source.fetchReconciliationPage(pageRequest);
       if (page.kind === 'failure') return failure(page.error);
       pages += 1;
-      fetched += page.value.launches.length;
+      fetched += page.value.occurrences.length;
 
-      for (const launch of page.value.launches) {
-        const slot = launch.market?.origin?.slot;
+      for (const occurrence of page.value.occurrences) {
+        let fact: ReturnType<typeof occurrenceFact>;
+        try {
+          fact = occurrenceFact(occurrence);
+        } catch {
+          return failure(new Error(`Solana reconciliation source returned a malformed occurrence`));
+        }
+        const slot = fact.origin.slot;
         if (
-          launch.market === undefined ||
-          launch.market.origin.kind !== 'chain' ||
           !isSlot(slot) ||
           slot < fromSlotInclusive ||
-          slot > head.value
+          slot > head.value ||
+          occurrence.programAddress.trim() === '' ||
+          !Number.isFinite(occurrence.observedAt.getTime()) ||
+          (this.source.launchSource === LaunchSource.PUMP_FUN && occurrence.kind !== 'launch') ||
+          (this.source.launchSource === LaunchSource.PUMPSWAP && occurrence.kind !== 'graduation')
         ) {
           return failure(
             new Error(
-              `Solana reconciliation source returned a launch without an in-range chain occurrence`
+              `Solana reconciliation source returned an invalid or mismatched market occurrence`
             )
           );
         }
+        const recorded = await this.occurrences.record(
+          this.source.chain,
+          this.source.launchSource,
+          occurrence
+        );
+        if (recorded.kind === 'failure') return failure(recorded.error);
       }
 
-      const batch = await this.discovery.discoverBatch(
+      const launchBatch = await this.discovery.discoverBatch(
         { chain: this.source.chain, launchSource: this.source.launchSource },
-        page.value.launches
+        page.value.occurrences.flatMap((occurrence) =>
+          occurrence.kind === 'launch' ? [occurrence.launch] : []
+        )
       );
-      if (batch.failures.length > 0) {
+      const graduationBatch = await this.discovery.graduateBatch(
+        { chain: this.source.chain, launchSource: this.source.launchSource },
+        page.value.occurrences.flatMap((occurrence) =>
+          occurrence.kind === 'graduation' ? [occurrence.graduation] : []
+        )
+      );
+      const failures = [...launchBatch.failures, ...graduationBatch.failures];
+      if (failures.length > 0) {
         return failure(
           new Error(
-            `Reconciliation failed to ingest ${batch.failures.length} launch occurrence(s): ${batch.failures[0]?.error.message ?? 'unknown error'}`
+            `Reconciliation failed to ingest ${failures.length} market occurrence(s): ${failures[0]?.error.message ?? 'unknown error'}`
           )
         );
       }
-      discovered += batch.discovered.length;
-      graduated += batch.graduated.length;
-      duplicates += batch.duplicates.length;
+      discovered += launchBatch.discovered.length;
+      graduated += graduationBatch.graduated.length;
+      duplicates += launchBatch.duplicates.length + graduationBatch.duplicates.length;
 
       if (page.value.reachedFloor) break;
       const next = page.value.nextBeforeSignature?.trim();
@@ -257,6 +375,61 @@ export class SolanaLaunchReconciler {
       duplicates,
     });
   }
+}
+
+function occurrenceFact(occurrence: ReconciledMarketOccurrence): {
+  origin: ChainEventOrigin;
+  at: Date;
+  raw: Record<string, unknown>;
+} {
+  return occurrence.kind === 'launch'
+    ? {
+        origin: occurrence.launch.market.origin,
+        at: occurrence.launch.launchTime,
+        raw: occurrence.launch.raw,
+      }
+    : {
+        origin: occurrence.graduation.market.origin,
+        at: occurrence.graduation.graduatedAt,
+        raw: occurrence.graduation.raw,
+      };
+}
+
+function sameOccurrence(
+  row: OccurrenceRow,
+  chain: Chain.SOLANA,
+  launchSource: LaunchSource,
+  occurrence: ReconciledMarketOccurrence
+): boolean {
+  const fact = occurrenceFact(occurrence);
+  const position = fact.origin.position;
+  return (
+    row.chain === String(chain) &&
+    row.launch_source === String(launchSource) &&
+    row.event_kind === occurrence.kind &&
+    row.program_address === occurrence.programAddress &&
+    row.transaction_signature === position.transactionSignature &&
+    row.instruction_index === (position.instructionIndex ?? null) &&
+    row.inner_instruction_index ===
+      ('innerInstructionIndex' in position ? (position.innerInstructionIndex ?? null) : null) &&
+    row.log_index === (position.logIndex ?? null) &&
+    Number(row.slot) === fact.origin.slot &&
+    row.block_time.getTime() === fact.at.getTime() &&
+    canonicalJson(row.raw_payload) === canonicalJson(fact.raw)
+  );
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
+      left.localeCompare(right)
+    );
+    return `{${entries
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function isSlot(value: unknown): value is number {

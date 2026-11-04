@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { LaunchSource, Result, success } from '@nit/domain';
-import { ReconciledLaunch } from './reconciliation';
+import { DecodedMarketOccurrence, ReconciledLaunch } from './reconciliation';
 import {
   SolanaLaunchTransaction,
   SolanaLaunchTransactionDecoder,
@@ -52,9 +52,9 @@ function decodedLaunch(transaction: SolanaLaunchTransaction): ReconciledLaunch {
 class RecordingDecoder implements SolanaLaunchTransactionDecoder {
   readonly calls: SolanaLaunchTransaction[] = [];
 
-  decode(transaction: SolanaLaunchTransaction): Result<readonly ReconciledLaunch[], Error> {
+  decode(transaction: SolanaLaunchTransaction): Result<readonly DecodedMarketOccurrence[], Error> {
     this.calls.push(transaction);
-    return success([decodedLaunch(transaction)]);
+    return success([{ kind: 'launch', launch: decodedLaunch(transaction) }]);
   }
 }
 
@@ -101,7 +101,8 @@ describe('SolanaRpcReconciliationSource', () => {
 
     expect(result.kind).toBe('success');
     if (result.kind === 'failure') throw result.error;
-    expect(result.value.launches).toHaveLength(1);
+    expect(result.value.occurrences).toHaveLength(1);
+    expect(result.value.occurrences[0]?.observedAt).toBeInstanceOf(Date);
     expect(result.value.reachedFloor).toBe(true);
     expect(result.value.nextBeforeSignature).toBeUndefined();
     expect(decoder.calls.map((call) => call.signature)).toEqual(['in-range']);
@@ -139,7 +140,7 @@ describe('SolanaRpcReconciliationSource', () => {
     });
 
     expect(result).toEqual(
-      success({ launches: [], reachedFloor: false, nextBeforeSignature: 'sig-1' })
+      success({ occurrences: [], reachedFloor: false, nextBeforeSignature: 'sig-1' })
     );
   });
 

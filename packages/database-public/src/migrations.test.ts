@@ -404,6 +404,26 @@ describe('Solana reconciliation cursor schema', () => {
   });
 });
 
+describe('Solana market occurrence schema', () => {
+  const occurrences = ddl(
+    MIGRATIONS.find((migration) => migration.id === '0018_solana_market_occurrences')
+  );
+
+  it('distinguishes top-level, inner, and log occurrences exactly', () => {
+    expect(occurrences).toContain('inner_instruction_index INTEGER');
+    expect(occurrences).toContain('solana_market_occurrences_inner_instruction_idx');
+    expect(occurrences).toContain(
+      'inner_instruction_index IS NULL OR instruction_index IS NOT NULL'
+    );
+  });
+
+  it('stores immutable decoded launch and graduation evidence', () => {
+    expect(occurrences).toContain('CREATE TABLE IF NOT EXISTS solana_market_occurrences');
+    expect(occurrences).toContain("event_kind IN ('launch', 'graduation')");
+    expect(occurrences).toContain('BEFORE UPDATE OR DELETE ON solana_market_occurrences');
+  });
+});
+
 describe('REQUIRED_TABLES', () => {
   it('lists each required table exactly once', () => {
     expect(new Set(REQUIRED_TABLES).size).toBe(REQUIRED_TABLES.length);

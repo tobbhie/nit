@@ -1,7 +1,7 @@
 import { Config, loadConfig } from '@nit/config';
 import { DatabasePool, Migrator } from '@nit/database-public';
 import { Logger } from '@nit/observability';
-import { ProviderRegistry } from '@nit/provider-interfaces';
+import { ProviderRegistry, ProviderSlot } from '@nit/provider-interfaces';
 import { assertSafeStartup, bindToyProviders } from './guard';
 
 export interface BootstrapResult {
@@ -11,10 +11,19 @@ export interface BootstrapResult {
   registry: ProviderRegistry;
 }
 
+export interface BootstrapOptions {
+  /** Generic apps retain the deterministic development bindings by default. */
+  bindDevelopmentToyProviders?: boolean;
+  requiredProviderSlots?: readonly ProviderSlot[];
+}
+
 /**
  * Generic application bootstrap with lifecycle hooks.
  */
-export async function bootstrap(configPath?: string): Promise<BootstrapResult> {
+export async function bootstrap(
+  configPath?: string,
+  options: BootstrapOptions = {}
+): Promise<BootstrapResult> {
   const config = loadConfig(configPath);
 
   const logger = new Logger({
@@ -63,9 +72,15 @@ export async function bootstrap(configPath?: string): Promise<BootstrapResult> {
   }
 
   const registry = new ProviderRegistry();
-  bindToyProviders(registry);
+  if (options.bindDevelopmentToyProviders !== false) bindToyProviders(registry);
 
-  assertSafeStartup({ config, registry });
+  assertSafeStartup({
+    config,
+    registry,
+    ...(options.requiredProviderSlots === undefined
+      ? {}
+      : { requiredSlots: options.requiredProviderSlots }),
+  });
 
   logger.info('Bootstrap complete');
 

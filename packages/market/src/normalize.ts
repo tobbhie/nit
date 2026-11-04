@@ -141,6 +141,10 @@ export function normalizeSourceLaunch(
     }
     const { origin } = launch.market;
     const instructionIndex = origin.position.instructionIndex;
+    const innerInstructionIndex =
+      'innerInstructionIndex' in origin.position
+        ? origin.position.innerInstructionIndex
+        : undefined;
     const logIndex = origin.position.logIndex;
     if (
       !Number.isSafeInteger(origin.slot) ||
@@ -148,6 +152,10 @@ export function normalizeSourceLaunch(
       (instructionIndex === undefined) === (logIndex === undefined) ||
       (instructionIndex !== undefined &&
         (!Number.isSafeInteger(instructionIndex) || instructionIndex < 0)) ||
+      (innerInstructionIndex !== undefined &&
+        (instructionIndex === undefined ||
+          !Number.isSafeInteger(innerInstructionIndex) ||
+          innerInstructionIndex < 0)) ||
       (logIndex !== undefined && (!Number.isSafeInteger(logIndex) || logIndex < 0)) ||
       origin.position.transactionSignature.trim().length === 0
     ) {

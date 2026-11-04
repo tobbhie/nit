@@ -36,6 +36,15 @@ export interface SourceTokenLaunch {
   raw: Record<string, unknown>;
 }
 
+/** A Pump bonding curve becoming a concrete PumpSwap pool. */
+export interface SourceTokenGraduation {
+  /** Existing canonical token mint. A graduation must never invent token metadata. */
+  address: string;
+  graduatedAt: Timestamp;
+  market: SourceTokenMarket;
+  raw: Record<string, unknown>;
+}
+
 /**
  * What to ask a launchpad for.
  *

@@ -5,12 +5,13 @@ import {
   Result,
   Timestamp,
   TokenId,
+  ValidationError,
   failure,
   generateTokenMarketId,
   now,
   success,
 } from '@nit/domain';
-import { SourceTokenLaunch } from './contracts';
+import { SourceTokenGraduation, SourceTokenLaunch } from './contracts';
 import { enrichmentJobsFor } from './enrichment-jobs';
 import { tokenDiscoveredEvent, tokenGraduatedEvent } from './events';
 import { normalizeSourceLaunch } from './normalize';
@@ -219,6 +220,70 @@ export class MarketDiscoveryService {
   }
 
   /**
+   * Advance an already-known Pump token to its observed PumpSwap pool.
+   *
+   * A migration event carries a mint and pool, but no trustworthy token name or
+   * ticker. Keeping this separate from `discover` prevents reconciliation from
+   * manufacturing metadata merely to get through launch normalization.
+   */
+  async graduate(
+    origin: LaunchOrigin,
+    graduation: SourceTokenGraduation
+  ): Promise<Result<DiscoveryOutcome, Error>> {
+    const validated = validateGraduation(origin, graduation);
+    if (validated.kind === 'failure') return validated;
+
+    return this.unitOfWork.transact<DiscoveryOutcome>(async ({ tokens, markets, events }) => {
+      const token = await tokens.findByAddress(origin.chain, validated.value.address);
+      if (token.kind === 'failure') return failure(token.error);
+      if (token.value === null) {
+        return failure(
+          new Error(`Cannot graduate unknown token ${origin.chain}/${validated.value.address}`)
+        );
+      }
+
+      const current = await markets.findCurrent(token.value.tokenId);
+      if (current.kind === 'failure') return failure(current.error);
+      if (current.value?.venue === MarketVenue.PUMPSWAP) {
+        return success({ status: 'duplicate', tokenId: token.value.tokenId });
+      }
+      if (current.value?.venue !== MarketVenue.PUMP_FUN_BONDING_CURVE) {
+        return failure(
+          new Error(`Token ${token.value.tokenId} has no active Pump bonding curve to graduate`)
+        );
+      }
+
+      const transitioned = await markets.transition({
+        tokenMarketId: generateTokenMarketId(),
+        tokenId: token.value.tokenId,
+        venue: MarketVenue.PUMPSWAP,
+        marketAddress: validated.value.market.marketAddress,
+        activeFrom: validated.value.graduatedAt,
+        origin: validated.value.market.origin,
+        provenance: {
+          adapterContract: 'source-token-graduation-v1',
+          launchSource: origin.launchSource,
+        },
+      });
+      if (transitioned.kind === 'failure') return failure(transitioned.error);
+      if (!transitioned.value.inserted) {
+        return success({ status: 'duplicate', tokenId: token.value.tokenId });
+      }
+
+      const appended = await events.append(
+        tokenGraduatedEvent({
+          tokenId: token.value.tokenId,
+          marketAddress: validated.value.market.marketAddress,
+          graduatedAt: validated.value.graduatedAt,
+          producer: this.options.producer,
+        })
+      );
+      if (appended.kind === 'failure') return failure(appended.error);
+      return success({ status: 'graduated', tokenId: token.value.tokenId });
+    });
+  }
+
+  /**
    * Discover a poll's worth of launches, oldest first.
    *
    * Sorting matters for more than tidiness: the event log is what replay reads,
@@ -263,4 +328,70 @@ export class MarketDiscoveryService {
 
     return batch;
   }
+
+  async graduateBatch(
+    origin: LaunchOrigin,
+    graduations: readonly SourceTokenGraduation[]
+  ): Promise<DiscoveryBatchOutcome> {
+    const outcome: DiscoveryBatchOutcome = {
+      discovered: [],
+      graduated: [],
+      duplicates: [],
+      failures: [],
+    };
+    for (const graduation of graduations) {
+      const result = await this.graduate(origin, graduation);
+      if (result.kind === 'failure') {
+        outcome.failures.push({ address: graduation.address, error: result.error });
+      } else if (result.value.status === 'graduated') {
+        outcome.graduated.push(result.value.tokenId);
+      } else {
+        outcome.duplicates.push(result.value.tokenId);
+      }
+    }
+    return outcome;
+  }
+}
+
+function validateGraduation(
+  origin: LaunchOrigin,
+  graduation: SourceTokenGraduation
+): Result<SourceTokenGraduation, ValidationError> {
+  const address = graduation.address.trim();
+  const marketAddress = graduation.market.marketAddress.trim();
+  const position = graduation.market.origin.position;
+  const instructionIndex = position.instructionIndex;
+  const innerInstructionIndex =
+    'innerInstructionIndex' in position ? position.innerInstructionIndex : undefined;
+  const logIndex = position.logIndex;
+  if (origin.launchSource !== LaunchSource.PUMPSWAP) {
+    return failure(new ValidationError('Only PumpSwap can record a token graduation'));
+  }
+  if (
+    address === '' ||
+    marketAddress === '' ||
+    !Number.isFinite(graduation.graduatedAt.getTime()) ||
+    !Number.isSafeInteger(graduation.market.origin.slot) ||
+    graduation.market.origin.slot < 0 ||
+    position.transactionSignature.trim() === '' ||
+    (instructionIndex === undefined) === (logIndex === undefined) ||
+    (instructionIndex !== undefined &&
+      (!Number.isSafeInteger(instructionIndex) || instructionIndex < 0)) ||
+    (innerInstructionIndex !== undefined &&
+      (instructionIndex === undefined ||
+        !Number.isSafeInteger(innerInstructionIndex) ||
+        innerInstructionIndex < 0)) ||
+    (logIndex !== undefined && (!Number.isSafeInteger(logIndex) || logIndex < 0))
+  ) {
+    return failure(new ValidationError('Token graduation occurrence is invalid'));
+  }
+  return success({
+    address,
+    graduatedAt: graduation.graduatedAt,
+    market: {
+      marketAddress,
+      origin: graduation.market.origin,
+    },
+    raw: graduation.raw,
+  });
 }

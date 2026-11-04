@@ -4,7 +4,9 @@ import { ConfigSchema, Config } from './schema';
 import { ConfigurationError } from '@nit/domain';
 import { validateProductionSafety } from './guards';
 
-function parseEnvironment(value: string | undefined): 'development' | 'staging' | 'production' | undefined {
+function parseEnvironment(
+  value: string | undefined
+): 'development' | 'staging' | 'production' | undefined {
   if (value === 'development' || value === 'staging' || value === 'production') {
     return value;
   }
@@ -27,6 +29,50 @@ function parseIntEnv(value: string | undefined): number | undefined {
   return Number.isInteger(parsed) ? parsed : undefined;
 }
 
+function parseBooleanEnv(value: string | undefined): boolean | undefined {
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return undefined;
+}
+
+function solanaMarketInput(fileConfig: Partial<Config>): unknown {
+  const fromFile = fileConfig.solanaMarket;
+  const enabled =
+    parseBooleanEnv(process.env['NIT_SOLANA_MARKET_ENABLED']) ?? fromFile?.enabled ?? false;
+  if (!enabled) return { enabled: false };
+  const enabledFile = fromFile?.enabled === true ? fromFile : undefined;
+  return {
+    enabled: true,
+    httpEndpoint: process.env['NIT_SOLANA_RPC_HTTP_ENDPOINT'] ?? enabledFile?.httpEndpoint,
+    websocketEndpoint:
+      process.env['NIT_SOLANA_RPC_WEBSOCKET_ENDPOINT'] ?? enabledFile?.websocketEndpoint,
+    pumpFunProgramAddress:
+      process.env['NIT_PUMP_FUN_PROGRAM_ADDRESS'] ?? enabledFile?.pumpFunProgramAddress,
+    pumpSwapProgramAddress:
+      process.env['NIT_PUMPSWAP_PROGRAM_ADDRESS'] ?? enabledFile?.pumpSwapProgramAddress,
+    requestTimeoutMs:
+      parseIntEnv(process.env['NIT_SOLANA_REQUEST_TIMEOUT_MS']) ?? enabledFile?.requestTimeoutMs,
+    minRequestIntervalMs:
+      parseIntEnv(process.env['NIT_SOLANA_MIN_REQUEST_INTERVAL_MS']) ??
+      enabledFile?.minRequestIntervalMs,
+    reconciliation: {
+      ...enabledFile?.reconciliation,
+      intervalMs:
+        parseIntEnv(process.env['NIT_SOLANA_RECONCILIATION_INTERVAL_MS']) ??
+        enabledFile?.reconciliation.intervalMs,
+      overlapSlots:
+        parseIntEnv(process.env['NIT_SOLANA_RECONCILIATION_OVERLAP_SLOTS']) ??
+        enabledFile?.reconciliation.overlapSlots,
+      initialLookbackSlots:
+        parseIntEnv(process.env['NIT_SOLANA_INITIAL_LOOKBACK_SLOTS']) ??
+        enabledFile?.reconciliation.initialLookbackSlots,
+      pageSize:
+        parseIntEnv(process.env['NIT_SOLANA_RECONCILIATION_PAGE_SIZE']) ??
+        enabledFile?.reconciliation.pageSize,
+    },
+  };
+}
+
 /**
  * Load configuration from environment variables and YAML files
  */
@@ -40,10 +86,9 @@ export function loadConfig(configPath?: string): Config {
       const content = readFileSync(configPath, 'utf-8');
       fileConfig = parse(content) as Partial<Config>;
     } catch (error) {
-      throw new ConfigurationError(
-        `Failed to load configuration from ${configPath}`,
-        { error: String(error) }
-      );
+      throw new ConfigurationError(`Failed to load configuration from ${configPath}`, {
+        error: String(error),
+      });
     }
   }
 
@@ -51,9 +96,13 @@ export function loadConfig(configPath?: string): Config {
   // is deliberately untyped — ConfigSchema.safeParse below is the type gate.
   const config: Record<string, unknown> = {
     ...fileConfig,
-    environment: parseEnvironment(process.env['NIT_ENVIRONMENT']) ?? fileConfig.environment ?? parseEnvironment(env),
+    environment:
+      parseEnvironment(process.env['NIT_ENVIRONMENT']) ??
+      fileConfig.environment ??
+      parseEnvironment(env),
     version: {
-      schemaVersion: process.env['NIT_SCHEMA_VERSION'] || fileConfig.version?.schemaVersion || '1.0.0',
+      schemaVersion:
+        process.env['NIT_SCHEMA_VERSION'] || fileConfig.version?.schemaVersion || '1.0.0',
       buildId: process.env['NIT_BUILD_ID'] || fileConfig.version?.buildId || 'dev',
       commitHash: process.env['GIT_COMMIT'] || fileConfig.version?.commitHash,
     },
@@ -69,15 +118,22 @@ export function loadConfig(configPath?: string): Config {
     },
     queue: fileConfig.queue,
     providers: fileConfig.providers,
+    solanaMarket: solanaMarketInput(fileConfig),
     featureFlags: {
-      privateIntelligence: process.env['FEATURE_PRIVATE_INTELLIGENCE'] === 'true' ||
-        fileConfig.featureFlags?.privateIntelligence || false,
-      productionAlerts: process.env['FEATURE_PRODUCTION_ALERTS'] === 'true' ||
-        fileConfig.featureFlags?.productionAlerts || false,
-      execution: process.env['FEATURE_EXECUTION'] === 'true' ||
-        fileConfig.featureFlags?.execution || false,
-      privateSources: process.env['FEATURE_PRIVATE_SOURCES'] === 'true' ||
-        fileConfig.featureFlags?.privateSources || false,
+      privateIntelligence:
+        process.env['FEATURE_PRIVATE_INTELLIGENCE'] === 'true' ||
+        fileConfig.featureFlags?.privateIntelligence ||
+        false,
+      productionAlerts:
+        process.env['FEATURE_PRODUCTION_ALERTS'] === 'true' ||
+        fileConfig.featureFlags?.productionAlerts ||
+        false,
+      execution:
+        process.env['FEATURE_EXECUTION'] === 'true' || fileConfig.featureFlags?.execution || false,
+      privateSources:
+        process.env['FEATURE_PRIVATE_SOURCES'] === 'true' ||
+        fileConfig.featureFlags?.privateSources ||
+        false,
     },
     logLevel: parseLogLevel(process.env['LOG_LEVEL']) ?? fileConfig.logLevel ?? 'info',
   };

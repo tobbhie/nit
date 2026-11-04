@@ -1102,6 +1102,134 @@ export const MIGRATIONS: readonly Migration[] = [
         FOR EACH ROW EXECUTE FUNCTION reject_solana_cursor_regression();
     `,
   },
+  {
+    id: '0018_solana_market_occurrences',
+    description: 'Exact nested Solana occurrence identity and immutable raw capture',
+    up: `
+      ALTER TABLE token_markets
+        ADD COLUMN IF NOT EXISTS inner_instruction_index INTEGER;
+      ALTER TABLE token_markets
+        DROP CONSTRAINT IF EXISTS token_markets_source_shape;
+      ALTER TABLE token_markets
+        DROP CONSTRAINT IF EXISTS token_markets_inner_instruction_index_nonnegative;
+      ALTER TABLE token_markets
+        ADD CONSTRAINT token_markets_inner_instruction_index_nonnegative CHECK (
+          inner_instruction_index IS NULL OR inner_instruction_index >= 0
+        );
+      ALTER TABLE token_markets
+        ADD CONSTRAINT token_markets_source_shape CHECK (
+          (
+            source_event_kind = 'chain'
+            AND transaction_signature IS NOT NULL
+            AND market_address IS NOT NULL
+            AND num_nonnulls(instruction_index, log_index) = 1
+            AND (inner_instruction_index IS NULL OR instruction_index IS NOT NULL)
+            AND slot IS NOT NULL
+          )
+          OR
+          (
+            source_event_kind = 'legacy'
+            AND transaction_signature IS NULL
+            AND instruction_index IS NULL
+            AND inner_instruction_index IS NULL
+            AND log_index IS NULL
+            AND slot IS NULL
+          )
+        );
+
+      DROP INDEX IF EXISTS token_markets_chain_instruction_idx;
+      CREATE UNIQUE INDEX IF NOT EXISTS token_markets_chain_instruction_idx
+        ON token_markets (transaction_signature, instruction_index)
+        WHERE source_event_kind = 'chain'
+          AND instruction_index IS NOT NULL
+          AND inner_instruction_index IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS token_markets_chain_inner_instruction_idx
+        ON token_markets (
+          transaction_signature, instruction_index, inner_instruction_index
+        )
+        WHERE source_event_kind = 'chain' AND inner_instruction_index IS NOT NULL;
+
+      CREATE OR REPLACE FUNCTION token_market_allow_close_only()
+        RETURNS TRIGGER AS $$
+      BEGIN
+        IF TG_OP = 'DELETE' THEN
+          RAISE EXCEPTION 'token market intervals cannot be deleted'
+            USING ERRCODE = 'restrict_violation';
+        END IF;
+        IF OLD.active_until IS NOT NULL
+          OR NEW.active_until IS NULL
+          OR NEW.active_until <= OLD.active_from
+          OR NEW.token_market_id IS DISTINCT FROM OLD.token_market_id
+          OR NEW.token_id IS DISTINCT FROM OLD.token_id
+          OR NEW.venue IS DISTINCT FROM OLD.venue
+          OR NEW.market_address IS DISTINCT FROM OLD.market_address
+          OR NEW.active_from IS DISTINCT FROM OLD.active_from
+          OR NEW.source_event_kind IS DISTINCT FROM OLD.source_event_kind
+          OR NEW.source_event_key IS DISTINCT FROM OLD.source_event_key
+          OR NEW.transaction_signature IS DISTINCT FROM OLD.transaction_signature
+          OR NEW.instruction_index IS DISTINCT FROM OLD.instruction_index
+          OR NEW.inner_instruction_index IS DISTINCT FROM OLD.inner_instruction_index
+          OR NEW.log_index IS DISTINCT FROM OLD.log_index
+          OR NEW.slot IS DISTINCT FROM OLD.slot
+          OR NEW.provenance IS DISTINCT FROM OLD.provenance
+          OR NEW.recorded_at IS DISTINCT FROM OLD.recorded_at THEN
+          RAISE EXCEPTION 'token market intervals may only be closed once'
+            USING ERRCODE = 'restrict_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      CREATE TABLE IF NOT EXISTS solana_market_occurrences (
+        source_event_key TEXT PRIMARY KEY,
+        chain TEXT NOT NULL CHECK (chain = 'solana'),
+        launch_source TEXT NOT NULL CHECK (launch_source IN ('pump_fun', 'pumpswap')),
+        event_kind TEXT NOT NULL CHECK (event_kind IN ('launch', 'graduation')),
+        program_address TEXT NOT NULL,
+        transaction_signature TEXT NOT NULL,
+        instruction_index INTEGER,
+        inner_instruction_index INTEGER,
+        log_index INTEGER,
+        slot BIGINT NOT NULL CHECK (slot >= 0),
+        block_time TIMESTAMPTZ NOT NULL,
+        raw_payload JSONB NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT solana_market_occurrences_position_shape CHECK (
+          num_nonnulls(instruction_index, log_index) = 1
+          AND (inner_instruction_index IS NULL OR instruction_index IS NOT NULL)
+        ),
+        CONSTRAINT solana_market_occurrences_instruction_nonnegative CHECK (
+          instruction_index IS NULL OR instruction_index >= 0
+        ),
+        CONSTRAINT solana_market_occurrences_inner_nonnegative CHECK (
+          inner_instruction_index IS NULL OR inner_instruction_index >= 0
+        ),
+        CONSTRAINT solana_market_occurrences_log_nonnegative CHECK (
+          log_index IS NULL OR log_index >= 0
+        )
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS solana_market_occurrences_instruction_idx
+        ON solana_market_occurrences (transaction_signature, instruction_index)
+        WHERE instruction_index IS NOT NULL AND inner_instruction_index IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS solana_market_occurrences_inner_instruction_idx
+        ON solana_market_occurrences (
+          transaction_signature, instruction_index, inner_instruction_index
+        )
+        WHERE inner_instruction_index IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS solana_market_occurrences_log_idx
+        ON solana_market_occurrences (transaction_signature, log_index)
+        WHERE log_index IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS solana_market_occurrences_source_slot_idx
+        ON solana_market_occurrences (launch_source, slot DESC);
+
+      DROP TRIGGER IF EXISTS solana_market_occurrences_append_only
+        ON solana_market_occurrences;
+      CREATE TRIGGER solana_market_occurrences_append_only
+        BEFORE UPDATE OR DELETE ON solana_market_occurrences
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+    `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
@@ -1114,6 +1242,7 @@ export const REQUIRED_TABLES: readonly string[] = [
   'media',
   'tokens',
   'token_markets',
+  'solana_market_occurrences',
   'solana_reconciliation_cursors',
   'token_artwork',
   'market_snapshots',

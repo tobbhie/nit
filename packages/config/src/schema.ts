@@ -38,6 +38,59 @@ export const FeatureFlagsSchema = z.object({
   privateSources: z.boolean().default(false),
 });
 
+const HttpEndpointSchema = z
+  .string()
+  .url()
+  .refine(
+    (value) => {
+      const parsed = new URL(value);
+      return (
+        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+        parsed.username === '' &&
+        parsed.password === ''
+      );
+    },
+    { message: 'must be an HTTP(S) URL without embedded credentials' }
+  );
+
+const WebSocketEndpointSchema = z
+  .string()
+  .url()
+  .refine(
+    (value) => {
+      const parsed = new URL(value);
+      return (
+        (parsed.protocol === 'ws:' || parsed.protocol === 'wss:') &&
+        parsed.username === '' &&
+        parsed.password === ''
+      );
+    },
+    { message: 'must be a WS(S) URL without embedded credentials' }
+  );
+
+export const SolanaMarketConfigSchema = z
+  .discriminatedUnion('enabled', [
+    z.object({ enabled: z.literal(false) }),
+    z.object({
+      enabled: z.literal(true),
+      httpEndpoint: HttpEndpointSchema,
+      websocketEndpoint: WebSocketEndpointSchema,
+      pumpFunProgramAddress: z.string().trim().min(1),
+      pumpSwapProgramAddress: z.string().trim().min(1),
+      requestTimeoutMs: z.number().int().positive().default(15_000),
+      minRequestIntervalMs: z.number().int().nonnegative().default(200),
+      reconciliation: z
+        .object({
+          intervalMs: z.number().int().positive().default(60_000),
+          overlapSlots: z.number().int().nonnegative().default(250),
+          initialLookbackSlots: z.number().int().nonnegative().default(2_000),
+          pageSize: z.number().int().positive().max(1_000).default(1_000),
+        })
+        .default({}),
+    }),
+  ])
+  .default({ enabled: false });
+
 export const ConfigSchema = z.object({
   environment: EnvironmentSchema,
   version: z.object({
@@ -48,6 +101,7 @@ export const ConfigSchema = z.object({
   database: DatabaseConfigSchema,
   queue: QueueConfigSchema,
   providers: z.record(ProviderConfigSchema).default({}),
+  solanaMarket: SolanaMarketConfigSchema,
   featureFlags: FeatureFlagsSchema,
   logLevel: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 });
@@ -57,3 +111,4 @@ export type DatabaseConfig = z.infer<typeof DatabaseConfigSchema>;
 export type QueueConfig = z.infer<typeof QueueConfigSchema>;
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
 export type FeatureFlags = z.infer<typeof FeatureFlagsSchema>;
+export type SolanaMarketConfig = z.infer<typeof SolanaMarketConfigSchema>;

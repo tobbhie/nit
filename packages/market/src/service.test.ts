@@ -4,6 +4,7 @@ import { EventEnvelope } from '@nit/events';
 import { TokenDiscoveredPayload } from './events';
 import { DISCOVERED, FakeUnitOfWork, PUMP_FUN, launch } from './in-memory.fixtures';
 import { MarketDiscoveryService } from './service';
+import { SourceTokenGraduation } from './contracts';
 
 function serviceOn(uow: FakeUnitOfWork): MarketDiscoveryService {
   return new MarketDiscoveryService(uow, {
@@ -156,6 +157,81 @@ describe('MarketDiscoveryService.discover', () => {
   it('rejects a malformed launch without opening a transaction', async () => {
     const uow = new FakeUnitOfWork();
     const result = await serviceOn(uow).discover(PUMP_FUN, launch({ ticker: '' }));
+
+    expect(result.kind).toBe('failure');
+    expect(uow.transactions).toBe(0);
+  });
+});
+
+describe('MarketDiscoveryService.graduate', () => {
+  const pumpSwap = { chain: Chain.SOLANA, launchSource: LaunchSource.PUMPSWAP };
+  const launchMarket = {
+    marketAddress: 'CurveGraduate1',
+    origin: {
+      kind: 'chain' as const,
+      slot: 350_000_000,
+      position: {
+        transactionSignature: 'launch-signature',
+        instructionIndex: 3,
+        innerInstructionIndex: 1,
+      },
+    },
+  };
+  const graduation = (address = 'Graduate1'): SourceTokenGraduation => ({
+    address,
+    graduatedAt: new Date('2026-08-20T10:00:00.000Z'),
+    market: {
+      marketAddress: 'PoolGraduate1',
+      origin: {
+        kind: 'chain',
+        slot: 350_001_000,
+        position: {
+          transactionSignature: 'graduation-signature',
+          instructionIndex: 4,
+          innerInstructionIndex: 2,
+        },
+      },
+    },
+    raw: { event: 'CompletePumpAmmMigrationEvent' },
+  });
+
+  it('advances the known token market and absorbs an exact replay', async () => {
+    const uow = new FakeUnitOfWork();
+    const service = serviceOn(uow);
+    const discovered = await service.discover(
+      PUMP_FUN,
+      launch({ address: 'Graduate1', market: launchMarket })
+    );
+    const first = await service.graduate(pumpSwap, graduation());
+    const replay = await service.graduate(pumpSwap, graduation());
+    if (discovered.kind === 'failure' || first.kind === 'failure' || replay.kind === 'failure') {
+      throw new Error('Expected discovery and graduation to succeed');
+    }
+
+    expect(first.value).toEqual({ status: 'graduated', tokenId: discovered.value.tokenId });
+    expect(replay.value).toEqual({ status: 'duplicate', tokenId: discovered.value.tokenId });
+    expect(uow.store.markets).toHaveLength(2);
+    expect(uow.store.markets[0]?.activeUntil).toEqual(graduation().graduatedAt);
+    expect(uow.store.markets[1]?.origin).toEqual(graduation().market.origin);
+    expect(uow.store.events.map((event) => event.eventType)).toEqual([
+      EventType.TOKEN_DISCOVERED,
+      EventType.TOKEN_GRADUATED,
+    ]);
+  });
+
+  it('fails an unknown mint instead of inventing token metadata', async () => {
+    const uow = new FakeUnitOfWork();
+    const result = await serviceOn(uow).graduate(pumpSwap, graduation('UnknownMint'));
+
+    expect(result.kind).toBe('failure');
+    expect(uow.store.tokens.size).toBe(0);
+    expect(uow.store.markets).toHaveLength(0);
+    expect(uow.store.events).toHaveLength(0);
+  });
+
+  it('rejects graduation through the wrong source before opening a transaction', async () => {
+    const uow = new FakeUnitOfWork();
+    const result = await serviceOn(uow).graduate(PUMP_FUN, graduation());
 
     expect(result.kind).toBe('failure');
     expect(uow.transactions).toBe(0);

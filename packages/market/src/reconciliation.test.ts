@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { Chain, LaunchSource, Result, failure, success } from '@nit/domain';
-import { SourceTokenLaunch } from './contracts';
+import { SourceTokenGraduation, SourceTokenLaunch } from './contracts';
 import {
+  ReconciledMarketOccurrence,
   ReconciliationDiscovery,
   SolanaLaunchReconciler,
   SolanaReconciliationCursor,
@@ -9,6 +10,7 @@ import {
   SolanaReconciliationPage,
   SolanaReconciliationPageRequest,
   SolanaReconciliationSource,
+  SolanaMarketOccurrenceRepository,
 } from './reconciliation';
 
 class MemoryCursor implements SolanaReconciliationCursorRepository {
@@ -86,19 +88,47 @@ class RecordingDiscovery implements ReconciliationDiscovery {
       failures: this.fail ? [{ address: 'Mint1', error: new Error('database unavailable') }] : [],
     });
   }
+
+  graduateBatch(
+    _origin: unknown,
+    _graduations: readonly SourceTokenGraduation[]
+  ): Promise<{
+    discovered: never[];
+    graduated: never[];
+    duplicates: never[];
+    failures: never[];
+  }> {
+    return Promise.resolve({ discovered: [], graduated: [], duplicates: [], failures: [] });
+  }
+}
+
+class MemoryOccurrences implements SolanaMarketOccurrenceRepository {
+  readonly values: ReconciledMarketOccurrence[] = [];
+
+  record(
+    _chain: Chain.SOLANA,
+    _launchSource: LaunchSource,
+    occurrence: ReconciledMarketOccurrence
+  ): Promise<Result<boolean, Error>> {
+    this.values.push(occurrence);
+    return Promise.resolve(success(true));
+  }
 }
 
 describe('SolanaLaunchReconciler', () => {
   it('overlaps a stored watermark, pages by signature, then advances to finalized head', async () => {
     const source = new ScriptedSource(success(1_100), [
-      success({ launches: [], reachedFloor: false, nextBeforeSignature: 'sig-2' }),
-      success({ launches: [], reachedFloor: true }),
+      success({ occurrences: [], reachedFloor: false, nextBeforeSignature: 'sig-2' }),
+      success({ occurrences: [], reachedFloor: true }),
     ]);
     const cursors = new MemoryCursor(1_000);
-    const result = await new SolanaLaunchReconciler(source, cursors, new RecordingDiscovery(), {
-      overlapSlots: 250,
-      pageSize: 100,
-    }).reconcile();
+    const result = await new SolanaLaunchReconciler(
+      source,
+      cursors,
+      new MemoryOccurrences(),
+      new RecordingDiscovery(),
+      { overlapSlots: 250, pageSize: 100 }
+    ).reconcile();
 
     expect(result.kind).toBe('success');
     expect(source.requests).toEqual([
@@ -115,43 +145,58 @@ describe('SolanaLaunchReconciler', () => {
 
   it('uses a bounded initial lookback when no cursor exists', async () => {
     const source = new ScriptedSource(success(5_000), [
-      success({ launches: [], reachedFloor: true }),
+      success({ occurrences: [], reachedFloor: true }),
     ]);
-    await new SolanaLaunchReconciler(source, new MemoryCursor(), new RecordingDiscovery(), {
-      initialLookbackSlots: 2_000,
-    }).reconcile();
+    await new SolanaLaunchReconciler(
+      source,
+      new MemoryCursor(),
+      new MemoryOccurrences(),
+      new RecordingDiscovery(),
+      { initialLookbackSlots: 2_000 }
+    ).reconcile();
 
     expect(source.requests[0]?.fromSlotInclusive).toBe(3_000);
   });
 
   it('does not advance after an ingest failure', async () => {
     const source = new ScriptedSource(success(1_100), [
-      success({ launches: [], reachedFloor: true }),
+      success({ occurrences: [], reachedFloor: true }),
     ]);
     const cursors = new MemoryCursor(1_000);
     const discovery = new RecordingDiscovery();
     discovery.fail = true;
 
-    const result = await new SolanaLaunchReconciler(source, cursors, discovery).reconcile();
+    const result = await new SolanaLaunchReconciler(
+      source,
+      cursors,
+      new MemoryOccurrences(),
+      discovery
+    ).reconcile();
     expect(result.kind).toBe('failure');
     expect(cursors.advances).toEqual([]);
   });
 
   it('rejects a launch that lacks an exact chain occurrence', async () => {
     const malformed = {
-      address: 'Mint1',
-      ticker: 'MINT',
-      name: 'Mint',
-      launchTime: new Date('2026-08-20T09:00:00.000Z'),
-      raw: {},
+      kind: 'launch',
+      programAddress: 'Pump111111111111111111111111111111111111',
+      observedAt: new Date('2026-08-20T09:00:01.000Z'),
+      launch: {
+        address: 'Mint1',
+        ticker: 'MINT',
+        name: 'Mint',
+        launchTime: new Date('2026-08-20T09:00:00.000Z'),
+        raw: {},
+      },
     } as never;
     const source = new ScriptedSource(success(1_100), [
-      success({ launches: [malformed], reachedFloor: true }),
+      success({ occurrences: [malformed], reachedFloor: true }),
     ]);
     const cursors = new MemoryCursor(1_000);
     const result = await new SolanaLaunchReconciler(
       source,
       cursors,
+      new MemoryOccurrences(),
       new RecordingDiscovery()
     ).reconcile();
 
@@ -161,12 +206,13 @@ describe('SolanaLaunchReconciler', () => {
 
   it('fails closed when signature pagination stalls', async () => {
     const source = new ScriptedSource(success(1_100), [
-      success({ launches: [], reachedFloor: false }),
+      success({ occurrences: [], reachedFloor: false }),
     ]);
     const cursors = new MemoryCursor(1_000);
     const result = await new SolanaLaunchReconciler(
       source,
       cursors,
+      new MemoryOccurrences(),
       new RecordingDiscovery()
     ).reconcile();
 
@@ -180,6 +226,7 @@ describe('SolanaLaunchReconciler', () => {
     const result = await new SolanaLaunchReconciler(
       source,
       cursors,
+      new MemoryOccurrences(),
       new RecordingDiscovery()
     ).reconcile();
 

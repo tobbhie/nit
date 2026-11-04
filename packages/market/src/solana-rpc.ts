@@ -1,6 +1,8 @@
 import { Chain, LaunchSource, Result, failure, success } from '@nit/domain';
+import { ProviderIdentity } from '@nit/provider-interfaces';
 import {
-  ReconciledLaunch,
+  DecodedMarketOccurrence,
+  ReconciledMarketOccurrence,
   SolanaReconciliationPage,
   SolanaReconciliationPageRequest,
   SolanaReconciliationSource,
@@ -31,6 +33,7 @@ export interface SolanaLaunchTransaction {
   slot: number;
   launchSource: LaunchSource;
   programAddress: string;
+  observedAt: Date;
   /** The complete `getTransaction` result, before launchpad-specific decoding. */
   transaction: Record<string, unknown>;
 }
@@ -43,21 +46,33 @@ export interface SolanaLaunchTransaction {
  * address or an unversioned binary layout from becoming an infrastructure
  * constant.
  */
-export interface SolanaLaunchTransactionDecoder {
-  decode(transaction: SolanaLaunchTransaction): Result<readonly ReconciledLaunch[], Error>;
+export interface SolanaMarketTransactionDecoder {
+  decode(transaction: SolanaLaunchTransaction): Result<readonly DecodedMarketOccurrence[], Error>;
 }
+
+/** @deprecated Use `SolanaMarketTransactionDecoder`. */
+export type SolanaLaunchTransactionDecoder = SolanaMarketTransactionDecoder;
 
 export interface SolanaRpcReconciliationOptions {
   endpoint: string;
   programAddress: string;
   launchSource: LaunchSource;
-  decoder: SolanaLaunchTransactionDecoder;
+  decoder: SolanaMarketTransactionDecoder;
   fetch?: SolanaRpcFetch;
   requestTimeoutMs?: number;
   /** Defaults to 200ms, keeping one adapter at or below five RPC calls/second. */
   minRequestIntervalMs?: number;
   clock?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
+}
+
+export interface SolanaConfirmedTransactionSource extends ProviderIdentity {
+  readonly chain: Chain.SOLANA;
+  readonly launchSource: LaunchSource;
+  fetchConfirmedTransaction(
+    signature: string,
+    expectedSlot: number
+  ): Promise<Result<readonly ReconciledMarketOccurrence[], Error>>;
 }
 
 interface SignatureInfo {
@@ -82,7 +97,7 @@ export class SolanaRpcReconciliationSource implements SolanaReconciliationSource
 
   private readonly endpoint: string;
   private readonly programAddress: string;
-  private readonly decoder: SolanaLaunchTransactionDecoder;
+  private readonly decoder: SolanaMarketTransactionDecoder;
   private readonly fetch: SolanaRpcFetch;
   private readonly requestTimeoutMs: number;
   private readonly minRequestIntervalMs: number;
@@ -160,7 +175,7 @@ export class SolanaRpcReconciliationSource implements SolanaReconciliationSource
     const reachedFloor =
       entries.length < request.limit ||
       entries.some((entry) => entry.slot < request.fromSlotInclusive);
-    const launches: ReconciledLaunch[] = [];
+    const occurrences: ReconciledMarketOccurrence[] = [];
 
     for (const entry of entries) {
       if (
@@ -171,65 +186,86 @@ export class SolanaRpcReconciliationSource implements SolanaReconciliationSource
         continue;
       }
 
-      const transactionResponse = await this.rpc('getTransaction', [
-        entry.signature,
-        {
-          commitment: 'confirmed',
-          encoding: 'jsonParsed',
-          maxSupportedTransactionVersion: 1,
-        },
-      ]);
-      if (transactionResponse.kind === 'failure') return transactionResponse;
-      if (transactionResponse.value === null) {
-        return failure(new Error(`Solana RPC did not return transaction '${entry.signature}'`));
-      }
-      if (!isRecord(transactionResponse.value)) {
-        return failure(new Error('Solana RPC returned a malformed transaction'));
-      }
-      if (transactionResponse.value.slot !== entry.slot) {
-        return failure(
-          new Error(`Solana RPC returned a slot mismatch for transaction '${entry.signature}'`)
-        );
-      }
-
-      let decoded: Result<readonly ReconciledLaunch[], Error>;
-      try {
-        decoded = this.decoder.decode({
-          signature: entry.signature,
-          slot: entry.slot,
-          launchSource: this.launchSource,
-          programAddress: this.programAddress,
-          transaction: transactionResponse.value,
-        });
-      } catch (error) {
-        return failure(
-          error instanceof Error
-            ? new Error(`Solana launch decoder failed: ${error.message}`)
-            : new Error('Solana launch decoder failed')
-        );
-      }
-      if (decoded.kind === 'failure') return decoded;
-      for (const launch of decoded.value) {
-        const origin = launch.market?.origin;
-        if (
-          origin === undefined ||
-          origin.slot !== entry.slot ||
-          origin.position.transactionSignature !== entry.signature
-        ) {
-          return failure(
-            new Error(`Solana launch decoder returned an occurrence for another transaction`)
-          );
-        }
-        launches.push(launch);
-      }
+      const transaction = await this.fetchConfirmedTransaction(entry.signature, entry.slot);
+      if (transaction.kind === 'failure') return transaction;
+      occurrences.push(...transaction.value);
     }
 
     const last = entries.at(-1);
     return success({
-      launches,
+      occurrences,
       reachedFloor,
       ...(!reachedFloor && last !== undefined ? { nextBeforeSignature: last.signature } : {}),
     });
+  }
+
+  async fetchConfirmedTransaction(
+    signature: string,
+    expectedSlot: number
+  ): Promise<Result<readonly ReconciledMarketOccurrence[], Error>> {
+    if (signature.trim() === '' || !isSlot(expectedSlot)) {
+      return failure(new Error('Solana confirmed transaction identity is invalid'));
+    }
+    const transactionResponse = await this.rpc('getTransaction', [
+      signature,
+      {
+        commitment: 'confirmed',
+        encoding: 'jsonParsed',
+        maxSupportedTransactionVersion: 1,
+      },
+    ]);
+    if (transactionResponse.kind === 'failure') return transactionResponse;
+    if (transactionResponse.value === null) {
+      return failure(new Error(`Solana RPC did not return transaction '${signature}'`));
+    }
+    if (!isRecord(transactionResponse.value)) {
+      return failure(new Error('Solana RPC returned a malformed transaction'));
+    }
+    if (transactionResponse.value.slot !== expectedSlot) {
+      return failure(
+        new Error(`Solana RPC returned a slot mismatch for transaction '${signature}'`)
+      );
+    }
+
+    const observedAt = new Date(this.clock());
+    if (!Number.isFinite(observedAt.getTime())) {
+      return failure(new Error('Solana RPC clock returned an invalid observation time'));
+    }
+    let decoded: Result<readonly DecodedMarketOccurrence[], Error>;
+    try {
+      decoded = this.decoder.decode({
+        signature,
+        slot: expectedSlot,
+        launchSource: this.launchSource,
+        programAddress: this.programAddress,
+        observedAt,
+        transaction: transactionResponse.value,
+      });
+    } catch (error) {
+      return failure(
+        error instanceof Error
+          ? new Error(`Solana market decoder failed: ${error.message}`)
+          : new Error('Solana market decoder failed')
+      );
+    }
+    if (decoded.kind === 'failure') return decoded;
+
+    const occurrences: ReconciledMarketOccurrence[] = [];
+    for (const occurrence of decoded.value) {
+      const fact = occurrence.kind === 'launch' ? occurrence.launch : occurrence.graduation;
+      const origin = fact.market?.origin;
+      if (
+        origin === undefined ||
+        origin.slot !== expectedSlot ||
+        origin.position.transactionSignature !== signature ||
+        (this.launchSource === LaunchSource.PUMP_FUN && occurrence.kind !== 'launch') ||
+        (this.launchSource === LaunchSource.PUMPSWAP && occurrence.kind !== 'graduation')
+      ) {
+        return failure(new Error(`Solana market decoder returned a mismatched occurrence`));
+      }
+      occurrences.push({ ...occurrence, programAddress: this.programAddress, observedAt });
+    }
+    return success(occurrences);
   }
 
   private async rpc(method: string, params: readonly unknown[]): Promise<Result<unknown, Error>> {
