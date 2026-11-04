@@ -111,6 +111,31 @@ importers:
         specifier: ^1.0.0
         version: 1.6.1(@types/node@20.19.43)
 
+  apps/wallet-worker:
+    dependencies:
+      '@nit/composition':
+        specifier: workspace:*
+        version: link:../../packages/composition
+      '@nit/database-public':
+        specifier: workspace:*
+        version: link:../../packages/database-public
+      '@nit/domain':
+        specifier: workspace:*
+        version: link:../../packages/domain
+      '@nit/observability':
+        specifier: workspace:*
+        version: link:../../packages/observability
+      '@nit/wallet-intelligence':
+        specifier: workspace:*
+        version: link:../../packages/wallet-intelligence
+    devDependencies:
+      typescript:
+        specifier: ^5.3.0
+        version: 5.9.3
+      vitest:
+        specifier: ^1.0.0
+        version: 1.6.1(@types/node@20.19.43)
+
   packages/agent-contracts:
     dependencies:
       '@nit/domain':
@@ -371,6 +396,31 @@ importers:
         specifier: workspace:*
         version: link:../signals
     devDependencies:
+      typescript:
+        specifier: ^5.3.0
+        version: 5.9.3
+      vitest:
+        specifier: ^1.0.0
+        version: 1.6.1(@types/node@20.19.43)
+
+  packages/wallet-intelligence:
+    dependencies:
+      '@nit/database-public':
+        specifier: workspace:*
+        version: link:../database-public
+      '@nit/domain':
+        specifier: workspace:*
+        version: link:../domain
+      '@nit/signals':
+        specifier: workspace:*
+        version: link:../signals
+      ws:
+        specifier: ^8.18.0
+        version: 8.22.1
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.18.2
+        version: 8.18.2
       typescript:
         specifier: ^5.3.0
         version: 5.9.3

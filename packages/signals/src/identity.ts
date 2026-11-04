@@ -16,9 +16,18 @@ export function signalOriginKey(origin: SignalOrigin): string {
     return `provider|${component(origin.provider)}|${component(origin.referenceId)}`;
   }
 
+  if (origin.transactionLevel === true) {
+    if (origin.actorAddress === undefined || origin.actorAddress.trim() === '') {
+      throw new ValidationError('Transaction-level chain signal origin requires actorAddress');
+    }
+    return `chain|${component(origin.chain)}|${component(origin.transactionSignature)}|transaction|${component(origin.actorAddress)}`;
+  }
+
   const index = origin.instructionIndex ?? origin.logIndex;
   if (index === undefined) {
-    throw new ValidationError('Chain signal origin requires instructionIndex or logIndex');
+    throw new ValidationError(
+      'Chain signal origin requires instructionIndex, logIndex, or transactionLevel'
+    );
   }
 
   const indexKind = origin.instructionIndex !== undefined ? 'instruction' : 'log';

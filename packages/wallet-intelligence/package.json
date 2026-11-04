@@ -1,0 +1,23 @@
+{
+  "name": "@nit/wallet-intelligence",
+  "version": "0.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@nit/database-public": "workspace:*",
+    "@nit/domain": "workspace:*",
+    "@nit/signals": "workspace:*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.2",
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0"
+  }
+}

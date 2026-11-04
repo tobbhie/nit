@@ -20,13 +20,32 @@ const SignalOriginSchema = z.union([
       transactionSignature: z.string().min(1),
       instructionIndex: z.number().int().nonnegative().optional(),
       logIndex: z.number().int().nonnegative().optional(),
+      transactionLevel: z.literal(true).optional(),
+      actorAddress: SolanaAddressSchema.optional(),
     })
     .superRefine((origin, context) => {
-      const count = Number(origin.instructionIndex !== undefined) + Number(origin.logIndex !== undefined);
+      const count =
+        Number(origin.instructionIndex !== undefined) +
+        Number(origin.logIndex !== undefined) +
+        Number(origin.transactionLevel === true);
       if (count !== 1) {
         context.addIssue({
           code: z.ZodIssueCode.custom,
-          message: 'Exactly one of instructionIndex or logIndex is required',
+          message: 'Exactly one of instructionIndex, logIndex, or transactionLevel is required',
+        });
+      }
+      if (origin.transactionLevel === true && origin.actorAddress === undefined) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['actorAddress'],
+          message: 'actorAddress is required for transaction-level origins',
+        });
+      }
+      if (origin.transactionLevel !== true && origin.actorAddress !== undefined) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['actorAddress'],
+          message: 'actorAddress is only valid for transaction-level origins',
         });
       }
     }),
@@ -67,6 +86,7 @@ export const SignalEnvelopeSchema = z
     const tokenRequired =
       signal.kind === SignalKind.WALLET_BUY ||
       signal.kind === SignalKind.WALLET_SELL ||
+      signal.kind === SignalKind.WALLET_CONVERGENCE ||
       signal.kind === SignalKind.MARKET;
     if (tokenRequired && signal.tokenMint === undefined) {
       context.addIssue({

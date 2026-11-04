@@ -424,6 +424,27 @@ describe('Solana market occurrence schema', () => {
   });
 });
 
+describe('wallet intelligence schema', () => {
+  const wallet = ddl(MIGRATIONS.find((migration) => migration.id === '0019_wallet_intelligence'));
+
+  it('stores immutable swaps, funding, and relationship evidence', () => {
+    for (const table of ['wallet_swaps', 'wallet_funding_events', 'wallet_relation_evidence']) {
+      expect(wallet).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
+      expect(wallet).toContain(`BEFORE UPDATE OR DELETE ON ${table}`);
+    }
+    expect(wallet).toContain('UNIQUE (\n          chain, transaction_signature, wallet_address');
+    expect(wallet).toContain(
+      "relation_kind IN ('shared_funder', 'same_slot_entry', 'same_slot_exit')"
+    );
+  });
+
+  it('adds transaction-level actor identity and monotonic wallet cursors', () => {
+    expect(wallet).toContain('signals_chain_transaction_actor_origin_idx');
+    expect(wallet).toContain('CREATE TABLE IF NOT EXISTS wallet_reconciliation_cursors');
+    expect(wallet).toContain('reject_wallet_cursor_regression');
+  });
+});
+
 describe('REQUIRED_TABLES', () => {
   it('lists each required table exactly once', () => {
     expect(new Set(REQUIRED_TABLES).size).toBe(REQUIRED_TABLES.length);

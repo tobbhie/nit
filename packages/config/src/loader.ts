@@ -73,6 +73,62 @@ function solanaMarketInput(fileConfig: Partial<Config>): unknown {
   };
 }
 
+function csvEnv(value: string | undefined): string[] | undefined {
+  if (value === undefined) return undefined;
+  const items = value
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item !== '');
+  return items.length === 0 ? undefined : items;
+}
+
+function solanaWalletInput(fileConfig: Partial<Config>): unknown {
+  const fromFile = fileConfig.solanaWallet;
+  const enabled =
+    parseBooleanEnv(process.env['NIT_SOLANA_WALLET_ENABLED']) ?? fromFile?.enabled ?? false;
+  if (!enabled) return { enabled: false };
+  const enabledFile = fromFile?.enabled === true ? fromFile : undefined;
+  return {
+    enabled: true,
+    httpEndpoint: process.env['NIT_SOLANA_WALLET_RPC_HTTP_ENDPOINT'] ?? enabledFile?.httpEndpoint,
+    websocketEndpoint:
+      process.env['NIT_SOLANA_WALLET_RPC_WEBSOCKET_ENDPOINT'] ?? enabledFile?.websocketEndpoint,
+    watchedWallets:
+      csvEnv(process.env['NIT_WATCHED_WALLET_ADDRESSES']) ?? enabledFile?.watchedWallets,
+    quoteAssets: csvEnv(process.env['NIT_WALLET_QUOTE_ASSETS']) ?? enabledFile?.quoteAssets,
+    swapProgramAddresses:
+      csvEnv(process.env['NIT_WALLET_SWAP_PROGRAM_ADDRESSES']) ?? enabledFile?.swapProgramAddresses,
+    requestTimeoutMs:
+      parseIntEnv(process.env['NIT_WALLET_REQUEST_TIMEOUT_MS']) ?? enabledFile?.requestTimeoutMs,
+    minRequestIntervalMs:
+      parseIntEnv(process.env['NIT_WALLET_MIN_REQUEST_INTERVAL_MS']) ??
+      enabledFile?.minRequestIntervalMs,
+    convergence: {
+      windowMs:
+        parseIntEnv(process.env['NIT_WALLET_CONVERGENCE_WINDOW_MS']) ??
+        enabledFile?.convergence.windowMs,
+      minimumIndependentWallets:
+        parseIntEnv(process.env['NIT_WALLET_CONVERGENCE_MIN_INDEPENDENT']) ??
+        enabledFile?.convergence.minimumIndependentWallets,
+    },
+    reconciliation: {
+      ...enabledFile?.reconciliation,
+      intervalMs:
+        parseIntEnv(process.env['NIT_WALLET_RECONCILIATION_INTERVAL_MS']) ??
+        enabledFile?.reconciliation.intervalMs,
+      overlapSlots:
+        parseIntEnv(process.env['NIT_WALLET_RECONCILIATION_OVERLAP_SLOTS']) ??
+        enabledFile?.reconciliation.overlapSlots,
+      initialLookbackSlots:
+        parseIntEnv(process.env['NIT_WALLET_INITIAL_LOOKBACK_SLOTS']) ??
+        enabledFile?.reconciliation.initialLookbackSlots,
+      pageSize:
+        parseIntEnv(process.env['NIT_WALLET_RECONCILIATION_PAGE_SIZE']) ??
+        enabledFile?.reconciliation.pageSize,
+    },
+  };
+}
+
 /**
  * Load configuration from environment variables and YAML files
  */
@@ -119,6 +175,7 @@ export function loadConfig(configPath?: string): Config {
     queue: fileConfig.queue,
     providers: fileConfig.providers,
     solanaMarket: solanaMarketInput(fileConfig),
+    solanaWallet: solanaWalletInput(fileConfig),
     featureFlags: {
       privateIntelligence:
         process.env['FEATURE_PRIVATE_INTELLIGENCE'] === 'true' ||

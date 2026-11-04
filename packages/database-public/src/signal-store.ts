@@ -10,12 +10,7 @@ import {
   generateEventId,
   success,
 } from '@nit/domain';
-import {
-  SignalEnvelope,
-  SignalKind,
-  parseSignalEnvelope,
-  signalOriginKey,
-} from '@nit/signals';
+import { SignalEnvelope, SignalKind, parseSignalEnvelope, signalOriginKey } from '@nit/signals';
 import { PostgresEventStore } from './event-store';
 import { DatabasePool, Executor, transactResult } from './pool';
 
@@ -36,6 +31,8 @@ interface SignalRow {
   transaction_signature: string | null;
   instruction_index: number | null;
   log_index: number | null;
+  transaction_level: boolean;
+  actor_address: string | null;
   evidence_ids: string[];
   payload: unknown;
 }
@@ -58,7 +55,9 @@ function rowToSignal<TPayload>(row: SignalRow): SignalEnvelope<TPayload> {
           chain: row.chain as Chain,
           transactionSignature: row.transaction_signature as string,
           ...(row.instruction_index === null
-            ? { logIndex: row.log_index as number }
+            ? row.log_index === null
+              ? { transactionLevel: true as const, actorAddress: row.actor_address as string }
+              : { logIndex: row.log_index }
             : { instructionIndex: row.instruction_index }),
         };
 
@@ -106,10 +105,11 @@ export class PostgresSignalStore {
            signal_id, source, source_version, kind, chain, token_mint,
            canonical_narrative_id, occurred_at, observed_at, available_at,
            origin_kind, provider, reference_id, transaction_signature,
-           instruction_index, log_index, origin_key, evidence_ids, payload
+           instruction_index, log_index, transaction_level, actor_address,
+           origin_key, evidence_ids, payload
          ) VALUES (
            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-           $11, $12, $13, $14, $15, $16, $17, $18, $19
+           $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
          )
          ON CONFLICT (origin_key) DO NOTHING
          RETURNING signal_id`,
@@ -130,6 +130,8 @@ export class PostgresSignalStore {
           signal.origin.kind === 'chain' ? signal.origin.transactionSignature : null,
           signal.origin.kind === 'chain' ? (signal.origin.instructionIndex ?? null) : null,
           signal.origin.kind === 'chain' ? (signal.origin.logIndex ?? null) : null,
+          signal.origin.kind === 'chain' ? (signal.origin.transactionLevel ?? false) : false,
+          signal.origin.kind === 'chain' ? (signal.origin.actorAddress ?? null) : null,
           originKey,
           signal.evidenceIds,
           JSON.stringify(signal.payload),

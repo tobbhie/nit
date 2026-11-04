@@ -1230,6 +1230,160 @@ export const MIGRATIONS: readonly Migration[] = [
         FOR EACH ROW EXECUTE FUNCTION reject_mutation();
     `,
   },
+  {
+    id: '0019_wallet_intelligence',
+    description: 'Immutable wallet swaps, relationship evidence, and reconciliation cursors',
+    up: `
+      ALTER TABLE signals ADD COLUMN IF NOT EXISTS transaction_level BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE signals ADD COLUMN IF NOT EXISTS actor_address TEXT;
+      ALTER TABLE signals DROP CONSTRAINT IF EXISTS signals_kind_allowed;
+      ALTER TABLE signals ADD CONSTRAINT signals_kind_allowed CHECK (
+        kind IN (
+          'narrative', 'wallet_buy', 'wallet_sell', 'wallet_convergence',
+          'wallet_risk', 'market', 'candidate_update'
+        )
+      );
+      ALTER TABLE signals DROP CONSTRAINT IF EXISTS signals_required_subject;
+      ALTER TABLE signals ADD CONSTRAINT signals_required_subject CHECK (
+        (kind IN ('wallet_buy', 'wallet_sell', 'wallet_convergence', 'market') AND token_mint IS NOT NULL)
+        OR (kind = 'wallet_risk')
+        OR (kind IN ('narrative', 'candidate_update') AND canonical_narrative_id IS NOT NULL)
+      );
+      ALTER TABLE signals DROP CONSTRAINT IF EXISTS signals_origin_shape;
+      ALTER TABLE signals ADD CONSTRAINT signals_origin_shape CHECK (
+        (
+          origin_kind = 'provider'
+          AND provider IS NOT NULL
+          AND reference_id IS NOT NULL
+          AND transaction_signature IS NULL
+          AND instruction_index IS NULL
+          AND log_index IS NULL
+          AND NOT transaction_level
+          AND actor_address IS NULL
+        )
+        OR (
+          origin_kind = 'chain'
+          AND provider IS NULL
+          AND reference_id IS NULL
+          AND transaction_signature IS NOT NULL
+          AND (
+            (CASE WHEN instruction_index IS NULL THEN 0 ELSE 1 END)
+            + (CASE WHEN log_index IS NULL THEN 0 ELSE 1 END)
+            + (CASE WHEN transaction_level THEN 1 ELSE 0 END)
+          ) = 1
+          AND (NOT transaction_level OR actor_address IS NOT NULL)
+          AND (transaction_level OR actor_address IS NULL)
+        )
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS signals_chain_transaction_actor_origin_idx
+        ON signals (chain, transaction_signature, actor_address)
+        WHERE origin_kind = 'chain' AND transaction_level;
+
+      CREATE TABLE IF NOT EXISTS wallet_swaps (
+        wallet_swap_id UUID PRIMARY KEY,
+        chain TEXT NOT NULL CHECK (chain = 'solana'),
+        transaction_signature TEXT NOT NULL,
+        slot BIGINT NOT NULL CHECK (slot >= 0),
+        wallet_address TEXT NOT NULL,
+        side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
+        token_mint TEXT NOT NULL,
+        token_raw_amount NUMERIC(78, 0) NOT NULL CHECK (token_raw_amount > 0),
+        token_decimals SMALLINT NOT NULL CHECK (token_decimals BETWEEN 0 AND 30),
+        quote_asset TEXT NOT NULL,
+        quote_raw_amount NUMERIC(78, 0) NOT NULL CHECK (quote_raw_amount > 0),
+        quote_decimals SMALLINT NOT NULL CHECK (quote_decimals BETWEEN 0 AND 30),
+        program_addresses TEXT[] NOT NULL CHECK (cardinality(program_addresses) > 0),
+        attribution JSONB NOT NULL,
+        occurred_at TIMESTAMPTZ NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        available_at TIMESTAMPTZ NOT NULL,
+        recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT wallet_swaps_time_order CHECK (
+          observed_at >= occurred_at AND available_at >= observed_at
+        ),
+        CONSTRAINT wallet_swaps_transaction_wallet_key UNIQUE (
+          chain, transaction_signature, wallet_address
+        )
+      );
+      CREATE INDEX IF NOT EXISTS wallet_swaps_token_timeline_idx
+        ON wallet_swaps (token_mint, side, occurred_at DESC);
+      CREATE INDEX IF NOT EXISTS wallet_swaps_wallet_timeline_idx
+        ON wallet_swaps (wallet_address, occurred_at DESC);
+
+      CREATE TABLE IF NOT EXISTS wallet_funding_events (
+        wallet_funding_event_id UUID PRIMARY KEY,
+        chain TEXT NOT NULL CHECK (chain = 'solana'),
+        transaction_signature TEXT NOT NULL,
+        instruction_path TEXT NOT NULL,
+        slot BIGINT NOT NULL CHECK (slot >= 0),
+        funder_address TEXT NOT NULL,
+        funded_wallet_address TEXT NOT NULL,
+        lamports NUMERIC(78, 0) NOT NULL CHECK (lamports > 0),
+        occurred_at TIMESTAMPTZ NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        CONSTRAINT wallet_funding_occurrence_key UNIQUE (
+          chain, transaction_signature, instruction_path, funded_wallet_address
+        )
+      );
+      CREATE INDEX IF NOT EXISTS wallet_funding_common_source_idx
+        ON wallet_funding_events (funder_address, funded_wallet_address, occurred_at DESC);
+
+      CREATE TABLE IF NOT EXISTS wallet_relation_evidence (
+        wallet_relation_evidence_id UUID PRIMARY KEY,
+        wallet_a TEXT NOT NULL,
+        wallet_b TEXT NOT NULL,
+        relation_kind TEXT NOT NULL CHECK (
+          relation_kind IN ('shared_funder', 'same_slot_entry', 'same_slot_exit')
+        ),
+        source_reference TEXT NOT NULL,
+        occurred_at TIMESTAMPTZ NOT NULL,
+        observed_at TIMESTAMPTZ NOT NULL,
+        details JSONB NOT NULL,
+        CONSTRAINT wallet_relation_canonical_pair CHECK (wallet_a < wallet_b),
+        CONSTRAINT wallet_relation_occurrence_key UNIQUE (
+          wallet_a, wallet_b, relation_kind, source_reference
+        )
+      );
+      CREATE INDEX IF NOT EXISTS wallet_relation_pair_timeline_idx
+        ON wallet_relation_evidence (wallet_a, wallet_b, occurred_at DESC);
+
+      CREATE TABLE IF NOT EXISTS wallet_reconciliation_cursors (
+        wallet_address TEXT PRIMARY KEY,
+        finalized_slot BIGINT NOT NULL CHECK (finalized_slot >= 0),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE OR REPLACE FUNCTION reject_wallet_cursor_regression()
+        RETURNS TRIGGER AS $$
+      BEGIN
+        IF NEW.wallet_address IS DISTINCT FROM OLD.wallet_address
+          OR NEW.finalized_slot < OLD.finalized_slot THEN
+          RAISE EXCEPTION 'Wallet reconciliation cursor cannot regress or change identity'
+            USING ERRCODE = 'restrict_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      DROP TRIGGER IF EXISTS wallet_reconciliation_cursor_monotonic
+        ON wallet_reconciliation_cursors;
+      CREATE TRIGGER wallet_reconciliation_cursor_monotonic
+        BEFORE UPDATE ON wallet_reconciliation_cursors
+        FOR EACH ROW EXECUTE FUNCTION reject_wallet_cursor_regression();
+
+      DROP TRIGGER IF EXISTS wallet_swaps_append_only ON wallet_swaps;
+      CREATE TRIGGER wallet_swaps_append_only
+        BEFORE UPDATE OR DELETE ON wallet_swaps
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+      DROP TRIGGER IF EXISTS wallet_funding_events_append_only ON wallet_funding_events;
+      CREATE TRIGGER wallet_funding_events_append_only
+        BEFORE UPDATE OR DELETE ON wallet_funding_events
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+      DROP TRIGGER IF EXISTS wallet_relation_evidence_append_only ON wallet_relation_evidence;
+      CREATE TRIGGER wallet_relation_evidence_append_only
+        BEFORE UPDATE OR DELETE ON wallet_relation_evidence
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+    `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
@@ -1244,6 +1398,10 @@ export const REQUIRED_TABLES: readonly string[] = [
   'token_markets',
   'solana_market_occurrences',
   'solana_reconciliation_cursors',
+  'wallet_swaps',
+  'wallet_funding_events',
+  'wallet_relation_evidence',
+  'wallet_reconciliation_cursors',
   'token_artwork',
   'market_snapshots',
   'creator_profiles',

@@ -91,6 +91,40 @@ export const SolanaMarketConfigSchema = z
   ])
   .default({ enabled: false });
 
+const SolanaAddressSchema = z
+  .string()
+  .trim()
+  .regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
+const WalletQuoteAssetSchema = z.union([z.literal('SOL'), SolanaAddressSchema]);
+
+export const SolanaWalletConfigSchema = z
+  .discriminatedUnion('enabled', [
+    z.object({ enabled: z.literal(false) }),
+    z.object({
+      enabled: z.literal(true),
+      httpEndpoint: HttpEndpointSchema,
+      websocketEndpoint: WebSocketEndpointSchema,
+      watchedWallets: z.array(SolanaAddressSchema).min(1),
+      quoteAssets: z.array(WalletQuoteAssetSchema).min(1),
+      swapProgramAddresses: z.array(SolanaAddressSchema).min(1),
+      requestTimeoutMs: z.number().int().positive().default(15_000),
+      minRequestIntervalMs: z.number().int().nonnegative().default(200),
+      convergence: z.object({
+        windowMs: z.number().int().positive(),
+        minimumIndependentWallets: z.number().int().min(2),
+      }),
+      reconciliation: z
+        .object({
+          intervalMs: z.number().int().positive().default(60_000),
+          overlapSlots: z.number().int().nonnegative().default(250),
+          initialLookbackSlots: z.number().int().nonnegative().default(2_000),
+          pageSize: z.number().int().positive().max(1_000).default(1_000),
+        })
+        .default({}),
+    }),
+  ])
+  .default({ enabled: false });
+
 export const ConfigSchema = z.object({
   environment: EnvironmentSchema,
   version: z.object({
@@ -102,6 +136,7 @@ export const ConfigSchema = z.object({
   queue: QueueConfigSchema,
   providers: z.record(ProviderConfigSchema).default({}),
   solanaMarket: SolanaMarketConfigSchema,
+  solanaWallet: SolanaWalletConfigSchema,
   featureFlags: FeatureFlagsSchema,
   logLevel: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 });
@@ -112,3 +147,4 @@ export type QueueConfig = z.infer<typeof QueueConfigSchema>;
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
 export type FeatureFlags = z.infer<typeof FeatureFlagsSchema>;
 export type SolanaMarketConfig = z.infer<typeof SolanaMarketConfigSchema>;
+export type SolanaWalletConfig = z.infer<typeof SolanaWalletConfigSchema>;

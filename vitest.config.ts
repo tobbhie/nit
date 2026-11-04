@@ -32,6 +32,7 @@ export default defineConfig({
       '@nit/queue': resolve(__dirname, 'packages/queue/src'),
       '@nit/observation': resolve(__dirname, 'packages/observation/src'),
       '@nit/market': resolve(__dirname, 'packages/market/src'),
+      '@nit/wallet-intelligence': resolve(__dirname, 'packages/wallet-intelligence/src'),
       '@nit/observability': resolve(__dirname, 'packages/observability/src'),
       '@nit/provider-interfaces': resolve(__dirname, 'packages/provider-interfaces/src'),
       '@nit/composition': resolve(__dirname, 'packages/composition/src'),

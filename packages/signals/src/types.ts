@@ -4,6 +4,8 @@ export enum SignalKind {
   NARRATIVE = 'narrative',
   WALLET_BUY = 'wallet_buy',
   WALLET_SELL = 'wallet_sell',
+  WALLET_CONVERGENCE = 'wallet_convergence',
+  WALLET_RISK = 'wallet_risk',
   MARKET = 'market',
   CANDIDATE_UPDATE = 'candidate_update',
 }
@@ -20,6 +22,10 @@ export interface ChainSignalOrigin {
   readonly transactionSignature: string;
   readonly instructionIndex?: number;
   readonly logIndex?: number;
+  /** A wallet-attributed fact derived from complete transaction balance deltas. */
+  readonly transactionLevel?: true;
+  /** Separates multiple wallet-attributed facts from the same transaction. */
+  readonly actorAddress?: string;
 }
 
 /** The immutable source occurrence used for ingestion deduplication. */
