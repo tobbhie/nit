@@ -1,4 +1,5 @@
 import { PostgresSignalStore } from '@nit/database-public';
+import { createHash } from 'node:crypto';
 import { Chain, Result, generateEvidenceId, generateSignalId, success } from '@nit/domain';
 import { SignalEnvelope, SignalKind } from '@nit/signals';
 import {
@@ -29,12 +30,14 @@ export interface WalletProcessingSummary {
 /** Orchestrates idempotent evidence persistence and canonical signal publication. */
 export class WalletIntelligenceService {
   private readonly sourceVersion: string;
+  private readonly policyHash: string;
 
   constructor(
     private readonly parser: SolanaWalletSwapParser,
     private readonly repository: WalletIntelligenceRepository,
     private readonly signals: PostgresSignalStore,
-    private readonly policy: WalletConvergencePolicy
+    private readonly policy: WalletConvergencePolicy,
+    private readonly clock: () => Date = (): Date => new Date()
   ) {
     if (!Number.isSafeInteger(policy.windowMs) || policy.windowMs <= 0) {
       throw new Error('Wallet convergence window must be a positive integer');
@@ -46,6 +49,9 @@ export class WalletIntelligenceService {
       throw new Error('Wallet convergence requires at least two independent wallets');
     }
     this.sourceVersion = parser.version;
+    this.policyHash = createHash('sha256')
+      .update(JSON.stringify([policy.windowMs, policy.minimumIndependentWallets]))
+      .digest('hex');
   }
 
   async process(
@@ -79,10 +85,11 @@ export class WalletIntelligenceService {
         if (stored.kind === 'failure') return stored;
         if (stored.value.inserted) {
           relations += 1;
-          const published = await this.publishRisk(stored.value.value);
-          if (published.kind === 'failure') return published;
-          if (published.value) signalCount += 1;
         }
+        // Evidence may have committed before a previous publication failed.
+        const published = await this.publishRisk(stored.value.value);
+        if (published.kind === 'failure') return published;
+        if (published.value) signalCount += 1;
       }
     }
 
@@ -116,10 +123,10 @@ export class WalletIntelligenceService {
         if (stored.kind === 'failure') return stored;
         if (stored.value.inserted) {
           relations += 1;
-          const risk = await this.publishRisk(stored.value.value);
-          if (risk.kind === 'failure') return risk;
-          if (risk.value) signalCount += 1;
         }
+        const risk = await this.publishRisk(stored.value.value);
+        if (risk.kind === 'failure') return risk;
+        if (risk.value) signalCount += 1;
       }
 
       const convergence = await this.publishConvergence(swap);
@@ -159,7 +166,7 @@ export class WalletIntelligenceService {
       tokenMint: swap.tokenMint,
       occurredAt: swap.occurredAt,
       observedAt: swap.observedAt,
-      availableAt: swap.availableAt,
+      availableAt: latest(this.clock(), swap.availableAt),
       origin: {
         kind: 'chain',
         chain: Chain.SOLANA,
@@ -189,7 +196,7 @@ export class WalletIntelligenceService {
       chain: Chain.SOLANA,
       occurredAt: evidence.occurredAt,
       observedAt: evidence.observedAt,
-      availableAt: evidence.observedAt,
+      availableAt: latest(this.clock(), evidence.observedAt),
       origin: {
         kind: 'provider',
         provider: 'wallet_tracker',
@@ -232,6 +239,9 @@ export class WalletIntelligenceService {
       swap.side,
       swap.tokenMint,
       swap.transactionSignature,
+      this.policyHash,
+      ...recent.value.map((item) => item.walletSwapId).sort(),
+      ...relationEvidenceIds.slice().sort(),
       ...wallets,
     ].join(':');
     const written = await this.signals.append<WalletConvergenceSignalPayload>({
@@ -242,14 +252,27 @@ export class WalletIntelligenceService {
       chain: Chain.SOLANA,
       tokenMint: swap.tokenMint,
       occurredAt: swap.occurredAt,
-      observedAt: swap.observedAt,
-      availableAt: swap.availableAt,
+      observedAt: latest(
+        swap.observedAt,
+        ...recent.value.map((item) => item.observedAt),
+        ...relations.value.map((item) => item.observedAt)
+      ),
+      availableAt: latest(
+        this.clock(),
+        swap.availableAt,
+        ...recent.value.map((item) => item.availableAt),
+        ...relations.value.map((item) => item.observedAt)
+      ),
       origin: { kind: 'provider', provider: 'wallet_tracker', referenceId },
       evidenceIds: [...recent.value.map((item) => item.walletSwapId), ...relationEvidenceIds],
       payload,
     });
     return written.kind === 'failure' ? written : success(written.value.inserted);
   }
+}
+
+function latest(...dates: readonly Date[]): Date {
+  return new Date(Math.max(...dates.map((date) => date.getTime())));
 }
 
 function relation(
