@@ -29,6 +29,7 @@ export default defineConfig({
       '@nit/trading': resolve(__dirname, 'packages/trading/src'),
       '@nit/decision-console': resolve(__dirname, 'packages/decision-console/src'),
       '@nit/agent-contracts': resolve(__dirname, 'packages/agent-contracts/src'),
+      '@nit/agent-runtime': resolve(__dirname, 'packages/agent-runtime/src'),
       '@nit/database-public': resolve(__dirname, 'packages/database-public/src'),
       '@nit/queue': resolve(__dirname, 'packages/queue/src'),
       '@nit/observation': resolve(__dirname, 'packages/observation/src'),

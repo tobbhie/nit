@@ -346,3 +346,109 @@ They make no new network calls, collect no credentials, and do not start a bot,
 provider, model, signer or live broker. Real datasets, thresholds, source artifacts
 and research configuration remain private. Source collection, full multimedia
 extraction, calibration training and agent learning remain later integrations.
+
+## Observe-only agent
+
+`@nit/agent-runtime` adds an optional evidence-linked investigator above the
+deterministic terminal. Its seven tools read captured research records/decisions,
+candidate versions, scoped wallet swaps/relationships, approved reserve snapshots,
+strategy snapshots, frozen experiment reports and position-event projections.
+The model can choose a next read or finish a structured explanation. Trading,
+approvals, experiment execution, policy changes, learning-journal writes, SQL,
+shell and arbitrary URL fetching are not registered agent tools in this phase.
+
+The runtime ships pinned `SOUL.md`, `INVESTIGATION.md` and `OUTPUT.md` guides in
+`packages/agent-runtime/guides/`. Their full text/hashes, catalog hash, code version,
+model identity, principal grants and limits are pinned with each task. External
+posts and tool data are quoted evidence, never capability grants. Guide/config
+changes reject queued stale tasks; submit a new request ID after review. Server
+checks remain authoritative independently of guide prose or model instructions.
+
+Use `@nit/app-agent-worker` with `NIT_AGENT_CONFIG_PATH` and
+`NIT_AGENT_COMMAND_PATH` pointing to private bounded JSON files, plus the existing
+`NIT_CONFIG_PATH` bootstrap configuration:
+
+```powershell
+pnpm --filter @nit/app-agent-worker start
+```
+
+The configuration wrapper contains `agent: AgentConfiguration`, `cashAsset`,
+`approvedMarketSources` (may be empty, making market evidence unavailable),
+`pollIntervalMs`, and optional `gateway: {endpoint, allowedOrigin}`. The exported
+types and validators in `packages/agent-runtime/src/types.ts` define the complete
+contract. Principals have explicit identities, UTC expiry times, allowed read
+capabilities, time/resource scopes and `allowExternalContext`. Scopes pin Solana,
+record/decision/narrative IDs, mints, public wallet addresses, portfolio IDs and
+experiment IDs. Experiment reads additionally require every variant portfolio.
+Stored conclusions/traces recheck current owner scope before disclosure. A task
+cannot expand its grant by citing an identifier in source text or model output.
+
+Limits explicitly bound global queued tasks, steps, tool calls, wall time,
+per-call timeout, input/output tokens, run/day token and cost reservations,
+run/day trace-storage reservations, result size, date span and protection lag.
+No tuned budget defaults are embedded in production configuration. One global
+lease permits one planning task at a time across worker processes; overdue paper
+protection makes the agent yield before claiming work. Agent/model availability
+is not required by the paper dispatcher or protective exit logic.
+
+Commands are `enqueue` with `task: InvestigationTask`; `run_once`; `serve`;
+`status`, `trace`, and `cancel` with `principal` and `taskId`; and `recover`.
+Tasks support narrative/wallet investigation, decision explanation, episode
+review and frozen-experiment review. Intake is idempotent on principal/request
+ID; changing content/settings under that ID is rejected. Status and trace commands
+work without a model connection. SIGINT/SIGTERM aborts the active request and
+drains the worker. Persisted cancellation is checked at call boundaries; an
+already-running external request can consume its reserved budget until timeout.
+
+`ReasoningModel` is provider-neutral. The optional `JsonGatewayModel` speaks NIT's
+version-1 JSON protocol to one operator-approved HTTPS origin/path. It is not a
+vendor-specific SDK or a claim that arbitrary vendor endpoints accept this
+protocol. Implement the interface directly or translate at a configured gateway.
+The request contains the pinned guides, scoped task, read catalog, bounded
+history, remaining budgets and token limits. A response echoes `requestId` and
+`protocolVersion: 1`, returns `action` (`tool` with name/version/arguments or
+`conclusion`), and actual `usage: {inputTokens, outputTokens}`. Billing usage must
+come from trusted provider metadata, not model-authored prose. The gateway must
+honor supplied token limits; pricing rates are explicitly pinned by the operator.
+
+Actual remote calls require `agent.enabled`, an authorized unexpired principal
+with `allowExternalContext`, gateway configuration, and
+`NIT_AGENT_GATEWAY_BEARER_TOKEN` in the runtime environment. No ambient model is
+selected. Production rejects toy identities. Endpoint identity is hashed, query
+credentials/userinfo are rejected, redirects are disabled, responses are bounded,
+and transport errors are sanitized. No model service has been enabled or called
+by the automated tests; those use a scripted development model and mocked HTTP.
+
+Before a request, the controller durably reserves worst-case input/output tokens,
+cost at pinned micro-USD-per-million-token rates, and trace bytes. Daily limits
+aggregate across that principal's runs. Reservations are conservative budget
+consumption, not billing reconciliation: smaller reported usage does not refund
+them, and outages/unknown outcomes remain reserved. Actual validated usage and
+computed cost are recorded separately. Interrupted requests are not retried
+automatically. `recover` marks expired runs interrupted, preserves unknown-call
+audits/budgets and uses the existing queue's fenced, single-attempt recovery.
+Use a new explicit request ID for an operator-authorized retry. Never delete
+audit/queue records to reset a budget or simulate successful completion.
+
+Conclusions are WATCH, INSUFFICIENT_EVIDENCE or EXPLANATION_ONLY, with a
+qualitative confidence label, alternatives and missing evidence. Every claim must
+cite record IDs actually returned in this run; evidence hashes and availability
+are preserved. Bounded report views retain the full immutable source hash and a
+separate hash of the returned projection. This validates references, not semantic
+entailment of model prose.
+Outputs are labeled `MODEL_INTERPRETATION_NOT_FACT_VERIFIED`. Missing/future data
+cannot become a verified observation or an order approval. Tool attempts,
+validated model responses, cancellations and conclusions have immutable audit
+records; status/budget/lease rows are operational projections.
+
+Data exposure, when explicitly enabled: selected source text and narrative
+reports, approved public wallet activity, scoped strategy/position data and frozen
+research summaries are sent to the configured gateway/model service. This can
+include private research or policy parameters if those scopes are granted.
+Credentials, filesystem contents outside pinned guides and unscoped portfolios
+are not model tools. The bearer credential is used only on the fixed transport
+and is excluded from task context and traces. Dependencies add workspace links
+and the already-used Zod validator; no vendor SDK, telemetry, signer or live
+execution dependency is introduced. Actual provider billing and the complete
+2 GB deployment load still need operational validation. Learning, promotion and
+paper-trade capabilities remain separate future phases.

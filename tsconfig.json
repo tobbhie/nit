@@ -40,6 +40,7 @@
       "@nit/trading": ["packages/trading/src"],
       "@nit/decision-console": ["packages/decision-console/src"],
       "@nit/agent-contracts": ["packages/agent-contracts/src"],
+      "@nit/agent-runtime": ["packages/agent-runtime/src"],
       "@nit/queue": ["packages/queue/src"],
       "@nit/observation": ["packages/observation/src"],
       "@nit/market": ["packages/market/src"],
@@ -59,6 +60,7 @@
     { "path": "packages/trading" },
     { "path": "packages/decision-console" },
     { "path": "packages/agent-contracts" },
+    { "path": "packages/agent-runtime" },
     { "path": "packages/database-public" },
     { "path": "packages/queue" },
     { "path": "packages/observability" },
@@ -73,6 +75,7 @@
     { "path": "apps/paper-worker" },
     { "path": "apps/console-worker" },
     { "path": "apps/research-worker" },
+    { "path": "apps/agent-worker" },
     { "path": "apps/control-api" }
   ],
   "exclude": ["node_modules", "dist", "**/dist", "**/node_modules"]

@@ -1608,9 +1608,64 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE TRIGGER positions_identity_immutable BEFORE UPDATE ON positions FOR EACH ROW EXECUTE FUNCTION reject_position_identity_change();
     `,
   },
+  {
+    id: '0024_observe_only_agent',
+    description:
+      'Scoped observe-only tasks, immutable model/tool traces and bounded budget reservations',
+    up: `
+      CREATE TABLE IF NOT EXISTS agent_guides(guide_hash TEXT PRIMARY KEY,bundle JSONB NOT NULL);
+      CREATE TABLE IF NOT EXISTS agent_tasks(task_id UUID PRIMARY KEY,principal TEXT NOT NULL,request_id TEXT NOT NULL,
+        task JSONB NOT NULL,settings JSONB NOT NULL,content_hash TEXT NOT NULL,guide_hash TEXT NOT NULL REFERENCES agent_guides(guide_hash),
+        created_at TIMESTAMPTZ NOT NULL,UNIQUE(principal,request_id));
+      CREATE TABLE IF NOT EXISTS agent_runs(run_id UUID PRIMARY KEY,task_id UUID NOT NULL UNIQUE REFERENCES agent_tasks(task_id),
+        started_at TIMESTAMPTZ NOT NULL,deadline_at TIMESTAMPTZ NOT NULL,settings_hash TEXT NOT NULL,model_identity JSONB NOT NULL,
+        CHECK(deadline_at>=started_at));
+      CREATE TABLE IF NOT EXISTS agent_task_state(task_id UUID PRIMARY KEY REFERENCES agent_tasks(task_id),run_id UUID REFERENCES agent_runs(run_id),
+        status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed','timed_out','cancelled','budget_exhausted','rejected','interrupted')),
+        updated_at TIMESTAMPTZ NOT NULL,reason TEXT);
+      CREATE TABLE IF NOT EXISTS agent_task_cancellations(task_id UUID PRIMARY KEY REFERENCES agent_tasks(task_id),principal TEXT NOT NULL,occurred_at TIMESTAMPTZ NOT NULL,reason TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS agent_task_status_idx ON agent_task_state(status,updated_at);
+      CREATE TABLE IF NOT EXISTS agent_run_events(event_id UUID PRIMARY KEY,run_id UUID NOT NULL REFERENCES agent_runs(run_id),
+        ordinal INTEGER NOT NULL,kind TEXT NOT NULL,detail JSONB NOT NULL,occurred_at TIMESTAMPTZ NOT NULL,UNIQUE(run_id,ordinal));
+      CREATE TABLE IF NOT EXISTS agent_model_attempts(call_id UUID PRIMARY KEY,run_id UUID NOT NULL REFERENCES agent_runs(run_id),step INTEGER NOT NULL,
+        request_id TEXT NOT NULL,request_hash TEXT NOT NULL,request JSONB NOT NULL,reserved_tokens BIGINT NOT NULL CHECK(reserved_tokens>=0),
+        reserved_cost_micros BIGINT NOT NULL CHECK(reserved_cost_micros>=0),reserved_trace_bytes BIGINT NOT NULL CHECK(reserved_trace_bytes>=0),
+        started_at TIMESTAMPTZ NOT NULL,UNIQUE(run_id,step));
+      CREATE TABLE IF NOT EXISTS agent_model_results(call_id UUID PRIMARY KEY REFERENCES agent_model_attempts(call_id),
+        outcome TEXT NOT NULL,response JSONB,usage JSONB,completed_at TIMESTAMPTZ NOT NULL);
+      CREATE TABLE IF NOT EXISTS agent_tool_calls(tool_call_id UUID PRIMARY KEY,run_id UUID NOT NULL REFERENCES agent_runs(run_id),
+        task_id UUID NOT NULL REFERENCES agent_tasks(task_id),request_id TEXT NOT NULL,caller_identity TEXT NOT NULL,step INTEGER NOT NULL,
+        tool TEXT NOT NULL,tool_version TEXT NOT NULL,capability TEXT,arguments JSONB NOT NULL,outcome TEXT NOT NULL,
+        result JSONB,evidence_ids UUID[] NOT NULL DEFAULT '{}',result_hash TEXT,started_at TIMESTAMPTZ NOT NULL,completed_at TIMESTAMPTZ NOT NULL,
+        UNIQUE(run_id,step));
+      CREATE TABLE IF NOT EXISTS agent_conclusions(run_id UUID PRIMARY KEY REFERENCES agent_runs(run_id),task_id UUID NOT NULL UNIQUE REFERENCES agent_tasks(task_id),
+        conclusion JSONB NOT NULL,content_hash TEXT NOT NULL,evidence_ids UUID[] NOT NULL,created_at TIMESTAMPTZ NOT NULL);
+      CREATE TABLE IF NOT EXISTS agent_daily_budgets(principal TEXT NOT NULL,day DATE NOT NULL,reserved_tokens BIGINT NOT NULL DEFAULT 0 CHECK(reserved_tokens>=0),
+        reserved_cost_micros BIGINT NOT NULL DEFAULT 0 CHECK(reserved_cost_micros>=0),reserved_trace_bytes BIGINT NOT NULL DEFAULT 0 CHECK(reserved_trace_bytes>=0),PRIMARY KEY(principal,day));
+      CREATE TABLE IF NOT EXISTS agent_runtime_lease(lease_key TEXT PRIMARY KEY,owner TEXT NOT NULL,run_id UUID,expires_at TIMESTAMPTZ NOT NULL);
+      DO $$ DECLARE table_name TEXT; BEGIN
+        FOREACH table_name IN ARRAY ARRAY['agent_guides','agent_tasks','agent_task_cancellations','agent_runs','agent_run_events','agent_model_attempts','agent_model_results','agent_tool_calls','agent_conclusions'] LOOP
+          EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I',table_name||'_append_only',table_name);
+          EXECUTE format('CREATE TRIGGER %I BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION reject_mutation()',table_name||'_append_only',table_name);
+        END LOOP;
+      END; $$;
+    `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
+  'agent_task_cancellations',
+  'agent_guides',
+  'agent_tasks',
+  'agent_task_state',
+  'agent_runs',
+  'agent_run_events',
+  'agent_model_attempts',
+  'agent_model_results',
+  'agent_tool_calls',
+  'agent_conclusions',
+  'agent_daily_budgets',
+  'agent_runtime_lease',
   'research_records',
   'research_links',
   'decision_feature_snapshots',

@@ -39,6 +39,28 @@ importers:
         specifier: ^1.0.0
         version: 1.6.1(@types/node@20.19.43)
 
+  apps/agent-worker:
+    dependencies:
+      '@nit/agent-runtime':
+        specifier: workspace:*
+        version: link:../../packages/agent-runtime
+      '@nit/composition':
+        specifier: workspace:*
+        version: link:../../packages/composition
+      '@nit/domain':
+        specifier: workspace:*
+        version: link:../../packages/domain
+      '@nit/trading':
+        specifier: workspace:*
+        version: link:../../packages/trading
+    devDependencies:
+      typescript:
+        specifier: ^5.3.0
+        version: 5.9.3
+      vitest:
+        specifier: ^1.0.0
+        version: 1.6.1(@types/node@20.19.43)
+
   apps/console-worker:
     dependencies:
       '@nit/composition':
@@ -201,6 +223,37 @@ importers:
       '@nit/domain':
         specifier: workspace:*
         version: link:../domain
+    devDependencies:
+      typescript:
+        specifier: ^5.3.0
+        version: 5.9.3
+      vitest:
+        specifier: ^1.0.0
+        version: 1.6.1(@types/node@20.19.43)
+
+  packages/agent-runtime:
+    dependencies:
+      '@nit/agent-contracts':
+        specifier: workspace:*
+        version: link:../agent-contracts
+      '@nit/database-public':
+        specifier: workspace:*
+        version: link:../database-public
+      '@nit/domain':
+        specifier: workspace:*
+        version: link:../domain
+      '@nit/queue':
+        specifier: workspace:*
+        version: link:../queue
+      '@nit/signals':
+        specifier: workspace:*
+        version: link:../signals
+      '@nit/trading':
+        specifier: workspace:*
+        version: link:../trading
+      zod:
+        specifier: ^3.22.4
+        version: 3.25.76
     devDependencies:
       typescript:
         specifier: ^5.3.0

@@ -1,0 +1,21 @@
+{
+  "name": "@nit/app-agent-worker",
+  "version": "0.0.0",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -b",
+    "start": "node dist/main.js",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@nit/agent-runtime": "workspace:*",
+    "@nit/composition": "workspace:*",
+    "@nit/trading": "workspace:*",
+    "@nit/domain": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0"
+  }
+}
