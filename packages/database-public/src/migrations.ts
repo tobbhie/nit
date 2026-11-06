@@ -1436,9 +1436,40 @@ export const MIGRATIONS: readonly Migration[] = [
       FOR EACH ROW EXECUTE FUNCTION reject_mutation();
   `,
   },
+  {
+    id: '0021_continuous_paper_dispatch',
+    description: 'Durable paper signal delivery and feed health projections',
+    up: `
+      CREATE TABLE IF NOT EXISTS paper_signal_dispatch (
+        portfolio_id UUID NOT NULL REFERENCES paper_portfolios (portfolio_id),
+        signal_id UUID NOT NULL REFERENCES signals (signal_id),
+        attempted_at TIMESTAMPTZ NOT NULL,
+        retry_at TIMESTAMPTZ NOT NULL,
+        completed_at TIMESTAMPTZ,
+        reason TEXT,
+        PRIMARY KEY (portfolio_id,signal_id)
+      );
+      CREATE INDEX IF NOT EXISTS paper_signal_retry_idx
+        ON paper_signal_dispatch (portfolio_id,retry_at) WHERE completed_at IS NULL;
+      CREATE TABLE IF NOT EXISTS paper_feed_health (
+        portfolio_id UUID NOT NULL REFERENCES paper_portfolios (portfolio_id),
+        token_mint TEXT NOT NULL,
+        checked_at TIMESTAMPTZ NOT NULL,
+        reason TEXT,
+        PRIMARY KEY (portfolio_id,token_mint)
+      );
+      CREATE TABLE IF NOT EXISTS paper_dispatch_health (
+        portfolio_id UUID PRIMARY KEY REFERENCES paper_portfolios (portfolio_id),
+        checked_at TIMESTAMPTZ NOT NULL
+      );
+    `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
+  'paper_signal_dispatch',
+  'paper_feed_health',
+  'paper_dispatch_health',
   'paper_run_configs',
   'paper_market_observations',
   'paper_execution_plans',

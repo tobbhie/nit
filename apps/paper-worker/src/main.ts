@@ -4,6 +4,8 @@ import { bootstrap } from '@nit/composition';
 import { PortfolioId, SignalId, ValidationError } from '@nit/domain';
 import {
   ExecutionMode,
+  ContinuousPaperDispatcher,
+  PostgresPaperMarketFeed,
   PaperMarketSnapshot,
   PostgresPaperRegistry,
   PostgresPaperTrader,
@@ -57,6 +59,38 @@ async function main(): Promise<void> {
       );
       if (result.kind === 'failure') throw result.error;
       process.stdout.write(`${JSON.stringify(result.value)}\n`);
+    } else if (action === 'serve') {
+      const clock = { now: (): Date => new Date() };
+      const options = object(input['dispatch']);
+      const dispatcher = new ContinuousPaperDispatcher(
+        db,
+        new PostgresPaperTrader(db, clock),
+        new PostgresPaperMarketFeed(db, stringArray(input['approvedSources'])),
+        clock,
+        {
+          portfolioIds: stringArray(options['portfolioIds']) as PortfolioId[],
+          intervalMs: positive(options['intervalMs']),
+          retryMs: positive(options['retryMs']),
+          maxProtectionTargets: positive(options['maxProtectionTargets']),
+          maxSignalsPerCycle: positive(options['maxSignalsPerCycle']),
+          maxSignalAgeMs: positive(options['maxSignalAgeMs']),
+        }
+      );
+      const shutdown = (): void => dispatcher.stop();
+      process.on('SIGTERM', shutdown);
+      process.on('SIGINT', shutdown);
+      try {
+        await dispatcher.run((outcome): void => {
+          process.stdout.write(
+            `${JSON.stringify(
+              outcome.kind === 'success' ? outcome.value : { error: outcome.error.message }
+            )}\n`
+          );
+        });
+      } finally {
+        process.off('SIGTERM', shutdown);
+        process.off('SIGINT', shutdown);
+      }
     } else if (action === 'rebuild') {
       const result = await new PostgresPaperTrader(db, { now: (): Date => new Date() }).rebuild(
         text(input['portfolioId']) as PortfolioId
@@ -72,9 +106,29 @@ async function main(): Promise<void> {
         [id]
       );
       if (result.kind === 'failure') throw result.error;
-      process.stdout.write(`${JSON.stringify(result.value)}\n`);
+      const issues = await db.query(
+        `SELECT token_mint,checked_at,reason FROM paper_feed_health
+        WHERE portfolio_id=$1 AND reason IS NOT NULL ORDER BY checked_at DESC LIMIT 100`,
+        [id]
+      );
+      const waiting = await db.query(
+        `SELECT COUNT(*)::text AS count FROM paper_signal_dispatch
+        WHERE portfolio_id=$1 AND completed_at IS NULL`,
+        [id]
+      );
+      if (issues.kind === 'failure') throw issues.error;
+      if (waiting.kind === 'failure') throw waiting.error;
+      process.stdout.write(
+        `${JSON.stringify({
+          portfolio: result.value,
+          feedIssues: issues.value,
+          waitingSignals: waiting.value,
+        })}\n`
+      );
     } else
-      throw new ValidationError('Paper command action must be create, tick, status or rebuild');
+      throw new ValidationError(
+        'Paper command action must be create, tick, serve, status or rebuild'
+      );
   } finally {
     await db.close();
   }
@@ -94,6 +148,18 @@ function date(value: unknown): Date {
   const parsed = new Date(text(value));
   if (!Number.isFinite(parsed.getTime())) throw new ValidationError('Invalid command timestamp');
   return parsed;
+}
+
+function positive(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0)
+    throw new ValidationError('Missing positive dispatch bound');
+  return value;
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0)
+    throw new ValidationError('Expected a nonempty string array');
+  return value.map(text);
 }
 
 main().catch((error: unknown): void => {

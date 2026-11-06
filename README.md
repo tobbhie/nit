@@ -78,7 +78,7 @@ market discovery, disable and stop only `@nit/app-wallet-worker`.
 
 ## Standalone paper trader
 
-`@nit/app-paper-worker` runs bounded `create`, `tick`, `status`, and `rebuild`
+`@nit/app-paper-worker` runs `create`, `tick`, `serve`, `status`, and `rebuild`
 commands from the JSON file named by `NIT_PAPER_COMMAND_PATH`:
 
 ```powershell
@@ -127,8 +127,41 @@ can retry on a later market snapshot. The initial runtime permits one acquisitio
 cycle per mint per portfolio; a new experiment/run starts a fresh cycle.
 
 This is a reserve-based simulator, not a live route adapter. It does not yet
-automatically ingest production liquidity observations, reproduce venue-specific
+acquire reserves directly from chain providers, reproduce venue-specific
 fees/MEV, or run the forward experiment. An input adapter must supply timestamped
 reserves and verified tradability/risk facts; missing critical flags block work.
 No new external dependency, telemetry, or network provider is introduced. The
 worker uses the existing PostgreSQL connection and has no signing capability.
+
+### Continuous paper dispatch
+
+Set the command action to `serve`, provide an explicit `approvedSources` list,
+and supply `dispatch` with `portfolioIds`, `intervalMs`, `retryMs`,
+`maxProtectionTargets`, `maxSignalsPerCycle`, and `maxSignalAgeMs` in the private
+command file. The loop accepts only configured forward-paper portfolios.
+SIGINT/SIGTERM stops scheduling, drains the active cycle, and closes the database.
+
+The feed reads existing `market_snapshots` from approved non-synthetic sources.
+Providers must publish `raw_payload.paperExecution` with the exported
+`PaperExecutionFacts` contract: schema version 1, the exact `marketAddress`, cash
+asset, virtual/model and real reserve amounts, decimals, and explicit verified,
+tradable, sellable, and critical-risk booleans. The reserve observation must belong
+to the currently active canonical venue and market address. USD liquidity or
+price metrics alone are insufficient. A newer incomplete reading blocks use;
+the adapter does not fall back to older reassuring risk facts. No provider is
+automatically approved and no existing synthetic adapter gains production status.
+
+Each bounded cycle first checks held positions and outstanding orders across
+all configured portfolios. Missing/stale/non-executable data or a pending sell
+blocks new entries for that portfolio. Protection work rotates by last check;
+when its batch is over capacity, new entries wait. Market reads are shared within
+the cycle. New signal deliveries have durable retry/terminal records, so restarts
+and late database commits cannot silently skip signals. Missing data defers a
+signal until recovery or its configured expiry. A record is completed only after
+a strategy decision exists, or when the opportunity expires.
+
+`status` returns portfolio data, up to 100 recent feed issues, and a waiting-signal
+count. `paper_feed_health` and `paper_signal_dispatch` are durable operational
+projections. This integration adds only database reads/writes; it sends no data
+to another network provider. A real market-data producer must still supply the
+execution-fact contract before unattended forward paper trading is usable.
