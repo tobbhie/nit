@@ -4,3 +4,5 @@ export * from './candidate';
 export * from './types';
 export * from './identity';
 export * from './validation';
+export * from './research';
+export * from './qualification';

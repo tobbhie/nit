@@ -11,7 +11,7 @@ import {
   generatePositionEventId,
   generatePositionId,
 } from '@nit/domain';
-import { SignalEnvelope, SignalKind, parseSignalEnvelope } from '@nit/signals';
+import { SignalEnvelope, SignalKind, parseSignalEnvelope, evidenceHash } from '@nit/signals';
 import { BPS, UNIT, amount, minimum, units } from './fixed';
 import { PaperMarketSnapshot, PaperQuote, paperQuote, validatePaperMarket } from './paper-market';
 import { PaperPolicy, paperPolicy } from './paper-policy';
@@ -35,6 +35,7 @@ interface PortfolioRow {
 }
 
 interface PositionRow {
+  episode_id: string | null;
   position_id: string;
   token_mint: string;
   original_quantity: string;
@@ -255,7 +256,7 @@ export class PostgresPaperTrader {
       if (busy.length > 0) return outcome;
       const positions = await paperRows<PositionRow>(
         db,
-        'SELECT * FROM positions WHERE portfolio_id=$1 AND token_mint=$2',
+        'SELECT * FROM positions WHERE portfolio_id=$1 AND token_mint=$2 ORDER BY (open_quantity>0) DESC,created_at DESC,position_id DESC LIMIT 1',
         [portfolioId, market.tokenMint]
       );
       const position = positions[0];
@@ -286,7 +287,17 @@ export class PostgresPaperTrader {
       const signal = await loadSignal(db, sourceSignalId);
       if (signal.availableAt > now)
         throw new ValidationError('Signal is not available as of the clock');
+      const episodeId = asObject(signal.payload)['episodeId'];
+      const alreadyUsed =
+        typeof episodeId !== 'string'
+          ? []
+          : await paperRows(
+              db,
+              'SELECT 1 FROM positions WHERE portfolio_id=$1 AND token_mint=$2 AND episode_id=$3',
+              [portfolioId, market.tokenMint, episodeId]
+            );
       const reason =
+        (alreadyUsed.length > 0 ? 'TOKEN_ALREADY_TRADED' : null) ??
         (await resolverRejection(db, signal, now)) ??
         entryRejection(portfolio, signal, market, policy, position, now);
       let entryNarrativeId = signal.canonicalNarrativeId;
@@ -487,9 +498,32 @@ function entryRejection(
 ): string | null {
   if (portfolio.status !== 'running' || now < portfolio.period_start || now > portfolio.period_end)
     return 'RUN_NOT_ACTIVE';
-  if (position !== undefined) return 'TOKEN_ALREADY_TRADED';
-  if (signal.tokenMint !== market.tokenMint) return 'SIGNAL_TOKEN_MISMATCH';
   const payload = asObject(signal.payload);
+  const episode = typeof payload['episodeId'] === 'string' ? payload['episodeId'] : null;
+  if (
+    position !== undefined &&
+    (units(position.open_quantity) > 0n || episode === null || position.episode_id === episode)
+  )
+    return 'TOKEN_ALREADY_TRADED';
+  if (episode !== null) {
+    // A valid episode and immutable decision snapshot are checked before persistence.
+    if (
+      payload['featureSnapshotId'] === undefined &&
+      portfolio.strategy_snapshot.entry.policyId !== 'E00' &&
+      !(
+        portfolio.strategy_snapshot.entry.policyId === 'E02' &&
+        typeof payload['walletSourceSignalId'] === 'string'
+      )
+    )
+      return 'EPISODE_FEATURE_REQUIRED';
+  }
+  if (signal.tokenMint !== market.tokenMint) return 'SIGNAL_TOKEN_MISMATCH';
+  const qualification =
+    payload['qualification'] === undefined ? null : asObject(payload['qualification']);
+  const baseline =
+    signal.source === 'market' &&
+    signal.kind === SignalKind.MARKET &&
+    payload['marketBaselineEligible'] === true;
   const narrative =
     signal.source === 'nit' && signal.kind === SignalKind.NARRATIVE && payload['eligible'] === true;
   const wallet =
@@ -504,16 +538,25 @@ function entryRejection(
     signal.source === 'nit' &&
     payload['actionState'] === 'trade_eligible' &&
     payload['narrativeConfirmed'] === true &&
-    payload['walletConfirmed'] === true;
+    payload['walletConfirmed'] === true &&
+    (payload['independentSourceCount'] === undefined ||
+      (typeof payload['independentSourceCount'] === 'number' &&
+        Number.isSafeInteger(payload['independentSourceCount']) &&
+        payload['independentSourceCount'] >= policy.minimumIndependentWallets)) &&
+    (qualification === null || qualification['E03'] === true);
   const entry = portfolio.strategy_snapshot.entry.policyId;
   if (
-    !(entry === 'E01'
-      ? narrative
-      : entry === 'E02'
-        ? wallet
-        : entry === 'E03'
-          ? combined
-          : narrative || wallet || combined)
+    !(entry === 'E00'
+      ? baseline
+      : entry === 'E01'
+        ? narrative
+        : entry === 'E02'
+          ? wallet
+          : entry === 'E03'
+            ? combined
+            : qualification === null
+              ? narrative || wallet || combined
+              : qualification['E04'] === true)
   )
     return 'ENTRY_EVIDENCE_NOT_QUALIFIED';
   return marketRejection(market, policy, now, true);
@@ -609,7 +652,86 @@ async function recordDecision(
       now,
     ]
   );
-  return rows[0]?.decision_id ?? null;
+  const decisionId = rows[0]?.decision_id;
+  if (decisionId !== undefined) {
+    const payload = asObject(signal.payload);
+    const featureId =
+      typeof payload['featureSnapshotId'] === 'string' ? payload['featureSnapshotId'] : null;
+    const episodeId = typeof payload['episodeId'] === 'string' ? payload['episodeId'] : null;
+    let feature: unknown = null;
+    if (episodeId !== null) {
+      const episodes = await paperRows<{ payload: { data: { tokenMints: string[] } } }>(
+        db,
+        "SELECT payload FROM research_records WHERE record_id=$1 AND kind='episode' AND available_at<=$2",
+        [episodeId, now]
+      );
+      if (
+        episodes[0] === undefined ||
+        !episodes[0].payload.data.tokenMints.includes(signal.tokenMint ?? '')
+      )
+        throw new ValidationError('Decision episode is unavailable or wrong mint');
+    }
+    if (featureId !== null) {
+      const found = await paperRows<{ payload: Record<string, unknown> }>(
+        db,
+        `SELECT payload FROM research_records WHERE record_id=$1 AND kind='feature' AND available_at<=$2`,
+        [featureId, now]
+      );
+      if (found[0] === undefined) throw new ValidationError('Decision feature is unavailable');
+      const data = asObject(found[0].payload['data']);
+      if (data['tokenMint'] !== signal.tokenMint || data['episodeId'] !== episodeId)
+        throw new ValidationError('Decision feature scope mismatch');
+      const evidenceMask =
+        payload['evidenceMask'] === undefined ? null : asObject(payload['evidenceMask']);
+      feature =
+        evidenceMask === null
+          ? found[0].payload
+          : {
+              ...found[0].payload,
+              data: {
+                ...data,
+                ...(evidenceMask['wallet'] === true
+                  ? {}
+                  : {
+                      wallet: 'unavailable',
+                      relationship: 'unknown',
+                      independentWallets: 0,
+                      coverageIds: [],
+                    }),
+                ...(evidenceMask['narrative'] === true
+                  ? {}
+                  : {
+                      narrative: 'unavailable',
+                      linkage: 'unavailable',
+                      narrativeStrengthBps: 0,
+                      linkConfidenceBps: 0,
+                      artifactIds: [],
+                    }),
+              },
+            };
+    }
+    const snapshot = {
+      signalId: signal.eventId,
+      availableAt: signal.availableAt.toISOString(),
+      payload: signal.payload,
+      feature,
+      policyHash: portfolio.config_hash,
+    };
+    await paperRows(
+      db,
+      `INSERT INTO decision_feature_snapshots(decision_id,feature_record_id,episode_id,evidence_mask,snapshot,content_hash)
+      VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        decisionId,
+        featureId,
+        episodeId,
+        JSON.stringify(payload['evidenceMask'] ?? { legacy: true }),
+        JSON.stringify(snapshot),
+        evidenceHash(snapshot),
+      ]
+    );
+  }
+  return decisionId ?? null;
 }
 
 async function planOrder(
@@ -668,7 +790,7 @@ async function planOrder(
     if (side === OrderSide.SELL) {
       const positions = await paperRows<PositionRow>(
         db,
-        'SELECT * FROM positions WHERE portfolio_id=$1 AND token_mint=$2',
+        'SELECT * FROM positions WHERE portfolio_id=$1 AND token_mint=$2 ORDER BY (open_quantity>0) DESC,created_at DESC,position_id DESC LIMIT 1',
         [portfolio.portfolio_id, market.tokenMint]
       );
       if (positions[0] !== undefined)
@@ -820,7 +942,7 @@ async function settle(
   }
   const positions = await paperRows<PositionRow>(
     db,
-    'SELECT * FROM positions WHERE portfolio_id=$1 AND token_mint=$2',
+    'SELECT * FROM positions WHERE portfolio_id=$1 AND token_mint=$2 ORDER BY (open_quantity>0) DESC,created_at DESC,position_id DESC LIMIT 1',
     [portfolio.portfolio_id, market.tokenMint]
   );
   const position = positions[0];
@@ -897,8 +1019,8 @@ async function settle(
         db,
         `INSERT INTO positions
         (position_id,portfolio_id,token_mint,original_quantity,open_quantity,cost_basis,
-         high_water_price,state,protection_config,stop_price,updated_at,created_at)
-        VALUES ($1,$2,$3,$4,$4,$5,$6,'open',$7,$8,$9,$9) RETURNING *`,
+         high_water_price,state,protection_config,stop_price,updated_at,created_at,episode_id)
+        VALUES ($1,$2,$3,$4,$4,$5,$6,'open',$7,$8,$9,$9,$10) RETURNING *`,
         [
           generatePositionId(),
           portfolio.portfolio_id,
@@ -909,6 +1031,20 @@ async function settle(
           JSON.stringify(portfolio.strategy_snapshot.protection.config),
           amount(stop),
           now,
+          asObject(
+            (
+              await loadSignal(
+                db,
+                (
+                  await paperRows<{ source_signal_id: SignalId }>(
+                    db,
+                    'SELECT source_signal_id FROM strategy_decisions WHERE decision_id=(SELECT decision_id FROM orders WHERE order_id=$1)',
+                    [pending.order_id]
+                  )
+                )[0]!.source_signal_id
+              )
+            ).payload
+          )['episodeId'] ?? null,
         ]
       );
       const current = opened[0];

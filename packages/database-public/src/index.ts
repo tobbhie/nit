@@ -6,6 +6,7 @@ export * from './pool';
 export * from './event-store';
 export * from './migrations';
 export * from './signal-store';
+export * from './research-store';
 
 // `./testing` is deliberately absent. It creates and drops schemas and reads
 // `.env` off disk, none of which belongs in a process that only wanted a

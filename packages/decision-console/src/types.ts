@@ -1,5 +1,5 @@
 import { EvidenceId, SignalId } from '@nit/domain';
-import { CandidateActionState } from '@nit/signals';
+import { CandidateActionState, EvidenceStatus } from '@nit/signals';
 
 export interface ResolverPolicy {
   readonly minimumNarrativeStrengthBps: number;
@@ -12,20 +12,40 @@ export interface ResolverPolicy {
   readonly watchDurationMs: number;
   readonly pollIntervalMs: number;
   readonly maxScenariosPerCycle: number;
+  readonly evidencePolicy?: {
+    readonly version: 1;
+    readonly narrativeRelationshipHandling: 'review' | 'advisory' | 'block';
+    readonly combinedRelationshipHandling: 'review' | 'block' | 'discount';
+  };
 }
 
 export interface NarrativeCandidates {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 1 | 2;
+  readonly episodeId?: string;
+  readonly interpretationId?: string;
+  readonly narrativeStatus?: EvidenceStatus;
   readonly title: string;
   readonly narrativeStrengthBps: number;
   readonly candidates: readonly {
     tokenMint: string;
     linkConfidenceBps: number;
     reasonCodes: readonly string[];
+    linkageStatus?: EvidenceStatus;
   }[];
 }
 
 export interface ResolvedCandidate {
+  readonly episodeId?: string;
+  readonly featureSnapshotId?: string;
+  readonly coverageIds?: readonly string[];
+  readonly evidence?: {
+    readonly narrative: EvidenceStatus;
+    readonly linkage: EvidenceStatus;
+    readonly wallet: EvidenceStatus;
+    readonly relationship: 'unknown' | 'clear' | 'suspected';
+    readonly attributionAmbiguous: boolean;
+  };
+  readonly qualification?: { readonly E01: boolean; readonly E03: boolean; readonly E04: boolean };
   readonly tokenMint: string;
   readonly ticker: string;
   readonly name: string;

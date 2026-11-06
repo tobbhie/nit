@@ -8,6 +8,7 @@ import {
   generateStrategyCombinationId,
   generateStrategyPolicyVersionId,
   generateStrategyRunId,
+  success,
 } from '@nit/domain';
 import { units } from './fixed';
 import { paperPolicy } from './paper-policy';
@@ -44,9 +45,11 @@ export interface PaperRunIdentity {
 export class PostgresPaperRegistry {
   constructor(private readonly db: DatabasePool) {}
 
-  async createRun(input: CreatePaperRun): Promise<Result<PaperRunIdentity, Error>> {
-    return this.db.transaction(async (client) => {
-      const db = clientExecutor(client);
+  async createRun(
+    input: CreatePaperRun,
+    executor?: Executor
+  ): Promise<Result<PaperRunIdentity, Error>> {
+    const operation = async (db: Executor): Promise<PaperRunIdentity> => {
       const snapshot = createStrategySnapshot(input.strategy);
       paperPolicy(input.strategy);
       if (input.mode !== ExecutionMode.HISTORICAL && input.mode !== ExecutionMode.FORWARD_PAPER) {
@@ -123,7 +126,10 @@ export class PostgresPaperRegistry {
         ]
       );
       return { runId, portfolioId };
-    });
+    };
+    return executor === undefined
+      ? this.db.transaction((client) => operation(clientExecutor(client)))
+      : success(await operation(executor));
   }
 }
 

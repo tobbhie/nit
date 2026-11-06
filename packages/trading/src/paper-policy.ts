@@ -30,7 +30,7 @@ export interface PaperPolicy {
 export function paperPolicy(input: StrategySnapshot): PaperPolicy {
   const snapshot = createStrategySnapshot(input);
   if (snapshot.configHash !== input.configHash) throw new ValidationError('Strategy hash mismatch');
-  if (!['E01', 'E02', 'E03', 'E04'].includes(snapshot.entry.policyId)) {
+  if (!['E00', 'E01', 'E02', 'E03', 'E04'].includes(snapshot.entry.policyId)) {
     throw new ValidationError('Unsupported paper entry policy');
   }
   if (!['X01', 'X02', 'X03', 'X04', 'X07'].includes(snapshot.exit.policyId)) {

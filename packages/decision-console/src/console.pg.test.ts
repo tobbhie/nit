@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { DatabasePool, PostgresSignalStore } from '@nit/database-public';
+import { DatabasePool, PostgresSignalStore, PostgresResearchStore } from '@nit/database-public';
 import { TestDatabase, createTestDatabase, hasTestDatabase } from '@nit/database-public/testing';
 import { Chain, PortfolioId, generateSignalId } from '@nit/domain';
-import { SignalKind } from '@nit/signals';
+import { SignalKind, contentHash, ResearchRecord } from '@nit/signals';
 import { ExecutionMode, PostgresPaperRegistry, PostgresPaperTrader, paperRows } from '@nit/trading';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { CandidateResolver } from './resolver';
@@ -172,7 +172,7 @@ describe.skipIf(!hasTestDatabase())(
       ).toBe(true);
       const signals = await paperRows<{ payload: { eligible: boolean } }>(
         db,
-        "SELECT payload FROM signals WHERE canonical_narrative_id=$1 AND source_version='resolver:v1' AND kind='narrative'",
+        "SELECT payload FROM signals WHERE canonical_narrative_id=$1 AND source_version='resolver:v2' AND kind='narrative'",
         [id]
       );
       expect(signals.every((signal) => !signal.payload.eligible)).toBe(true);
@@ -199,6 +199,116 @@ describe.skipIf(!hasTestDatabase())(
         [id]
       );
       expect(scenario[0]!.next_check_at.getTime()).toBeGreaterThan(now.getTime());
+    });
+    it('publishes provenance-backed candidates with immutable feature snapshots and explicit wallet coverage', async () => {
+      const store = new PostgresResearchStore(db);
+      const artifactId = randomUUID();
+      const episodeId = randomUUID();
+      const interpretationId = randomUUID();
+      const narrativeId = randomUUID();
+      const common = {
+        version: 1,
+        occurredAt: START.toISOString(),
+        observedAt: START.toISOString(),
+        availableAt: START.toISOString(),
+        producerVersion: 'fixture:v1',
+        evidenceIds: [],
+      };
+      const records: ResearchRecord[] = [
+        {
+          ...common,
+          recordId: artifactId,
+          scope: artifactId,
+          kind: 'artifact',
+          data: {
+            provider: 'fixture',
+            sourceId: artifactId,
+            authorId: 'fixture-author',
+            contentHash: contentHash('Explicit public text'),
+            text: 'Explicit public text',
+            sourceUrl: 'https://example.test/source',
+            derivativeOf: null,
+            media: [],
+          },
+        },
+        {
+          ...common,
+          recordId: episodeId,
+          scope: episodeId,
+          kind: 'episode',
+          data: {
+            narrativeId,
+            tokenMints: [TOKEN],
+            episodeType: 'launch',
+            previousEpisodeId: null,
+            originArtifactIds: [artifactId],
+          },
+        },
+        {
+          ...common,
+          recordId: interpretationId,
+          scope: interpretationId,
+          kind: 'interpretation',
+          data: {
+            episodeId,
+            title: 'Captured text',
+            status: 'confirmed',
+            narrativeStrengthBps: 9000,
+            artifactIds: [artifactId],
+            extractorVersion: 'explicit-links:v1',
+            modelVersion: null,
+            promptVersion: null,
+            historicalMode: 'captured',
+            candidates: [
+              {
+                tokenMint: TOKEN,
+                linkConfidenceBps: 9000,
+                status: 'confirmed',
+                disposition: 'candidate',
+                reasonCodes: ['EXPLICIT_MINT'],
+              },
+            ],
+          },
+        },
+      ];
+      for (const record of records) {
+        const written = await store.append(record);
+        if (written.kind === 'failure') throw written.error;
+      }
+      const published = await store.publishInterpretation(interpretationId, START);
+      if (published.kind === 'failure') throw published.error;
+      const first = await resolve(narrativeId);
+      expect(first.candidates[0]?.evidence?.wallet).toBe('unavailable');
+      expect(first.candidates[0]?.qualification?.E01).toBe(true);
+      const feature = await store.at(first.candidates[0]!.featureSnapshotId!, now);
+      expect(feature?.kind).toBe('feature');
+      expect(feature?.kind === 'feature' && feature.data.artifactIds).toEqual([artifactId]);
+      const coverage: ResearchRecord = {
+        ...common,
+        recordId: randomUUID(),
+        scope: randomUUID(),
+        kind: 'coverage',
+        availableAt: now.toISOString(),
+        data: {
+          family: 'wallet',
+          tokenMint: TOKEN,
+          status: 'confirmed',
+          windowStart: new Date(now.getTime() - POLICY.walletWindowMs).toISOString(),
+          windowEnd: now.toISOString(),
+          coveredWallets: ['fixture-watched-wallet'],
+        },
+      };
+      const saved = await store.append(coverage);
+      if (saved.kind === 'failure') throw saved.error;
+      const updated = await resolve(narrativeId);
+      expect(updated.candidates[0]?.evidence?.wallet).toBe('observed_nonconfirming');
+      expect(updated.version).toBe(first.version + 1);
+      await new PostgresPaperTrader(db, clock).tick(
+        portfolioId,
+        market(now),
+        updated.candidates[0]!.narrativeSignalId
+      );
+      expect(await count('orders')).toBe(1);
     });
     it('retains unknown safety separately from explicit risk blocks and rejects future evidence', async () => {
       const id = await narrative();
@@ -233,6 +343,33 @@ describe.skipIf(!hasTestDatabase())(
       expect(linked.state).toBe('manual_review');
       expect(linked.candidates[0]?.independentWallets).toBe(1);
       expect(linked.candidates[0]?.reasonCodes).toContain('RELATED_WALLET_SUSPICION');
+      const advisory = new CandidateResolver(
+        db,
+        feed,
+        clock,
+        {
+          ...POLICY,
+          evidencePolicy: {
+            version: 1,
+            narrativeRelationshipHandling: 'advisory',
+            combinedRelationshipHandling: 'review',
+          },
+        },
+        'SOL'
+      );
+      const reassessed = await advisory.resolve(id);
+      if (reassessed.kind === 'failure') throw reassessed.error;
+      expect(reassessed.value.candidates[0]?.qualification).toMatchObject({
+        E01: true,
+        E03: false,
+      });
+      expect(reassessed.value.policyHash).not.toBe(linked.policyHash);
+      const signal = await paperRows<{ payload: { eligible: boolean } }>(
+        db,
+        'SELECT payload FROM signals WHERE signal_id=$1',
+        [reassessed.value.candidates[0]!.narrativeSignalId]
+      );
+      expect(signal[0]?.payload.eligible).toBe(true);
     });
     it('binds callbacks to user/chat/message and requires explicit fresh quote confirmation', async () => {
       const id = await narrative();
@@ -463,7 +600,7 @@ describe.skipIf(!hasTestDatabase())(
         expect(await resolver.resolve(id)).toMatchObject({ kind: 'failure' });
         const signals = await paperRows(
           db,
-          "SELECT 1 FROM signals WHERE canonical_narrative_id=$1 AND source_version='resolver:v1'",
+          "SELECT 1 FROM signals WHERE canonical_narrative_id=$1 AND source_version='resolver:v2'",
           [id]
         );
         expect(signals).toHaveLength(0);
@@ -568,6 +705,66 @@ describe.skipIf(!hasTestDatabase())(
       now = new Date(now.getTime() + 1000);
       await new PostgresPaperTrader(db, clock).tick(portfolioId, market(now));
       expect(await count('positions')).toBe(0);
+    });
+    it('limits research report reads to experiments whose entire portfolio scope is authorized', async () => {
+      const experimentId = randomUUID();
+      const hash = 'f'.repeat(64);
+      await paperRows(
+        db,
+        "INSERT INTO research_datasets(dataset_hash,manifest) VALUES ($1,'{}') ON CONFLICT DO NOTHING",
+        [hash]
+      );
+      await paperRows(
+        db,
+        "INSERT INTO research_experiments(experiment_id,dataset_hash,config_hash,config) VALUES ($1,$2,$2,'{}')",
+        [experimentId, hash]
+      );
+      await paperRows(db, "INSERT INTO research_replay_variants VALUES ($1,'A',$2)", [
+        experimentId,
+        portfolioId,
+      ]);
+      await paperRows(
+        db,
+        'INSERT INTO research_reports(experiment_id,report,report_hash) VALUES ($1,$2,$3)',
+        [
+          experimentId,
+          JSON.stringify({
+            datasetHash: hash,
+            timing: 'fixed_decision',
+            underlyingScenarioCount: 1,
+            variants: [
+              {
+                variant: 'A',
+                dataStatus: 'COMPLETE_UNDER_DECLARED_ASSUMPTIONS',
+                netCashAfterResearchCosts: '0',
+                researchCostCash: '0',
+              },
+            ],
+          }),
+          hash,
+        ]
+      );
+      await command(`/run-report ${experimentId}`);
+      await consoleService.flush(16);
+      expect(api.sent.at(-1)?.body.text).toContain('HISTORICAL PAPER RESEARCH');
+      const extra = await new PostgresPaperRegistry(db).createRun({
+        strategy: strategy(),
+        mode: ExecutionMode.FORWARD_PAPER,
+        codeHash: 'a'.repeat(64),
+        codeCommitSha: 'console-fixture',
+        periodStart: START,
+        periodEnd: new Date(START.getTime() + 86400000),
+        cashAsset: 'SOL',
+        initialCash: '100',
+      });
+      if (extra.kind === 'failure') throw extra.error;
+      await paperRows(db, "INSERT INTO research_replay_variants VALUES ($1,'B',$2)", [
+        experimentId,
+        extra.value.portfolioId,
+      ]);
+      await command(`/run-report ${experimentId}`);
+      await consoleService.flush(16);
+      expect(api.sent.at(-1)?.body.text).toContain('not authorized');
     });
   }
 );

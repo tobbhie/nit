@@ -1,5 +1,10 @@
-import { createHash } from 'node:crypto';
-import { DatabasePool, PostgresSignalStore, clientExecutor } from '@nit/database-public';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  DatabasePool,
+  PostgresSignalStore,
+  PostgresResearchStore,
+  clientExecutor,
+} from '@nit/database-public';
 import {
   Chain,
   EvidenceId,
@@ -9,7 +14,17 @@ import {
   generateSignalId,
   failure,
 } from '@nit/domain';
-import { CandidateActionState as State, SignalEnvelope, SignalKind } from '@nit/signals';
+import {
+  CandidateActionState as State,
+  SignalEnvelope,
+  SignalKind,
+  EvidenceStatus,
+  EvidenceStatusSchema,
+  ResearchRecord,
+  parseResearchRecord,
+  evidenceHash,
+  qualifyEvidence,
+} from '@nit/signals';
 import { Clock, PaperMarketFeed, paperRows, validatePaperMarket } from '@nit/trading';
 import {
   CandidateReport,
@@ -21,7 +36,7 @@ import {
   object,
 } from './types';
 
-const SOURCE_VERSION = 'resolver:v1';
+const SOURCE_VERSION = 'resolver:v2';
 interface NarrativeRow {
   signal_id: SignalId;
   canonical_narrative_id: string;
@@ -60,6 +75,17 @@ export class CandidateResolver {
     if (policy.watchDurationMs <= policy.coalescingMs)
       throw new Error('Watch duration must exceed correlation window');
     nonempty(cashAsset);
+    if (
+      policy.evidencePolicy !== undefined &&
+      (policy.evidencePolicy.version !== 1 ||
+        !['review', 'advisory', 'block'].includes(
+          policy.evidencePolicy.narrativeRelationshipHandling
+        ) ||
+        !['review', 'block', 'discount'].includes(
+          policy.evidencePolicy.combinedRelationshipHandling
+        ))
+    )
+      throw new Error('Invalid versioned evidence policy');
     this.policyHash = hash(
       Object.fromEntries(Object.entries(policy).sort(([a], [b]) => a.localeCompare(b)))
     );
@@ -73,6 +99,37 @@ export class CandidateResolver {
       if (source.available_at.getTime() + this.policy.watchDurationMs <= now.getTime())
         throw new Error('Narrative watch window expired');
       const input = parseNarrative(source.payload);
+      let artifactIds: readonly string[] = [];
+      if (input.schemaVersion === 2) {
+        const research = new PostgresResearchStore(this.db);
+        const episode = await research.at(input.episodeId!, now);
+        const interpretation = await research.at(input.interpretationId!, now);
+        if (
+          episode?.kind !== 'episode' ||
+          interpretation?.kind !== 'interpretation' ||
+          interpretation.data.episodeId !== episode.recordId ||
+          episode.data.narrativeId !== narrativeId
+        )
+          throw new Error('Narrative provenance is unavailable or inconsistent');
+        artifactIds = interpretation.data.artifactIds;
+        const linked = interpretation.data.candidates.filter((c) => c.disposition === 'candidate');
+        if (
+          input.narrativeStrengthBps !== interpretation.data.narrativeStrengthBps ||
+          input.narrativeStatus !== interpretation.data.status ||
+          input.title !== interpretation.data.title ||
+          input.candidates.length !== linked.length ||
+          input.candidates.some(
+            (c) =>
+              !linked.some(
+                (r) =>
+                  r.tokenMint === c.tokenMint &&
+                  r.linkConfidenceBps === c.linkConfidenceBps &&
+                  r.status === c.linkageStatus
+              )
+          )
+        )
+          throw new Error('Narrative signal cannot rewrite captured interpretation');
+      }
       const coalescing = now.getTime() < source.available_at.getTime() + this.policy.coalescingMs;
       const candidates: ResolvedCandidate[] = [];
       for (const link of input.candidates) {
@@ -143,8 +200,30 @@ export class CandidateResolver {
           input.narrativeStrengthBps >= this.policy.minimumNarrativeStrengthBps &&
           link.linkConfidenceBps >= this.policy.minimumLinkConfidenceBps &&
           token.length === 1;
+        const coverage = await paperRows<{
+          payload: Extract<ResearchRecord, { kind: 'coverage' }>;
+        }>(
+          this.db,
+          `SELECT payload FROM research_records
+          WHERE kind='coverage' AND payload->'data'->>'family'='wallet' AND payload->'data'->>'tokenMint'=$1 AND available_at<=$2
+            AND (payload->'data'->>'windowStart')::timestamptz<=$3 AND (payload->'data'->>'windowEnd')::timestamptz>=$2
+          ORDER BY available_at DESC,version DESC LIMIT 1`,
+          [link.tokenMint, now, new Date(now.getTime() - this.policy.walletWindowMs)]
+        );
         const walletConfirmed =
-          count >= this.policy.minimumIndependentWallets && relations.length === 0;
+          count >= this.policy.minimumIndependentWallets &&
+          (relations.length === 0 ||
+            this.policy.evidencePolicy?.combinedRelationshipHandling === 'discount');
+        const walletStatus: EvidenceStatus =
+          count > 0
+            ? 'confirmed'
+            : coverage[0]?.payload.data.status === 'confirmed'
+              ? 'observed_nonconfirming'
+              : (coverage[0]?.payload.data.status ?? 'unavailable');
+        const narrativeStatus =
+          input.narrativeStatus ?? (narrativeConfirmed ? 'confirmed' : 'observed_nonconfirming');
+        const linkageStatus =
+          link.linkageStatus ?? (narrativeConfirmed ? 'confirmed' : 'observed_nonconfirming');
         const reasons = [...link.reasonCodes];
         if (token.length === 0) reasons.push('TOKEN_NOT_CANONICALLY_DISCOVERED');
         if (!narrativeConfirmed) reasons.push('NARRATIVE_LINK_NOT_QUALIFIED');
@@ -174,6 +253,20 @@ export class CandidateResolver {
           state,
           reasonCodes: [...new Set(reasons)].sort(),
           evidenceIds: [...new Set(evidenceIds)].sort(),
+          coverageIds: coverage.map((c) => c.payload.recordId),
+          ...(input.episodeId === undefined ? {} : { episodeId: input.episodeId }),
+          evidence: {
+            narrative: narrativeStatus,
+            linkage: linkageStatus,
+            wallet: walletStatus,
+            relationship:
+              relations.length > 0
+                ? 'suspected'
+                : coverage[0]?.payload.data.status === 'confirmed'
+                  ? 'clear'
+                  : 'unknown',
+            attributionAmbiguous: false,
+          },
         });
       }
       candidates.sort(
@@ -205,7 +298,47 @@ export class CandidateResolver {
           candidate.marketStatus === 'safe'
         )
           state = State.TRADE_ELIGIBLE;
-        return { ...candidate, rank: index + 1, state, reasonCodes: reasons };
+        const relationBlocked = candidate.evidence?.relationship === 'suspected';
+        const handling = this.policy.evidencePolicy?.narrativeRelationshipHandling ?? 'review';
+        const qualification = qualifyEvidence(
+          {
+            ...candidate.evidence!,
+            narrativeStrengthBps: input.narrativeStrengthBps,
+            linkConfidenceBps: candidate.linkConfidenceBps,
+            independentWallets: candidate.independentWallets,
+            attributionAmbiguous: !selectionClear,
+            selectionRank: index + 1,
+            correlationWindowOpen: coalescing,
+            executionSafe: candidate.marketStatus === 'safe' && candidate.narrativeConfirmed,
+          },
+          {
+            version: 1,
+            minimumNarrativeStrengthBps: this.policy.minimumNarrativeStrengthBps,
+            minimumLinkConfidenceBps: this.policy.minimumLinkConfidenceBps,
+            minimumIndependentWallets: this.policy.minimumIndependentWallets,
+            narrativeRelationshipHandling: handling,
+            combinedRelationshipHandling:
+              this.policy.evidencePolicy?.combinedRelationshipHandling ?? 'review',
+          }
+        );
+        const combined = qualification.E03;
+        if (combined) state = State.TRADE_ELIGIBLE;
+        else if (state === State.TRADE_ELIGIBLE)
+          state = relationBlocked ? State.MANUAL_REVIEW : State.WATCH;
+        if (
+          relationBlocked &&
+          (handling === 'block' ||
+            this.policy.evidencePolicy?.combinedRelationshipHandling === 'block')
+        )
+          reasons.push('RELATIONSHIP_POLICY_BLOCK');
+        return {
+          ...candidate,
+          rank: index + 1,
+          state,
+          reasonCodes: reasons,
+          evidence: { ...candidate.evidence!, attributionAmbiguous: !selectionClear },
+          qualification,
+        };
       });
       const state =
         ranked.length === 0
@@ -281,6 +414,69 @@ export class CandidateResolver {
         const version = (existing?.report?.version ?? 0) + 1;
         const published: ResolvedCandidate[] = [];
         for (const candidate of ranked) {
+          let featureSnapshotId: string | undefined;
+          if (input.episodeId !== undefined && input.interpretationId !== undefined) {
+            featureSnapshotId = randomUUID();
+            const feature = parseResearchRecord({
+              recordId: featureSnapshotId,
+              kind: 'feature',
+              scope: `resolver:${this.policyHash}:${input.episodeId}:${candidate.tokenMint}`,
+              version,
+              occurredAt: source.occurred_at.toISOString(),
+              observedAt: source.observed_at.toISOString(),
+              availableAt: now.toISOString(),
+              producerVersion: `resolver:${this.policyHash}`,
+              evidenceIds: [input.interpretationId],
+              data: {
+                episodeId: input.episodeId,
+                interpretationId: input.interpretationId,
+                tokenMint: candidate.tokenMint,
+                narrative: candidate.evidence!.narrative,
+                linkage: candidate.evidence!.linkage,
+                wallet: candidate.evidence!.wallet,
+                relationship: candidate.evidence!.relationship,
+                independentWallets: candidate.independentWallets,
+                attributionAmbiguous: candidate.evidence!.attributionAmbiguous,
+                selectionRank: candidate.rank,
+                correlationWindowOpen: coalescing,
+                canonicalTokenKnown: !candidate.reasonCodes.includes(
+                  'TOKEN_NOT_CANONICALLY_DISCOVERED'
+                ),
+                narrativeStrengthBps: input.narrativeStrengthBps,
+                linkConfidenceBps: candidate.linkConfidenceBps,
+                artifactIds,
+                coverageIds: candidate.coverageIds ?? [],
+                policyVersion: this.policyHash,
+                confidenceMeaning: 'evidence_score_not_profit_probability',
+              },
+            });
+            await paperRows(
+              db,
+              `INSERT INTO research_records(record_id,kind,scope,version,content_hash,occurred_at,observed_at,available_at,payload)
+              VALUES ($1,'feature',$2,$3,$4,$5,$6,$7,$8)`,
+              [
+                featureSnapshotId,
+                feature.scope,
+                version,
+                evidenceHash(feature),
+                feature.occurredAt,
+                feature.observedAt,
+                feature.availableAt,
+                JSON.stringify(feature),
+              ]
+            );
+            for (const ref of [
+              input.episodeId,
+              input.interpretationId,
+              ...artifactIds,
+              ...(candidate.coverageIds ?? []),
+            ])
+              await paperRows(db, 'INSERT INTO research_links VALUES ($1,$2,$3)', [
+                featureSnapshotId,
+                ref,
+                'derived_from',
+              ]);
+          }
           const candidateSignalId = generateSignalId();
           const narrativeSignalId = generateSignalId();
           const payload = {
@@ -289,7 +485,12 @@ export class CandidateResolver {
             actionState: candidate.state,
             narrativeConfirmed: candidate.narrativeConfirmed,
             walletConfirmed: candidate.walletConfirmed,
+            independentSourceCount: candidate.independentWallets,
             reasonCodes: candidate.reasonCodes,
+            evidence: candidate.evidence,
+            qualification: candidate.qualification,
+            ...(input.episodeId === undefined ? {} : { episodeId: input.episodeId }),
+            ...(featureSnapshotId === undefined ? {} : { featureSnapshotId }),
           };
           for (const [eventId, kind, body] of [
             [candidateSignalId, SignalKind.CANDIDATE_UPDATE, payload],
@@ -298,13 +499,7 @@ export class CandidateResolver {
               SignalKind.NARRATIVE,
               {
                 ...payload,
-                eligible:
-                  selectionClear &&
-                  candidate.rank === 1 &&
-                  !coalescing &&
-                  candidate.narrativeConfirmed &&
-                  candidate.marketStatus === 'safe' &&
-                  candidate.state !== State.MANUAL_REVIEW,
+                eligible: candidate.qualification!.E01,
               },
             ],
           ] as const) {
@@ -333,7 +528,12 @@ export class CandidateResolver {
             );
             if (written.kind === 'failure') throw written.error;
           }
-          published.push({ ...candidate, candidateSignalId, narrativeSignalId });
+          published.push({
+            ...candidate,
+            candidateSignalId,
+            narrativeSignalId,
+            ...(featureSnapshotId === undefined ? {} : { featureSnapshotId }),
+          });
         }
         const report: CandidateReport = {
           resolutionId,
@@ -408,7 +608,7 @@ export class CandidateResolver {
       SELECT DISTINCT ON (canonical_narrative_id) canonical_narrative_id,signal_id,available_at FROM signals
       WHERE source='nit' AND kind='narrative' AND source_version NOT LIKE 'resolver:%'
         AND canonical_narrative_id IS NOT NULL AND available_at<=$1 AND available_at >= $2
-        AND payload->>'schemaVersion'='1' AND payload ? 'candidates'
+        AND payload->>'schemaVersion' IN ('1','2') AND payload ? 'candidates'
       ORDER BY canonical_narrative_id,available_at DESC,signal_id DESC)
       SELECT s.* FROM latest s LEFT JOIN candidate_scenarios c ON c.narrative_id=s.canonical_narrative_id
       WHERE c.narrative_id IS NULL OR c.next_check_at <= $1 OR c.source_signal_id<>s.signal_id
@@ -449,7 +649,8 @@ export class CandidateResolver {
 
 function parseNarrative(raw: unknown): NarrativeCandidates {
   const value = object(raw);
-  if (value['schemaVersion'] !== 1) throw new Error('Unsupported narrative candidate schema');
+  if (value['schemaVersion'] !== 1 && value['schemaVersion'] !== 2)
+    throw new Error('Unsupported narrative candidate schema');
   const candidates = value['candidates'];
   if (!Array.isArray(candidates) || candidates.length > 32)
     throw new Error('Expected at most 32 explicit narrative candidates');
@@ -464,12 +665,22 @@ function parseNarrative(raw: unknown): NarrativeCandidates {
       tokenMint: mint,
       linkConfidenceBps: integer(item['linkConfidenceBps'], 0, 10000),
       reasonCodes: reasons.map((reason) => nonempty(reason, 100)),
+      ...(item['linkageStatus'] === undefined
+        ? {}
+        : { linkageStatus: EvidenceStatusSchema.parse(item['linkageStatus']) }),
     };
   });
   if (new Set(parsed.map((candidate) => candidate.tokenMint)).size !== parsed.length)
     throw new Error('Duplicate candidate mint');
   return {
-    schemaVersion: 1,
+    schemaVersion: value['schemaVersion'],
+    ...(value['schemaVersion'] === 2
+      ? {
+          episodeId: nonempty(value['episodeId']),
+          interpretationId: nonempty(value['interpretationId']),
+          narrativeStatus: EvidenceStatusSchema.parse(value['narrativeStatus']),
+        }
+      : {}),
     title: nonempty(value['title'], 200),
     narrativeStrengthBps: integer(value['narrativeStrengthBps'], 0, 10000),
     candidates: parsed,

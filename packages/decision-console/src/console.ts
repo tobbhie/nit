@@ -9,6 +9,7 @@ import {
   PaperMarketSnapshot,
   PaperQuote,
   PostgresPaperTrader,
+  PostgresResearchReplay,
   StrategySnapshot,
   paperPolicy,
   paperQuote,
@@ -774,13 +775,36 @@ export class TelegramDecisionConsole {
           [this.options.botName, operator.userId]
         );
         response = rows.map((row) => `${row.status}: ${row.count}`).join('\n') || 'No deliveries.';
+      } else if (command === '/run-report') {
+        const variants = await paperRows<{ portfolio_id: PortfolioId }>(
+          db,
+          'SELECT portfolio_id FROM research_replay_variants WHERE experiment_id=$1',
+          [arg]
+        );
+        if (
+          variants.length === 0 ||
+          variants.some((v) => !operator.portfolioIds.includes(v.portfolio_id))
+        )
+          throw new Error('Experiment portfolios are not authorized');
+        const report = object(await new PostgresResearchReplay(this.db).report(arg));
+        const rows = report['variants'];
+        if (!Array.isArray(rows)) throw new Error('Malformed stored report');
+        response =
+          `HISTORICAL PAPER RESEARCH\nDataset: ${String(report['datasetHash'])}\nTiming: ${String(report['timing'])}\nUnderlying scenarios: ${String(report['underlyingScenarioCount'])}\n` +
+          rows
+            .map((raw: unknown) => {
+              const v = object(raw);
+              return `${String(v['variant'])}: ${String(v['dataStatus'])}; net cash after research costs ${String(v['netCashAfterResearchCosts'])}; costs ${String(v['researchCostCash'])}`;
+            })
+            .join('\n') +
+          '\nShared market paths are correlated. Open/unsellable residuals are valued at zero. Full coverage, assumptions and paired differences are available through research-worker report.';
       } else if (
-        /^\/(backtest|backtest-event|backtest-compare|scenario|strategy-backtest|matrix|run-report)$/.test(
+        /^\/(backtest|backtest-event|backtest-compare|scenario|strategy-backtest|matrix)$/.test(
           command
         )
       ) {
         response =
-          'Historical replay/report commands are not implemented yet; no backtest has been started.';
+          'Dataset creation and bounded replay scheduling use @nit/app-research-worker. Use /run-report <experiment> for authorized results. No backtest has been started by this command.';
       } else
         response =
           '/candidates <narrative> · /strategies · /strategy <portfolio> · /use <portfolio> · /portfolio · /positions · /pause <portfolio> · /resume <portfolio> · /stop <position> <price> · /outbox\nPaper only; no live execution.';
@@ -925,7 +949,9 @@ export class TelegramDecisionConsole {
     if (
       candidate === undefined ||
       candidate.state === CandidateActionState.BLOCKED ||
-      candidate.state === CandidateActionState.MANUAL_REVIEW
+      (candidate.state === CandidateActionState.MANUAL_REVIEW &&
+        candidate.qualification?.E01 !== true &&
+        candidate.qualification?.E04 !== true)
     )
       throw new Error('Candidate requires watch/manual review before a paper buy.');
     const preferences = await paperRows<{ state: string }>(
@@ -953,7 +979,9 @@ export class TelegramDecisionConsole {
     }
     const source =
       entry === 'E01' ||
-      (entry === 'E04' && candidate.state !== CandidateActionState.TRADE_ELIGIBLE)
+      (entry === 'E04' &&
+        candidate.qualification === undefined &&
+        candidate.state !== CandidateActionState.TRADE_ELIGIBLE)
         ? candidate.narrativeSignalId
         : candidate.candidateSignalId;
     if (source === undefined) throw new Error('Candidate has no applicable strategy signal');

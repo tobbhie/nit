@@ -226,7 +226,9 @@ change requires refreshed buttons; equivalent evidence refreshes remain usable.
 Watch/Discard withhold entries for that narrative/mint/portfolio and
 cancel pending buys at settlement without closing existing positions. Watch may
 be followed by an explicit Buy; a discarded candidate must first return to Watch.
-Evidence history is retained. Backtest commands report their unavailable status.
+Evidence history is retained. Replay scheduling uses the research worker below;
+`/run-report <experiment>` reads results only when every variant portfolio is
+authorized for that operator.
 
 `/outbox` reports delivery counts. Definite rate-limit failures retry within a
 bound; an ambiguous send or interrupted in-flight delivery is marked `uncertain`
@@ -242,3 +244,105 @@ callback IDs. The bot token is sent only to that fixed API host; provider URLs,
 tokens and raw transport errors are not logged. No third-party SDK, dependency,
 telemetry, signing key or live execution capability is added. Automated checks
 use mocked Telegram transport and an isolated development database.
+
+## Research provenance and matched replay
+
+`@nit/app-research-worker` provides bounded `append`, `publish`, `freeze`,
+`create`, `advance`, and `report` commands. Set `NIT_RESEARCH_COMMAND_PATH` to a
+private JSON file (at most 1 MiB), build the workspace, then run:
+
+```powershell
+pnpm --filter @nit/app-research-worker start
+```
+
+`append` takes a `record` conforming to `ResearchRecord` in
+`packages/signals/src/research.ts`: artifact, episode, interpretation, coverage,
+or feature. Records have stable identities, immutable versions/content hashes,
+producer versions, evidence references and distinct occurrence, observation and
+availability timestamps. Source artifacts hold bounded captured text and media
+hash/storage references; media bytes remain outside PostgreSQL. Derivative roots,
+common authors/source identities and identical content discount independent
+corroboration. Similarity or repetition does not establish original authorship or
+official endorsement. Captured interpretations preserve competing and rejected
+mints, extractor/model/prompt versions and approximation status. Revival episodes
+reference their predecessor rather than overwriting a launch interpretation.
+
+`publish` takes `interpretationId` and publishes an available captured
+interpretation as a schema-2 NIT narrative with explicit episode/provenance links.
+This is an explicit-text evidence producer; it does not fetch social history,
+invent model interpretations, or perform OCR/video extraction. Existing ingestion
+and future extractors can supply the same immutable contract. The resolver checks
+the signal against its recorded interpretation and emits per-token feature
+snapshots. Decisions retain the snapshot, evidence mask and pinned strategy hash.
+Legacy schema-1 narratives remain supported without invented provenance.
+
+Evidence states distinguish `pending`, `unavailable`, `extraction_failure`,
+`observed_nonconfirming`, `contradictory`, and `confirmed`. Empty stored wallet
+history means unavailable coverage unless an explicit completed observation
+covers the resolver's full window. Relationship suspicion is recorded separately
+from technical execution safety. An optional resolver `evidencePolicy` version 1
+sets `narrativeRelationshipHandling` (`review`, `advisory`, `block`) and
+`combinedRelationshipHandling` (`review`, `block`, `discount`). Legacy defaults
+remain review. Discount mode counts connected wallets as one independent group;
+it does not permit them to count individually. E01 and E03 qualifications are
+separate. E04 can evaluate competing plausible mints without requiring a single
+winner; it still observes relationship policy and hard execution/capital gates.
+Episode-aware positions allow a later episode after the earlier position closes,
+while retaining one open position per mint/portfolio and one acquisition per
+episode. Legacy signals retain their original one-cycle behavior.
+
+`freeze` takes `dataset` conforming to `ResearchDataset` in
+`packages/trading/src/research-replay.ts`. Supply the ex-ante universe with episode
+IDs, discovery timestamps and dead/failed/illiquid/ungraduated tokens; UTC start,
+decision-end and full evaluation horizon; chronological partition; discovery and
+coverage descriptions; measured/proxy and captured/regenerated labels; extractor
+versions; seed; and explicitly timestamped opportunity/reserve events. Each
+opportunity supplies family-specific costs and latencies, an optional immutable
+feature reference, and optional wallet-only signal reference. Freeze pins a
+canonical manifest hash and actual feature hashes. Missing markets/features are
+not filled from future observations. A curated universe is explicitly a proxy;
+declaring a market census does not independently verify provider completeness.
+
+`create` takes `experiment` conforming to `ResearchExperiment`, including an
+explicit experiment ID, dataset hash, code hash/commit, cash asset, initial cash,
+policy version, full `qualificationPolicy`, timing mode and strategy snapshots:
+
+- A uses E00 market-only entry over the common ex-ante opportunity universe.
+- B uses E01 with narrative provenance and masks wallet information.
+- C uses E03 with narrative plus independent wallet evidence.
+- Optional W uses E02 and can consume wallet signals without narrative features.
+
+Every variant must pin identical sizing, exit, protection, risk and execution
+assumptions. Each gets a separate historical portfolio.
+The qualification policy pins narrative/link score thresholds, independent-wallet
+minimum and separate narrative/combined relationship handling; the resolver and
+replay invoke the same pure qualification function. `fixed_decision` evaluates
+then-available information at common timestamps; `end_to_end` separately includes
+supplied pipeline delays, later feature availability and costs. Decisions consume
+masked evidence, and every fill/exit uses `PostgresPaperTrader`. E00 is a separate
+baseline; E04 is not repurposed as a market-only policy.
+
+`advance` takes `experimentId`, `maxSteps` (1–64 per variant) and
+`maxProtectionLagMs`. Each recorded timestamp checkpoints independently; replay
+can resume after a crash between engine and checkpoint commits. The worker yields
+between steps when forward-paper protection is overdue. Datasets are bounded to
+512 scenarios and 5000 events; larger research should use separately frozen
+chunks rather than loading unrestricted histories into the 2 GB process.
+
+`report` takes `experimentId` and returns immutable completed reports with actual
+orders/fills/failures/partials, missing-data and skipped opportunities, per-scenario
+cash outcomes and paired increments, fees, research costs, latency, exposure,
+cash and reserve-estimate drawdowns, worst outcomes and top-winner sensitivity.
+Unknown/unexecutable residual valuations are zero, not invented terminal fills;
+incomplete exit horizons remain visible. Reserve estimates are not guaranteed
+liquidation prices. Multiple variants and repeated-mint episodes are correlated;
+sample counts do not establish independence. Attribution precision remains null
+without independently labeled ground truth. Partition labels and matched inputs
+support holdout evaluation; running or repeatedly tuning a holdout does not keep
+it statistically untouched automatically. No automatic tuning/promotion is added.
+
+These commands add workspace links only and use the existing development database.
+They make no new network calls, collect no credentials, and do not start a bot,
+provider, model, signer or live broker. Real datasets, thresholds, source artifacts
+and research configuration remain private. Source collection, full multimedia
+extraction, calibration training and agent learning remain later integrations.

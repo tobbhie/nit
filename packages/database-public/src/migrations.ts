@@ -1546,9 +1546,79 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    id: '0023_research_measurement_boundary',
+    description:
+      'Immutable provenance, attention episodes, decision snapshots and pinned replay experiments',
+    up: `
+      CREATE TABLE IF NOT EXISTS research_records (
+        record_id UUID PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('artifact','episode','interpretation','coverage','feature')),
+        scope TEXT NOT NULL,version INTEGER NOT NULL CHECK(version>0),content_hash TEXT NOT NULL,
+        occurred_at TIMESTAMPTZ NOT NULL,observed_at TIMESTAMPTZ NOT NULL,available_at TIMESTAMPTZ NOT NULL,
+        payload JSONB NOT NULL, UNIQUE(kind,scope,version),CHECK(occurred_at<=observed_at AND observed_at<=available_at)
+      );
+      CREATE INDEX IF NOT EXISTS research_asof_idx ON research_records(kind,scope,available_at DESC,version DESC);
+      CREATE TABLE IF NOT EXISTS research_links (
+        record_id UUID NOT NULL REFERENCES research_records(record_id),evidence_id UUID NOT NULL REFERENCES research_records(record_id),
+        relation TEXT NOT NULL,PRIMARY KEY(record_id,evidence_id,relation),CHECK(record_id<>evidence_id)
+      );
+      CREATE TABLE IF NOT EXISTS decision_feature_snapshots (
+        decision_id UUID PRIMARY KEY REFERENCES strategy_decisions(decision_id),feature_record_id UUID REFERENCES research_records(record_id),
+        episode_id UUID REFERENCES research_records(record_id),evidence_mask JSONB NOT NULL,snapshot JSONB NOT NULL,content_hash TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS research_datasets (
+        dataset_hash TEXT PRIMARY KEY,manifest JSONB NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS research_experiments (
+        experiment_id UUID PRIMARY KEY,dataset_hash TEXT NOT NULL REFERENCES research_datasets(dataset_hash),
+        config_hash TEXT NOT NULL,config JSONB NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS research_replay_variants (
+        experiment_id UUID NOT NULL REFERENCES research_experiments(experiment_id),variant TEXT NOT NULL,
+        portfolio_id UUID NOT NULL UNIQUE REFERENCES paper_portfolios(portfolio_id),PRIMARY KEY(experiment_id,variant)
+      );
+      CREATE TABLE IF NOT EXISTS research_replay_steps (
+        experiment_id UUID NOT NULL REFERENCES research_experiments(experiment_id),variant TEXT NOT NULL,step INTEGER NOT NULL,
+        available_at TIMESTAMPTZ NOT NULL,outcome JSONB NOT NULL,PRIMARY KEY(experiment_id,variant,step),
+        FOREIGN KEY(experiment_id,variant) REFERENCES research_replay_variants(experiment_id,variant)
+      );
+      CREATE TABLE IF NOT EXISTS research_reports (
+        experiment_id UUID PRIMARY KEY REFERENCES research_experiments(experiment_id),report JSONB NOT NULL,report_hash TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      DO $$ DECLARE table_name TEXT; BEGIN
+        FOREACH table_name IN ARRAY ARRAY['research_records','research_links','decision_feature_snapshots','research_datasets',
+          'research_experiments','research_replay_variants','research_replay_steps','research_reports'] LOOP
+          EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I',table_name||'_append_only',table_name);
+          EXECUTE format('CREATE TRIGGER %I BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION reject_mutation()',
+            table_name||'_append_only',table_name);
+        END LOOP;
+      END; $$;
+      ALTER TABLE positions ADD COLUMN IF NOT EXISTS episode_id UUID REFERENCES research_records(record_id);
+      ALTER TABLE positions DROP CONSTRAINT IF EXISTS position_portfolio_token_key;
+      CREATE UNIQUE INDEX IF NOT EXISTS positions_legacy_mint_key ON positions(portfolio_id,token_mint) WHERE episode_id IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS positions_episode_key ON positions(portfolio_id,token_mint,episode_id) WHERE episode_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS positions_one_open_mint ON positions(portfolio_id,token_mint) WHERE open_quantity>0;
+      CREATE OR REPLACE FUNCTION reject_position_identity_change() RETURNS trigger AS $$ BEGIN
+        IF NEW.portfolio_id IS DISTINCT FROM OLD.portfolio_id OR NEW.token_mint IS DISTINCT FROM OLD.token_mint
+          OR NEW.episode_id IS DISTINCT FROM OLD.episode_id OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+          RAISE EXCEPTION 'Position portfolio/mint/episode identity is immutable';
+        END IF; RETURN NEW; END; $$ LANGUAGE plpgsql;
+      DROP TRIGGER IF EXISTS positions_identity_immutable ON positions;
+      CREATE TRIGGER positions_identity_immutable BEFORE UPDATE ON positions FOR EACH ROW EXECUTE FUNCTION reject_position_identity_change();
+    `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
+  'research_records',
+  'research_links',
+  'decision_feature_snapshots',
+  'research_datasets',
+  'research_experiments',
+  'research_replay_variants',
+  'research_replay_steps',
+  'research_reports',
   'candidate_scenarios',
   'candidate_resolution_reports',
   'telegram_actions',
