@@ -165,3 +165,80 @@ count. `paper_feed_health` and `paper_signal_dispatch` are durable operational
 projections. This integration adds only database reads/writes; it sends no data
 to another network provider. A real market-data producer must still supply the
 execution-fact contract before unattended forward paper trading is usable.
+
+## Candidate resolver and Telegram console
+
+`@nit/app-console-worker` resolves persisted NIT narrative candidates, publishes
+versioned candidate and narrative signals, and exposes an authorized **paper-only**
+Telegram console. The deterministic console works without a model or agent.
+It consumes existing market facts and wallet evidence; it does not introduce a
+market-data producer, live broker, historical replay runner, or learning runtime.
+
+An upstream NIT narrative must have a canonical narrative ID and payload
+`{schemaVersion: 1, title, narrativeStrengthBps, candidates}`. Each candidate
+contains an exact `tokenMint`, `linkConfidenceBps`, and explicit `reasonCodes`.
+Scores are integers from 0 to 10000 describing source evidence, not calibrated
+profit probabilities. All competing mints remain in the report. Equal or close
+links require manual review; wallet activity cannot silently choose a tied mint.
+NIT-only E01 eligibility and independent-wallet confirmation remain separate.
+Shared-funder/related-wallet evidence causes manual review, and unknown safety
+data stays unknown. E03 requires both qualified sources and explicit market safety.
+Coalescing and watch expiry use signal availability time; future observations
+cannot qualify a candidate. Reports, policy snapshots, signals and their events
+are committed atomically. Updates push only when the report materially changes.
+
+Keep configuration in `private/`. Set `NIT_CONSOLE_CONFIG_PATH` to a JSON file and
+provide `NIT_TELEGRAM_BOT_TOKEN` through the runtime environment, then run:
+
+```powershell
+pnpm --filter @nit/app-console-worker start
+```
+
+The JSON object requires `cashAsset`, `approvedMarketSources`, `cycleIntervalMs`,
+`resolver`, and `console`. The resolver policy supplies
+`minimumNarrativeStrengthBps`, `minimumLinkConfidenceBps`,
+`minimumSelectionMarginBps`, `minimumIndependentWallets`, `coalescingMs`,
+`walletWindowMs`, `maxMarketAgeMs`, `watchDurationMs`, `pollIntervalMs`, and
+`maxScenariosPerCycle`. No tuned policy defaults are embedded in the runtime.
+The console configuration supplies `botName`, `actionTtlMs`, `maxOutbox` (64–2048),
+and `operators`: `{userId, chatId, role: 'viewer' | 'trader', portfolioIds}`.
+IDs are strings; configure one chat per user, with explicit portfolio access.
+The worker uses the existing `NIT_CONFIG_PATH` bootstrap configuration and no toy
+provider binding. Use one polling process per bot; an existing Telegram webhook
+must be disabled before long polling. Poll offsets and message/action state are
+persisted. Stop with SIGINT/SIGTERM to drain work and close the database.
+
+Use `/candidates <narrative>` to refresh the narrative and separate token cards,
+`/strategies`, `/strategy <portfolio>`, `/portfolio`, and `/positions` to inspect
+authorized paper state, and `/use <portfolio>` to bind newly generated buttons to
+a portfolio. Trader actions include Buy, Watch, Discard, Close Remaining,
+`/pause <portfolio>`, `/resume <portfolio>`, and `/stop <position> <price>`.
+Stops can only tighten. Pause withholds new entries while the separate paper
+dispatcher continues protection and settlement; keep that worker running.
+
+Buy/Close first prepares a fresh reserve-model quote showing the exact input,
+estimated output, fees, impact, portfolio and expiry. Explicit confirmation queues
+a durable request, whose execution rechecks the current candidate, strategy,
+quote and risk gates. Acceptance creates a delayed paper order, never an instant
+fill. Opaque callbacks bind to bot/user/chat/message and expire; duplicates and
+worker restarts cannot create a second order. A material candidate or policy
+change requires refreshed buttons; equivalent evidence refreshes remain usable.
+Watch/Discard withhold entries for that narrative/mint/portfolio and
+cancel pending buys at settlement without closing existing positions. Watch may
+be followed by an explicit Buy; a discarded candidate must first return to Watch.
+Evidence history is retained. Backtest commands report their unavailable status.
+
+`/outbox` reports delivery counts. Definite rate-limit failures retry within a
+bound; an ambiguous send or interrupted in-flight delivery is marked `uncertain`
+and is not automatically resent. Refresh `/candidates` or `/positions` to obtain
+new buttons after delivery loss or expiry. The worker does not silently fabricate
+provider delivery guarantees.
+
+Network exposure: when explicitly started, this worker sends narrative titles,
+token identities, evidence scores/reasons, authorized portfolio identifiers,
+paper balances, quotes and position status to configured Telegram chats through
+`https://api.telegram.org`. Telegram returns user/chat identities, commands and
+callback IDs. The bot token is sent only to that fixed API host; provider URLs,
+tokens and raw transport errors are not logged. No third-party SDK, dependency,
+telemetry, signing key or live execution capability is added. Automated checks
+use mocked Telegram transport and an isolated development database.

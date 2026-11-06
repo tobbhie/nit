@@ -1464,9 +1464,103 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    id: '0022_resolver_and_telegram_console',
+    description: 'Versioned candidate scenarios and authorized durable Telegram controls',
+    up: `
+      CREATE TABLE IF NOT EXISTS candidate_scenarios (
+        narrative_id TEXT PRIMARY KEY,
+        source_signal_id UUID NOT NULL REFERENCES signals(signal_id),
+        fingerprint TEXT,
+        report JSONB,
+        next_check_at TIMESTAMPTZ NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        last_error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS candidate_scenario_due_idx ON candidate_scenarios(next_check_at);
+      CREATE TABLE IF NOT EXISTS candidate_resolution_reports (
+        resolution_id UUID PRIMARY KEY REFERENCES candidate_resolution_events(resolution_id),
+        report JSONB NOT NULL,
+        policy JSONB NOT NULL
+      );
+      DROP TRIGGER IF EXISTS candidate_resolution_reports_append_only ON candidate_resolution_reports;
+      CREATE TRIGGER candidate_resolution_reports_append_only BEFORE UPDATE OR DELETE ON candidate_resolution_reports
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+      CREATE TABLE IF NOT EXISTS console_operator_preferences (
+        bot_name TEXT NOT NULL,user_id TEXT NOT NULL,chat_id TEXT NOT NULL,
+        portfolio_id UUID REFERENCES paper_portfolios(portfolio_id),
+        PRIMARY KEY(bot_name,user_id,chat_id)
+      );
+      CREATE TABLE IF NOT EXISTS console_candidate_preferences (
+        bot_name TEXT NOT NULL,user_id TEXT NOT NULL,narrative_id TEXT NOT NULL,token_mint TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('watch','discard')),rationale TEXT NOT NULL,updated_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY(bot_name,user_id,narrative_id,token_mint)
+      );
+      CREATE TABLE IF NOT EXISTS paper_candidate_exclusions (
+        portfolio_id UUID NOT NULL REFERENCES paper_portfolios(portfolio_id),narrative_id TEXT NOT NULL,
+        token_mint TEXT NOT NULL,operator_user_id TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY(portfolio_id,narrative_id,token_mint)
+      );
+      CREATE TABLE IF NOT EXISTS telegram_actions (
+        action_token TEXT PRIMARY KEY,bot_name TEXT NOT NULL,user_id TEXT NOT NULL,chat_id TEXT NOT NULL,
+        resolution_id UUID REFERENCES candidate_resolution_events(resolution_id),token_mint TEXT,
+        portfolio_id UUID REFERENCES paper_portfolios(portfolio_id),position_id UUID REFERENCES positions(position_id),
+        kind TEXT NOT NULL CHECK(kind IN ('buy','confirm_buy','watch','discard','close','confirm_close','view','stop')),
+        expires_at TIMESTAMPTZ NOT NULL,status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','used','rejected')),
+        quote JSONB,message_id BIGINT,result JSONB,created_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS telegram_action_receipts (
+        bot_name TEXT NOT NULL,callback_id TEXT NOT NULL,action_token TEXT NOT NULL,
+        result JSONB NOT NULL,handled_at TIMESTAMPTZ NOT NULL,PRIMARY KEY(bot_name,callback_id)
+      );
+      DROP TRIGGER IF EXISTS telegram_action_receipts_append_only ON telegram_action_receipts;
+      CREATE TRIGGER telegram_action_receipts_append_only BEFORE UPDATE OR DELETE ON telegram_action_receipts
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+      CREATE TABLE IF NOT EXISTS console_trade_requests (
+        action_token TEXT PRIMARY KEY REFERENCES telegram_actions(action_token),
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','complete','rejected')),
+        result JSONB,created_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS telegram_outbox (
+        outbox_id UUID PRIMARY KEY,bot_name TEXT NOT NULL,user_id TEXT NOT NULL,chat_id TEXT NOT NULL,
+        body JSONB NOT NULL,action_tokens TEXT[] NOT NULL DEFAULT '{}',dedupe_key TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sending','sent','uncertain','failed')),
+        attempts INTEGER NOT NULL DEFAULT 0,available_at TIMESTAMPTZ NOT NULL,lease_until TIMESTAMPTZ,
+        message_id BIGINT,last_error TEXT,created_at TIMESTAMPTZ NOT NULL,
+        UNIQUE(bot_name,dedupe_key)
+      );
+      CREATE INDEX IF NOT EXISTS telegram_outbox_due_idx ON telegram_outbox(bot_name,status,available_at);
+      CREATE TABLE IF NOT EXISTS telegram_update_receipts (
+        bot_name TEXT NOT NULL,update_id BIGINT NOT NULL,handled_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY(bot_name,update_id)
+      );
+      DROP TRIGGER IF EXISTS telegram_update_receipts_append_only ON telegram_update_receipts;
+      CREATE TRIGGER telegram_update_receipts_append_only BEFORE UPDATE OR DELETE ON telegram_update_receipts
+        FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+      CREATE TABLE IF NOT EXISTS telegram_poll_offsets (
+        bot_name TEXT PRIMARY KEY,next_offset BIGINT NOT NULL CHECK(next_offset>=0)
+      );
+      CREATE TABLE IF NOT EXISTS console_notification_receipts (
+        bot_name TEXT NOT NULL,user_id TEXT NOT NULL,reference_id TEXT NOT NULL,
+        handled_at TIMESTAMPTZ NOT NULL,PRIMARY KEY(bot_name,user_id,reference_id)
+      );
+    `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
+  'candidate_scenarios',
+  'candidate_resolution_reports',
+  'telegram_actions',
+  'telegram_action_receipts',
+  'telegram_outbox',
+  'telegram_update_receipts',
+  'telegram_poll_offsets',
+  'console_operator_preferences',
+  'console_candidate_preferences',
+  'console_trade_requests',
+  'console_notification_receipts',
+  'paper_candidate_exclusions',
   'paper_signal_dispatch',
   'paper_feed_health',
   'paper_dispatch_health',

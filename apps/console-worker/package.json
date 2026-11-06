@@ -1,0 +1,21 @@
+{
+  "name": "@nit/app-console-worker",
+  "version": "0.0.0",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -b",
+    "start": "node dist/main.js",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@nit/composition": "workspace:*",
+    "@nit/domain": "workspace:*",
+    "@nit/trading": "workspace:*",
+    "@nit/decision-console": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0"
+  }
+}

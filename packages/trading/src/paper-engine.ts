@@ -115,10 +115,87 @@ export class PostgresPaperTrader {
     });
   }
 
+  /** Authenticated console requests still use the same sell quote/risk/ledger path. */
+  async closePosition(
+    portfolioId: PortfolioId,
+    positionId: string,
+    requestId: string,
+    market: PaperMarketSnapshot
+  ): Promise<Result<PaperTickResult, Error>> {
+    const now = this.clock.now();
+    return this.db.transaction(async (client) => {
+      const db = clientExecutor(client);
+      validatePaperMarket(market, now);
+      const portfolios = await paperRows<PortfolioRow>(
+        db,
+        `SELECT p.*,c.strategy_snapshot,r.config_hash,
+        r.status,r.mode,r.period_start,r.period_end FROM paper_portfolios p
+        JOIN strategy_runs r ON r.run_id=p.run_id JOIN paper_run_configs c ON c.run_id=r.run_id
+        WHERE p.portfolio_id=$1 FOR UPDATE OF p`,
+        [portfolioId]
+      );
+      const portfolio = portfolios[0];
+      if (
+        portfolio === undefined ||
+        !['historical', 'forward_paper'].includes(portfolio.mode) ||
+        portfolio.cash_asset !== market.cashAsset
+      )
+        throw new ValidationError('Invalid paper close scope');
+      if (
+        requestId.trim() === '' ||
+        requestId.length > 100 ||
+        portfolio.config_hash !== portfolio.strategy_snapshot.configHash
+      )
+        throw new ValidationError('Invalid paper close request');
+      if (portfolio.paper_last_tick_at !== null && portfolio.paper_last_tick_at > now)
+        throw new ValidationError('Paper clock cannot regress');
+      await paperRows(
+        db,
+        'UPDATE paper_portfolios SET paper_last_tick_at=$2 WHERE portfolio_id=$1',
+        [portfolioId, now]
+      );
+      const positions = await paperRows<PositionRow>(
+        db,
+        'SELECT * FROM positions WHERE position_id=$1 AND portfolio_id=$2',
+        [positionId, portfolioId]
+      );
+      const position = positions[0];
+      if (
+        position === undefined ||
+        position.token_mint !== market.tokenMint ||
+        units(position.open_quantity) === 0n
+      )
+        throw new ValidationError('Position is no longer open');
+      const pending = await paperRows(
+        db,
+        `SELECT 1 FROM orders o WHERE portfolio_id=$1 AND token_mint=$2
+        AND NOT EXISTS(SELECT 1 FROM paper_execution_results x WHERE x.order_id=o.order_id)`,
+        [portfolioId, market.tokenMint]
+      );
+      if (pending.length > 0) return { decisions: 0, orders: 0, settled: 0 };
+      await captureMarket(db, market);
+      const source = await positionSource(db, positionId);
+      return planOrder(
+        db,
+        portfolio,
+        market,
+        paperPolicy(portfolio.strategy_snapshot),
+        source,
+        OrderSide.SELL,
+        position.open_quantity,
+        'AUTHENTICATED_CLOSE',
+        false,
+        now,
+        `operator-close:${requestId}`
+      );
+    });
+  }
+
   async tick(
     portfolioId: PortfolioId,
     market: PaperMarketSnapshot,
-    sourceSignalId: SignalId | null = null
+    sourceSignalId: SignalId | null = null,
+    confirmedRequestId?: string
   ): Promise<Result<PaperTickResult, Error>> {
     const now = this.clock.now();
     return this.db.transaction(async (client) => {
@@ -209,9 +286,55 @@ export class PostgresPaperTrader {
       const signal = await loadSignal(db, sourceSignalId);
       if (signal.availableAt > now)
         throw new ValidationError('Signal is not available as of the clock');
-      const reason = entryRejection(portfolio, signal, market, policy, position, now);
-      const riskReason = reason ?? (await capitalRejection(db, portfolio, market, policy, now));
-      const key = `entry:${signal.eventId}:${market.tokenMint}`;
+      const reason =
+        (await resolverRejection(db, signal, now)) ??
+        entryRejection(portfolio, signal, market, policy, position, now);
+      let entryNarrativeId = signal.canonicalNarrativeId;
+      let authorized = false;
+      if (confirmedRequestId !== undefined) {
+        const actions = await paperRows<{ narrative_id: string }>(
+          db,
+          `SELECT cr.report->>'narrativeId' AS narrative_id FROM telegram_actions a JOIN console_trade_requests r USING(action_token)
+          JOIN candidate_resolution_reports cr ON cr.resolution_id=a.resolution_id
+          JOIN candidate_scenarios c ON c.narrative_id=cr.report->>'narrativeId'
+          WHERE a.action_token=$1 AND a.portfolio_id=$2 AND a.token_mint=$3 AND a.kind='confirm_buy'
+            AND a.status='used' AND r.status='pending' AND a.expires_at>$4
+            AND a.quote->>'sourceSignalId'=$5 AND a.quote->>'configHash'=$6
+            AND c.report->>'materialHash'=cr.report->>'materialHash'
+            AND c.report->>'policyHash'=cr.report->>'policyHash'
+            AND c.expires_at>$4
+            AND NOT EXISTS (SELECT 1 FROM paper_candidate_exclusions e WHERE e.portfolio_id=a.portfolio_id
+              AND e.narrative_id=cr.report->>'narrativeId' AND e.token_mint=a.token_mint AND e.created_at>a.created_at)`,
+          [
+            confirmedRequestId,
+            portfolioId,
+            market.tokenMint,
+            now,
+            sourceSignalId,
+            portfolio.config_hash,
+          ]
+        );
+        if (actions.length !== 1)
+          throw new ValidationError('Confirmed request expired or candidate state changed');
+        authorized = true;
+        entryNarrativeId = actions[0]!.narrative_id;
+      }
+      const excluded =
+        entryNarrativeId === undefined
+          ? []
+          : await paperRows(
+              db,
+              'SELECT 1 FROM paper_candidate_exclusions WHERE portfolio_id=$1 AND narrative_id=$2 AND token_mint=$3',
+              [portfolioId, entryNarrativeId, market.tokenMint]
+            );
+      const riskReason =
+        excluded.length > 0 && !authorized
+          ? 'OPERATOR_WITHHELD'
+          : (reason ?? (await capitalRejection(db, portfolio, market, policy, now)));
+      const key =
+        confirmedRequestId === undefined
+          ? `entry:${signal.eventId}:${market.tokenMint}`
+          : `operator-buy:${confirmedRequestId}`;
       if (riskReason !== null) {
         const inserted = await recordDecision(
           db,
@@ -239,6 +362,12 @@ export class PostgresPaperTrader {
         );
         outcome.decisions += created.decisions;
         outcome.orders += created.orders;
+        if (authorized && created.orders > 0)
+          await paperRows(
+            db,
+            'DELETE FROM paper_candidate_exclusions WHERE portfolio_id=$1 AND narrative_id=$2 AND token_mint=$3',
+            [portfolioId, entryNarrativeId, market.tokenMint]
+          );
       }
       return outcome;
     });
@@ -329,6 +458,23 @@ async function loadSignal(db: Executor, id: SignalId): Promise<SignalEnvelope> {
     evidenceIds: row.evidence_ids,
     payload: row.payload,
   });
+}
+
+async function resolverRejection(
+  db: Executor,
+  signal: SignalEnvelope,
+  now: Date
+): Promise<string | null> {
+  if (!signal.sourceVersion.startsWith('resolver:')) return null;
+  const rows = await paperRows(
+    db,
+    `SELECT 1 FROM candidate_scenarios c JOIN candidate_resolution_reports r
+    ON r.resolution_id::text=$2 WHERE c.narrative_id=$1 AND c.expires_at>$3
+      AND c.report->>'materialHash'=r.report->>'materialHash'
+      AND c.report->>'policyHash'=r.report->>'policyHash' FOR SHARE OF c`,
+    [signal.canonicalNarrativeId, asObject(signal.payload)['resolutionId'], now]
+  );
+  return rows.length === 1 ? null : 'CANDIDATE_STATE_CHANGED';
 }
 
 function entryRejection(
@@ -605,10 +751,45 @@ async function settle(
   now: Date
 ): Promise<void> {
   const plan = pending.plan;
+  const excluded =
+    plan.side !== OrderSide.BUY
+      ? []
+      : await paperRows(
+          db,
+          `SELECT 1 FROM orders o
+    JOIN strategy_decisions d ON d.decision_id=o.decision_id JOIN signals s ON s.signal_id=d.source_signal_id
+    LEFT JOIN telegram_actions a ON o.idempotency_key='operator-buy:'||a.action_token
+    LEFT JOIN candidate_resolution_reports r ON r.resolution_id=a.resolution_id
+    JOIN paper_candidate_exclusions x ON x.portfolio_id=o.portfolio_id
+      AND x.narrative_id=COALESCE(s.canonical_narrative_id,r.report->>'narrativeId') AND x.token_mint=o.token_mint WHERE o.order_id=$1`,
+          [pending.order_id]
+        );
   let reason =
     now > pending.expires_at
       ? 'QUOTE_EXPIRED'
       : marketRejection(market, policy, now, plan.side === OrderSide.BUY);
+  if (excluded.length > 0) reason = 'OPERATOR_WITHHELD';
+  if (plan.side === OrderSide.BUY) {
+    const changed = await paperRows(
+      db,
+      `SELECT 1 FROM orders o JOIN telegram_actions a
+      ON o.idempotency_key='operator-buy:'||a.action_token JOIN candidate_resolution_reports r ON r.resolution_id=a.resolution_id
+      WHERE o.order_id=$1 AND NOT EXISTS (SELECT 1 FROM candidate_scenarios c
+        WHERE c.narrative_id=r.report->>'narrativeId' AND c.expires_at>$2
+          AND c.report->>'materialHash'=r.report->>'materialHash' AND c.report->>'policyHash'=r.report->>'policyHash')`,
+      [pending.order_id, now]
+    );
+    if (changed.length > 0) reason = 'CANDIDATE_STATE_CHANGED';
+    const decisions = await paperRows<{ source_signal_id: SignalId }>(
+      db,
+      `SELECT d.source_signal_id FROM orders o
+      JOIN strategy_decisions d USING(decision_id) WHERE o.order_id=$1`,
+      [pending.order_id]
+    );
+    const source = decisions[0]?.source_signal_id;
+    if (source !== undefined)
+      reason = (await resolverRejection(db, await loadSignal(db, source), now)) ?? reason;
+  }
   if (market.occurredAt < new Date(plan.snapshotOccurredAt)) reason = 'MARKET_PRECEDES_QUOTE';
   let quote: PaperQuote | null = null;
   if (reason === null) {

@@ -98,10 +98,23 @@ export class PostgresSignalStore {
       return failure(error as Error);
     }
 
-    return transactResult(this.db, async (executor) => {
-      const originKey = signalOriginKey(signal.origin);
-      const inserted = await executor.query<{ signal_id: string }>(
-        `INSERT INTO signals (
+    return transactResult(this.db, (executor) => this.appendInTransaction(executor, signal));
+  }
+
+  /** Enlists in a caller-owned transaction; the caller must roll back on failure. */
+  async appendInTransaction<TPayload>(
+    executor: Executor,
+    candidate: SignalEnvelope<TPayload>
+  ): Promise<Result<SignalWriteResult, Error>> {
+    let signal: SignalEnvelope<TPayload>;
+    try {
+      signal = parseSignalEnvelope<TPayload>(candidate);
+    } catch (error) {
+      return failure(error as Error);
+    }
+    const originKey = signalOriginKey(signal.origin);
+    const inserted = await executor.query<{ signal_id: string }>(
+      `INSERT INTO signals (
            signal_id, source, source_version, kind, chain, token_mint,
            canonical_narrative_id, occurred_at, observed_at, available_at,
            origin_kind, provider, reference_id, transaction_signature,
@@ -113,56 +126,55 @@ export class PostgresSignalStore {
          )
          ON CONFLICT (origin_key) DO NOTHING
          RETURNING signal_id`,
-        [
-          signal.eventId,
-          signal.source,
-          signal.sourceVersion,
-          signal.kind,
-          signal.chain,
-          signal.tokenMint ?? null,
-          signal.canonicalNarrativeId ?? null,
-          signal.occurredAt,
-          signal.observedAt,
-          signal.availableAt,
-          signal.origin.kind,
-          signal.origin.kind === 'provider' ? signal.origin.provider : null,
-          signal.origin.kind === 'provider' ? signal.origin.referenceId : null,
-          signal.origin.kind === 'chain' ? signal.origin.transactionSignature : null,
-          signal.origin.kind === 'chain' ? (signal.origin.instructionIndex ?? null) : null,
-          signal.origin.kind === 'chain' ? (signal.origin.logIndex ?? null) : null,
-          signal.origin.kind === 'chain' ? (signal.origin.transactionLevel ?? false) : false,
-          signal.origin.kind === 'chain' ? (signal.origin.actorAddress ?? null) : null,
-          originKey,
-          signal.evidenceIds,
-          JSON.stringify(signal.payload),
-        ]
-      );
-      if (inserted.kind === 'failure') {
-        return failure(inserted.error);
-      }
+      [
+        signal.eventId,
+        signal.source,
+        signal.sourceVersion,
+        signal.kind,
+        signal.chain,
+        signal.tokenMint ?? null,
+        signal.canonicalNarrativeId ?? null,
+        signal.occurredAt,
+        signal.observedAt,
+        signal.availableAt,
+        signal.origin.kind,
+        signal.origin.kind === 'provider' ? signal.origin.provider : null,
+        signal.origin.kind === 'provider' ? signal.origin.referenceId : null,
+        signal.origin.kind === 'chain' ? signal.origin.transactionSignature : null,
+        signal.origin.kind === 'chain' ? (signal.origin.instructionIndex ?? null) : null,
+        signal.origin.kind === 'chain' ? (signal.origin.logIndex ?? null) : null,
+        signal.origin.kind === 'chain' ? (signal.origin.transactionLevel ?? false) : false,
+        signal.origin.kind === 'chain' ? (signal.origin.actorAddress ?? null) : null,
+        originKey,
+        signal.evidenceIds,
+        JSON.stringify(signal.payload),
+      ]
+    );
+    if (inserted.kind === 'failure') {
+      return failure(inserted.error);
+    }
 
-      const insertedId = inserted.value[0]?.signal_id;
-      if (insertedId === undefined) {
-        return this.findExistingId(executor, originKey);
-      }
+    const insertedId = inserted.value[0]?.signal_id;
+    if (insertedId === undefined) {
+      return this.findExistingId(executor, originKey);
+    }
 
-      const event = await new PostgresEventStore(executor).append({
-        eventId: generateEventId(),
-        eventType: EventType.SIGNAL_PUBLISHED,
-        aggregateType: AggregateType.SIGNAL,
-        aggregateId: insertedId as AggregateId,
-        version: signal.sourceVersion,
-        // Event-log replay must not make the payload visible before it was usable.
-        occurredAt: signal.availableAt,
-        producer: signal.source,
-        payload: signal,
-      });
-      if (event.kind === 'failure') {
-        return failure(event.error);
-      }
-
-      return success({ signalId: insertedId as SignalId, inserted: true });
+    const event = await new PostgresEventStore(executor).append({
+      eventId: generateEventId(),
+      eventType: EventType.SIGNAL_PUBLISHED,
+      aggregateType: AggregateType.SIGNAL,
+      aggregateId: insertedId as AggregateId,
+      version: signal.sourceVersion,
+      // Event-log replay must not make the payload visible before it was usable.
+      occurredAt: signal.availableAt,
+      producer: signal.source,
+      payload: signal,
     });
+    if (event.kind === 'failure') {
+      return failure(event.error);
+    }
+
+    return success({ signalId: insertedId as SignalId, inserted: true });
   }
 
   async getById<TPayload = unknown>(

@@ -27,6 +27,7 @@ export default defineConfig({
       '@nit/events': resolve(__dirname, 'packages/events/src'),
       '@nit/signals': resolve(__dirname, 'packages/signals/src'),
       '@nit/trading': resolve(__dirname, 'packages/trading/src'),
+      '@nit/decision-console': resolve(__dirname, 'packages/decision-console/src'),
       '@nit/agent-contracts': resolve(__dirname, 'packages/agent-contracts/src'),
       '@nit/database-public': resolve(__dirname, 'packages/database-public/src'),
       '@nit/queue': resolve(__dirname, 'packages/queue/src'),
