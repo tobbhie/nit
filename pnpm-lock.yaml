@@ -111,6 +111,25 @@ importers:
         specifier: ^1.0.0
         version: 1.6.1(@types/node@20.19.43)
 
+  apps/paper-worker:
+    dependencies:
+      '@nit/composition':
+        specifier: workspace:*
+        version: link:../../packages/composition
+      '@nit/domain':
+        specifier: workspace:*
+        version: link:../../packages/domain
+      '@nit/trading':
+        specifier: workspace:*
+        version: link:../../packages/trading
+    devDependencies:
+      typescript:
+        specifier: ^5.3.0
+        version: 5.9.3
+      vitest:
+        specifier: ^1.0.0
+        version: 1.6.1(@types/node@20.19.43)
+
   apps/wallet-worker:
     dependencies:
       '@nit/composition':
@@ -389,6 +408,9 @@ importers:
 
   packages/trading:
     dependencies:
+      '@nit/database-public':
+        specifier: workspace:*
+        version: link:../database-public
       '@nit/domain':
         specifier: workspace:*
         version: link:../domain

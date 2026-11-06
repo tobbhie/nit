@@ -1384,9 +1384,65 @@ export const MIGRATIONS: readonly Migration[] = [
         FOR EACH ROW EXECUTE FUNCTION reject_mutation();
     `,
   },
+  {
+    id: '0020_paper_runtime',
+    description:
+      'Pinned paper runtime configuration, market evidence, delayed orders and settlements',
+    up: `
+    ALTER TABLE paper_portfolios ADD COLUMN IF NOT EXISTS paper_last_tick_at TIMESTAMPTZ;
+    CREATE TABLE IF NOT EXISTS paper_run_configs (
+      run_id UUID PRIMARY KEY REFERENCES strategy_runs (run_id),
+      strategy_snapshot JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS paper_market_observations (
+      snapshot_id UUID PRIMARY KEY,
+      token_mint TEXT NOT NULL,
+      occurred_at TIMESTAMPTZ NOT NULL,
+      available_at TIMESTAMPTZ NOT NULL CHECK (available_at >= occurred_at),
+      snapshot JSONB NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS paper_market_available_idx
+      ON paper_market_observations (token_mint, available_at);
+    CREATE TABLE IF NOT EXISTS paper_execution_plans (
+      order_id UUID PRIMARY KEY REFERENCES orders (order_id),
+      snapshot_id UUID NOT NULL REFERENCES paper_market_observations (snapshot_id),
+      due_at TIMESTAMPTZ NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL CHECK (expires_at >= due_at),
+      plan JSONB NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS paper_execution_due_idx ON paper_execution_plans (due_at);
+    CREATE TABLE IF NOT EXISTS paper_execution_results (
+      order_id UUID PRIMARY KEY REFERENCES paper_execution_plans (order_id),
+      snapshot_id UUID NOT NULL REFERENCES paper_market_observations (snapshot_id),
+      cash_delta NUMERIC(38,18) NOT NULL,
+      settled_at TIMESTAMPTZ NOT NULL
+    );
+    DROP TRIGGER IF EXISTS paper_run_configs_append_only ON paper_run_configs;
+    CREATE TRIGGER paper_run_configs_append_only
+      BEFORE UPDATE OR DELETE ON paper_run_configs
+      FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+    DROP TRIGGER IF EXISTS paper_market_observations_append_only ON paper_market_observations;
+    CREATE TRIGGER paper_market_observations_append_only
+      BEFORE UPDATE OR DELETE ON paper_market_observations
+      FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+    DROP TRIGGER IF EXISTS paper_execution_plans_append_only ON paper_execution_plans;
+    CREATE TRIGGER paper_execution_plans_append_only
+      BEFORE UPDATE OR DELETE ON paper_execution_plans
+      FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+    DROP TRIGGER IF EXISTS paper_execution_results_append_only ON paper_execution_results;
+    CREATE TRIGGER paper_execution_results_append_only
+      BEFORE UPDATE OR DELETE ON paper_execution_results
+      FOR EACH ROW EXECUTE FUNCTION reject_mutation();
+  `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
+  'paper_run_configs',
+  'paper_market_observations',
+  'paper_execution_plans',
+  'paper_execution_results',
   'schema_migrations',
   'domain_events',
   'durable_jobs',

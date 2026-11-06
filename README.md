@@ -75,3 +75,60 @@ transaction signatures, and parsed public transactions solely for attribution
 and reconciliation. It receives no private key, signer, order, portfolio, or
 private intelligence payload. To stop new wallet intake without affecting NIT or
 market discovery, disable and stop only `@nit/app-wallet-worker`.
+
+## Standalone paper trader
+
+`@nit/app-paper-worker` runs bounded `create`, `tick`, `status`, and `rebuild`
+commands from the JSON file named by `NIT_PAPER_COMMAND_PATH`:
+
+```powershell
+$env:NIT_PAPER_COMMAND_PATH = 'path-to-private-paper-command.json'
+pnpm --filter @nit/app-paper-worker start
+```
+
+`create` accepts `strategy` (entry/exit/protection/risk definitions), `mode`
+(`historical` or `forward_paper`), `codeHash`, `codeCommitSha`, `periodStart`,
+`periodEnd`, `cashAsset`, and `initialCash`. The registry computes the immutable
+strategy hash and returns `runId` and `portfolioId`. Changing a registered
+policy's contents requires a new version. Every entry/exit combination has its
+own run and cash balance. Keep policy amounts and thresholds in private files.
+
+`tick` accepts `portfolioId`, `now`, a `PaperMarketSnapshot` as `market`, and an
+optional persisted `signalId`. It settles due orders, evaluates existing position
+protection, then evaluates an eligible entry. Use the exported `tickMatrix`
+method to distribute shared observations to multiple child portfolios. Both
+paper modes run this same engine with an injected clock. A future market or
+signal is rejected, and a portfolio's clock cannot move backwards.
+
+The implemented parents are E01 narrative-only, E02 wallet convergence, E03
+combined candidate evidence, and E04 all qualified signals. E01 requires an
+eligible NIT narrative with an exact mint; E03 requires a NIT candidate-update
+with `actionState=trade_eligible`, `narrativeConfirmed=true`, and
+`walletConfirmed=true`. Their upstream candidate resolver remains separate.
+The supported children are X01/X02 configurable profit targets, X03 trailing
+profit, X04 open-ended, and X07 time exit, all under P01 protection and R01 risk.
+Other policy IDs are rejected until their implementations exist.
+
+Orders are accepted into a durable plan and settled on a subsequent tick after
+the configured delay. Prices come from a constant-product reserve estimate for
+either the bonding curve or PumpSwap, with real reserve limits, token precision,
+cash fees, quote expiry, slippage and impact gates. Fill fractions and periodic
+transaction failures are explicit pinned simulation settings. Partial remainders
+are cancelled; failed attempts have no fabricated fill. Profitable reductions
+reserve the configured share of the original acquired quantity, and arm the
+post-profit stop only after an actual profitable fill. Protective or critical
+risk exits can sell the entire remainder.
+
+`status` accepts `portfolioId`. `rebuild` repairs mutable cash and position
+projections from immutable settlements and position-event snapshots. Restart
+recovery requires re-delivering ticks for outstanding plans; portfolio locks and
+unique settlements prevent double fills. Failed exits retain the position and
+can retry on a later market snapshot. The initial runtime permits one acquisition
+cycle per mint per portfolio; a new experiment/run starts a fresh cycle.
+
+This is a reserve-based simulator, not a live route adapter. It does not yet
+automatically ingest production liquidity observations, reproduce venue-specific
+fees/MEV, or run the forward experiment. An input adapter must supply timestamped
+reserves and verified tradability/risk facts; missing critical flags block work.
+No new external dependency, telemetry, or network provider is introduced. The
+worker uses the existing PostgreSQL connection and has no signing capability.

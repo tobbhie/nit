@@ -68,6 +68,7 @@
     { "path": "apps/ingestion-worker" },
     { "path": "apps/market-worker" },
     { "path": "apps/wallet-worker" },
+    { "path": "apps/paper-worker" },
     { "path": "apps/control-api" }
   ],
   "exclude": ["node_modules", "dist", "**/dist", "**/node_modules"]
