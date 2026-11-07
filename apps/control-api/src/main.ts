@@ -9,7 +9,10 @@ import { JobQueue } from '@nit/queue';
  * state only through the durable queue.
  */
 async function main(): Promise<void> {
-  const { config, db } = await bootstrap(process.env['NIT_CONFIG_PATH']);
+  const { config, db } = await bootstrap(process.env['NIT_CONFIG_PATH'], {
+    bindDevelopmentToyProviders: false,
+    requiredProviderSlots: [],
+  });
 
   const logger = new Logger({
     service: 'control-api',
@@ -77,7 +80,7 @@ async function main(): Promise<void> {
   });
 
   const port = Number(process.env['PORT'] ?? 3000);
-  server.listen(port, () => {
+  server.listen(port, process.env['NIT_CONTROL_HOST'] ?? '127.0.0.1', () => {
     logger.info('Control API started', { port });
   });
 

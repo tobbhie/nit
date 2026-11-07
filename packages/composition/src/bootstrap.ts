@@ -61,15 +61,13 @@ export async function bootstrap(
     throw verifyResult.error;
   }
   const missing = verifyResult.value;
-  if (missing.length > 0) {
-    logger.info('Running migrations', { missingTables: missing });
-    const migrateResult = await migrator.migrate();
-    if (migrateResult.kind === 'failure') {
-      logger.error('Migration failed', { error: migrateResult.error.message });
-      throw migrateResult.error;
-    }
-    logger.info('Migrations applied', { applied: migrateResult.value });
+  logger.info('Checking pending migrations', { missingTables: missing });
+  const migrateResult = await migrator.migrate();
+  if (migrateResult.kind === 'failure') {
+    logger.error('Migration failed', { error: migrateResult.error.message });
+    throw migrateResult.error;
   }
+  logger.info('Migrations applied', { applied: migrateResult.value });
 
   const registry = new ProviderRegistry();
   if (options.bindDevelopmentToyProviders !== false) bindToyProviders(registry);

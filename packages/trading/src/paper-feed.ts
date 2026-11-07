@@ -5,6 +5,8 @@ import { paperRows } from './paper-store';
 
 export interface PaperExecutionFacts {
   readonly schemaVersion: 1;
+  /** Chain-state time, when capture time differs from the underlying account slot. */
+  readonly occurredAt?: string;
   readonly marketAddress: string;
   readonly cashAsset: string;
   readonly tokenReserves: string;
@@ -58,9 +60,10 @@ export class PostgresPaperMarketFeed implements PaperMarketFeed {
         recorded_at: Date;
         raw_payload: Record<string, unknown>;
         market_address: string | null;
+        market_active_from: Date;
       }>(
         this.db,
-        `SELECT s.snapshot_id,s.venue,s.observed_at,s.recorded_at,s.raw_payload,v.market_address
+        `SELECT s.snapshot_id,s.venue,s.observed_at,s.recorded_at,s.raw_payload,v.market_address,v.active_from AS market_active_from
         FROM market_snapshots s JOIN tokens t ON t.token_id=s.token_id
         JOIN token_markets v ON v.token_id=t.token_id AND v.venue=s.venue
         WHERE t.chain='solana' AND t.address=$1 AND s.source=ANY($2::text[])
@@ -84,6 +87,12 @@ export class PostgresPaperMarketFeed implements PaperMarketFeed {
       if (facts['schemaVersion'] !== 1 || facts['cashAsset'] !== cashAsset) {
         return failure(new Error('Unsupported paper execution schema or cash asset'));
       }
+      const occurredAt =
+        facts['occurredAt'] === undefined
+          ? row.observed_at
+          : new Date(requiredText(facts['occurredAt']));
+      if (occurredAt > row.observed_at || occurredAt < row.market_active_from)
+        return failure(new Error('Execution state time is outside the captured market interval'));
       const snapshot: PaperMarketSnapshot = {
         snapshotId: row.snapshot_id,
         tokenMint,
@@ -99,7 +108,7 @@ export class PostgresPaperMarketFeed implements PaperMarketFeed {
         tradable: requiredBoolean(facts['tradable']),
         sellable: requiredBoolean(facts['sellable']),
         criticalRisk: requiredBoolean(facts['criticalRisk']),
-        occurredAt: row.observed_at,
+        occurredAt,
         observedAt: row.recorded_at,
         availableAt: row.recorded_at,
       };

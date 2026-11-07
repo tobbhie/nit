@@ -2,6 +2,7 @@ import { bootstrap } from '@nit/composition';
 import { QueueName, createVersion } from '@nit/domain';
 import { HealthReporter, Logger } from '@nit/observability';
 import { JobQueue, Worker, JobHandler, Job } from '@nit/queue';
+import { runXCapture } from './x-capture';
 import {
   NarrativeScorer,
   NarrativeTokenMatcher,
@@ -20,6 +21,8 @@ interface IngestionPayload {
  * through durable state — it never synchronously waits on it.
  */
 async function main(): Promise<void> {
+  const xPath = process.env['NIT_X_CAPTURE_CONFIG_PATH'];
+  if (xPath !== undefined) return runXCapture(xPath);
   const { config, db, registry } = await bootstrap(process.env['NIT_CONFIG_PATH']);
 
   const logger = new Logger({
@@ -56,13 +59,11 @@ async function main(): Promise<void> {
       const universe = await watchlist.getWatchlist();
       const matchResult = await matcher.match(input, universe);
 
-      logger
-        .child({ aggregateIds: [input.narrativeId] })
-        .info('Narrative processed', {
-          candidateCount: scored.length,
-          matchCount: matchResult.matches.length,
-          scorerVersion: scored[0]?.version.schemaVersion,
-        });
+      logger.child({ aggregateIds: [input.narrativeId] }).info('Narrative processed', {
+        candidateCount: scored.length,
+        matchCount: matchResult.matches.length,
+        scorerVersion: scored[0]?.version.schemaVersion,
+      });
     },
   };
 

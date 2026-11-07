@@ -15,3 +15,4 @@ export * from './unit-of-work';
 export * from './service';
 export * from './synthetic-source';
 export * from './poll-handler';
+export * from './x-source';

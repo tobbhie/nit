@@ -8,6 +8,7 @@
   "exclude": ["node_modules", "dist", "**/*.test.ts"],
   "references": [
     { "path": "../../packages/domain" },
+    { "path": "../../packages/observation" },
     { "path": "../../packages/composition" },
     { "path": "../../packages/observability" },
     { "path": "../../packages/provider-interfaces" },

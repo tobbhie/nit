@@ -163,8 +163,11 @@ a strategy decision exists, or when the opportunity expires.
 `status` returns portfolio data, up to 100 recent feed issues, and a waiting-signal
 count. `paper_feed_health` and `paper_signal_dispatch` are durable operational
 projections. This integration adds only database reads/writes; it sends no data
-to another network provider. A real market-data producer must still supply the
-execution-fact contract before unattended forward paper trading is usable.
+to another network provider. The opt-in market worker can now publish the
+execution-fact contract from Solana account reads as `solana-account-facts:v1`.
+It supports a limited set of legacy layouts and rejects unsupported token/pool
+modes. Configure and validate live coverage before unattended use. See
+[forward-paper operations](deploy/README.md) for network exposure, limits and startup.
 
 ## Candidate resolver and Telegram console
 

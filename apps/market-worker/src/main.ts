@@ -1,3 +1,5 @@
+import { readFile, stat } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { bootstrap } from '@nit/composition';
 import {
   ConfigurationError,
@@ -10,6 +12,10 @@ import {
 } from '@nit/domain';
 import {
   ConfirmedIngestionSummary,
+  ExecutionFactsConfigSchema,
+  ExecutionFactsRefresher,
+  SolanaExecutionFactsSource,
+  executionFactsRpc,
   MarketDiscoveryService,
   PostgresSolanaMarketOccurrenceRepository,
   PostgresSolanaReconciliationCursorRepository,
@@ -38,6 +44,34 @@ async function main(): Promise<void> {
     throw new ConfigurationError('Solana market intake is disabled');
   }
   const marketConfig = config.solanaMarket;
+  const factsPath = process.env['NIT_EXECUTION_FACTS_CONFIG_PATH'];
+  let refresher: ExecutionFactsRefresher | undefined;
+  let factsIntervalMs = 1000;
+  if (factsPath !== undefined) {
+    if ((await stat(factsPath)).size > 65536)
+      throw new ConfigurationError('Execution facts config exceeds 64 KiB');
+    const factsConfig = ExecutionFactsConfigSchema.parse(
+      JSON.parse(await readFile(factsPath, 'utf8')) as unknown
+    );
+    if (
+      factsConfig.pumpProgram !== marketConfig.pumpFunProgramAddress ||
+      factsConfig.swapProgram !== marketConfig.pumpSwapProgramAddress
+    )
+      throw new ConfigurationError('Execution facts programs must match discovery');
+    refresher = new ExecutionFactsRefresher(
+      db,
+      new SolanaExecutionFactsSource(
+        executionFactsRpc(
+          marketConfig.httpEndpoint,
+          marketConfig.requestTimeoutMs,
+          marketConfig.minRequestIntervalMs
+        ),
+        factsConfig
+      ),
+      factsConfig
+    );
+    factsIntervalMs = factsConfig.intervalMs;
+  }
   const logger = new Logger({ service: 'market-worker', level: config.logLevel });
   const queue = new JobQueue(db, {
     leaseTimeoutMs: config.queue.leaseTimeoutMs,
@@ -124,15 +158,16 @@ async function main(): Promise<void> {
   }, 30_000);
 
   let shuttingDown = false;
+  const abort = new AbortController();
   const shutdown = (): void => {
     if (shuttingDown) return;
     shuttingDown = true;
+    abort.abort();
     logger.info('Shutdown requested');
     clearInterval(healthTimer);
     scheduler.stop();
     for (const subscriber of subscribers) subscriber.stop();
     worker.stop();
-    void db.close();
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
@@ -143,7 +178,29 @@ async function main(): Promise<void> {
     reconciliationSources: [...programBySource.keys()],
     websocketConnections: subscribers.length,
   });
-  await worker.run();
+  const refresh = async (): Promise<void> => {
+    if (refresher === undefined) return;
+    while (!abort.signal.aborted) {
+      try {
+        logger.info('Execution facts refresh', { ...(await refresher.cycle()) });
+      } catch {
+        logger.error('Execution facts cycle failed');
+      }
+      try {
+        await delay(factsIntervalMs, undefined, { signal: abort.signal });
+      } catch {
+        break;
+      }
+    }
+  };
+  const workloads = [worker.run(), refresh()];
+  try {
+    await Promise.all(workloads);
+  } finally {
+    shutdown();
+    await Promise.allSettled(workloads);
+    await db.close();
+  }
 }
 
 function compositeIngestor(ingestors: readonly Ingestor[]): Ingestor {

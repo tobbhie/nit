@@ -236,6 +236,32 @@ describe.skipIf(!hasTestDatabase())('continuous paper dispatch and approved mark
     expect(() => new PostgresPaperMarketFeed(harness.db, ['synthetic-market'])).toThrow();
   });
 
+  it('preserves chain-state age and rejects source time after capture or before venue activation', async () => {
+    const feed = new PostgresPaperMarketFeed(harness.db, ['approved-rpc']);
+    now = new Date(PAPER_START.getTime() + 60_000);
+    const facts = {
+      ...fixtureMarket(now),
+      schemaVersion: 1,
+      marketAddress: '33333333333333333333333333333333',
+    };
+    await publish(PAPER_TOKEN, {
+      paperExecution: { ...facts, occurredAt: PAPER_START.toISOString() },
+    });
+    const stale = await feed.latest(PAPER_TOKEN, 'SOL', now);
+    expect(stale.kind).toBe('success');
+    if (stale.kind === 'success') expect(stale.value.occurredAt).toEqual(PAPER_START);
+    now = new Date(now.getTime() + 1000);
+    await publish(PAPER_TOKEN, {
+      paperExecution: { ...facts, occurredAt: new Date(now.getTime() + 1).toISOString() },
+    });
+    expect((await feed.latest(PAPER_TOKEN, 'SOL', now)).kind).toBe('failure');
+    now = new Date(now.getTime() + 1000);
+    await publish(PAPER_TOKEN, {
+      paperExecution: { ...facts, occurredAt: new Date(PAPER_START.getTime() - 1).toISOString() },
+    });
+    expect((await feed.latest(PAPER_TOKEN, 'SOL', now)).kind).toBe('failure');
+  });
+
   it('uses availability time and the current venue instead of historical launch liquidity', async () => {
     await publish();
     const feed = new PostgresPaperMarketFeed(harness.db, ['approved-rpc']);

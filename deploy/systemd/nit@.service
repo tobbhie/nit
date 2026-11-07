@@ -1,0 +1,37 @@
+[Unit]
+Description=NIT %i (forward paper)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=nit
+Group=nit
+WorkingDirectory=/opt/nit/current
+EnvironmentFile=/etc/nit/runtime.env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node --max-old-space-size=128 /opt/nit/current/apps/%i/dist/main.js
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+KillSignal=SIGTERM
+MemoryHigh=192M
+MemoryMax=256M
+CPUQuota=70%
+TasksMax=64
+LimitNOFILE=4096
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/nit
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nit-%i
+
+[Install]
+WantedBy=multi-user.target

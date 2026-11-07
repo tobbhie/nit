@@ -32,3 +32,6 @@ export * from './solana-rpc';
 export * from './pump-events';
 export * from './confirmed-ingestion';
 export * from './reconciliation-scheduler';
+export * from './execution-facts';
+export * from './execution-refresh';
+export * from './facts-rpc';

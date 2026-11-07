@@ -116,6 +116,9 @@ importers:
       '@nit/observability':
         specifier: workspace:*
         version: link:../../packages/observability
+      '@nit/observation':
+        specifier: workspace:*
+        version: link:../../packages/observation
       '@nit/provider-interfaces':
         specifier: workspace:*
         version: link:../../packages/provider-interfaces

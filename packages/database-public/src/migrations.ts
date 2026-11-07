@@ -1737,13 +1737,18 @@ export class Migrator {
     // Bootstrap the tracking table once, before the loop. Every later
     // migration reads and writes schema_migrations, so it must exist first;
     // re-running this DDL per iteration would be wasted work.
-    const bootstrap = await this.db.query(BOOTSTRAP_MIGRATION.up);
+    const bootstrap = await this.db.transaction(async (client) => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext(current_schema()), 724901)');
+      await client.query(BOOTSTRAP_MIGRATION.up);
+    });
     if (bootstrap.kind === 'failure') {
       return failure(bootstrap.error);
     }
 
     for (const migration of MIGRATIONS) {
       const outcome = await this.db.transaction(async (client) => {
+        // Serialize migration checks across workers sharing this database/schema.
+        await client.query('SELECT pg_advisory_xact_lock(hashtext(current_schema()), 724901)');
         const existing = await client.query('SELECT id FROM schema_migrations WHERE id = $1', [
           migration.id,
         ]);
