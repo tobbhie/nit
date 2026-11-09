@@ -158,6 +158,22 @@ importers:
         specifier: ^1.0.0
         version: 1.6.1(@types/node@20.19.43)
 
+  apps/narrative-worker:
+    dependencies:
+      '@nit/composition':
+        specifier: workspace:*
+        version: link:../../packages/composition
+      '@nit/narrative-intelligence':
+        specifier: workspace:*
+        version: link:../../packages/narrative-intelligence
+    devDependencies:
+      typescript:
+        specifier: ^5.3.0
+        version: 5.9.3
+      vitest:
+        specifier: ^1.0.0
+        version: 1.6.1(@types/node@20.19.43)
+
   apps/paper-worker:
     dependencies:
       '@nit/composition':
@@ -420,6 +436,34 @@ importers:
       '@types/ws':
         specifier: ^8.18.2
         version: 8.18.2
+      typescript:
+        specifier: ^5.3.0
+        version: 5.9.3
+      vitest:
+        specifier: ^1.0.0
+        version: 1.6.1(@types/node@20.19.43)
+
+  packages/narrative-intelligence:
+    dependencies:
+      '@nit/database-public':
+        specifier: workspace:*
+        version: link:../database-public
+      '@nit/domain':
+        specifier: workspace:*
+        version: link:../domain
+      '@nit/signals':
+        specifier: workspace:*
+        version: link:../signals
+      zod:
+        specifier: ^3.22.4
+        version: 3.25.76
+    devDependencies:
+      '@nit/decision-console':
+        specifier: workspace:*
+        version: link:../decision-console
+      '@nit/trading':
+        specifier: workspace:*
+        version: link:../trading
       typescript:
         specifier: ^5.3.0
         version: 5.9.3

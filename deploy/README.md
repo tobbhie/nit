@@ -37,12 +37,16 @@ Enable these instances individually after their configuration is verified:
 - `nit@console-worker`: NIT-only bot, allowlisted users/chats/portfolios, webhook
   disabled. Keep a single poller per bot.
 - `nit@agent-worker`: optional, explicit serve command and observation-only grant.
+- `nit@narrative-worker`: automated text interpretation and deterministic scoring.
+  Supply a private policy, two database pool slots and (for semantic interpretation)
+  a real interpreter gateway grant. See [producer coverage and protocol](../packages/narrative-intelligence/README.md).
 
 `nit@ingestion-worker` uses real X capture when `NIT_X_CAPTURE_CONFIG_PATH` and
 `NIT_X_BEARER_TOKEN` are set. Without that explicit path it retains its development
 toy job handler, which production guards reject. Captured research interpretations
-may be published through the research worker while automated interpretation is
-unfinished. A healthy control API is only
+can also be published through the research worker. Automated production currently
+covers a bounded text path; broader semantic/media understanding remains unfinished.
+A healthy control API is only
 database/process health, not proof the trading pipeline has complete coverage.
 
 The template bounds each process to 256 MB, caps heap size and restarts failures.

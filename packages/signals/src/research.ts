@@ -37,6 +37,11 @@ export const ResearchRecordSchema = z.discriminatedUnion('kind', [
       text: z.string().max(16000),
       sourceUrl: z.string().url().max(2048),
       derivativeOf: uuid.nullable(),
+      independenceEligible: z.boolean().optional(),
+      normalizedContentHash: z
+        .string()
+        .regex(/^[a-f0-9]{64}$/)
+        .optional(),
       media: z
         .array(z.object({ hash: z.string().regex(/^[a-f0-9]{64}$/), storageReference: text }))
         .max(16),
@@ -47,7 +52,9 @@ export const ResearchRecordSchema = z.discriminatedUnion('kind', [
     kind: z.literal('episode'),
     data: z.object({
       narrativeId: text,
-      tokenMints: z.array(mint).min(1).max(32),
+      tokenMints: z.array(mint).max(32),
+      /** Live attention episodes may precede token discovery. Each later interpretation pins its own known candidates. */
+      universeMode: z.literal('open').optional(),
       episodeType: z.enum(['launch', 'viral_burst', 'promotion', 'revival', 'cto']),
       previousEpisodeId: uuid.nullable(),
       originArtifactIds: z.array(uuid).min(1).max(32),
@@ -76,7 +83,6 @@ export const ResearchRecordSchema = z.discriminatedUnion('kind', [
             reasonCodes: z.array(text).min(1).max(16),
           })
         )
-        .min(1)
         .max(32),
     }),
   }),
@@ -139,12 +145,24 @@ export function parseResearchRecord(value: unknown): ResearchRecord {
   )
     throw new Error('A revival must reference its earlier episode');
   if (
+    parsed.kind === 'episode' &&
+    parsed.data.universeMode !== 'open' &&
+    parsed.data.tokenMints.length === 0
+  )
+    throw new Error('A captured episode requires an explicit token universe');
+  if (
     parsed.kind === 'interpretation' &&
     new Set(parsed.data.candidates.map((c) => c.tokenMint)).size !== parsed.data.candidates.length
   )
     throw new Error('Duplicate interpretation mint');
   if (parsed.kind === 'artifact' && contentHash(parsed.data.text) !== parsed.data.contentHash)
     throw new Error('Artifact text hash mismatch');
+  if (
+    parsed.kind === 'artifact' &&
+    parsed.data.normalizedContentHash !== undefined &&
+    parsed.data.normalizedContentHash !== contentHash(normalizedSourceText(parsed.data.text))
+  )
+    throw new Error('Artifact normalized text hash mismatch');
   return parsed;
 }
 /** Stable JSON hashing includes every transform/configuration field, including intercepts. */
@@ -162,6 +180,14 @@ export function canonicalEvidence(value: unknown): string {
 }
 export function contentHash(text: string): string {
   return createHash('sha256').update(text).digest('hex');
+}
+export function normalizedSourceText(value: string): string {
+  return value
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
 }
 export function evidenceHash(value: unknown): string {
   return contentHash(canonicalEvidence(value));

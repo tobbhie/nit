@@ -71,10 +71,10 @@ describe.skipIf(!hasTestDatabase())('Observation ingestion against Postgres', ()
   });
 
   beforeEach(async () => {
-    // media before observations: the FK points that way, and both are listed so
+    // Include dependent interpretation ledgers and media so
     // TRUNCATE does not need CASCADE.
     const truncated = await harness.db.query(
-      `TRUNCATE media, observations, domain_events,
+      `TRUNCATE nit_text_results, nit_text_attempts, media, observations, domain_events,
                 durable_jobs, dead_letter_jobs, job_history RESTART IDENTITY`
     );
     expect(truncated.kind).toBe('success');
@@ -294,7 +294,11 @@ describe.skipIf(!hasTestDatabase())('Observation ingestion against Postgres', ()
   describe('ObservationCreated is emitted', () => {
     it('appends exactly one event describing the stored observation', async () => {
       const observationId = await ingest(
-        post({ providerPostId: 'announced', text: 'gm', publishedAt: new Date('2026-08-19T09:59:00.000Z') })
+        post({
+          providerPostId: 'announced',
+          text: 'gm',
+          publishedAt: new Date('2026-08-19T09:59:00.000Z'),
+        })
       );
 
       const appended = await events.getByAggregateId(observationId);
@@ -413,7 +417,9 @@ describe.skipIf(!hasTestDatabase())('Observation ingestion against Postgres', ()
       });
     });
 
-    const enqueuePoll = async (payloadVersion = OBSERVATION_POLL_PAYLOAD_VERSION): Promise<void> => {
+    const enqueuePoll = async (
+      payloadVersion = OBSERVATION_POLL_PAYLOAD_VERSION
+    ): Promise<void> => {
       const enqueued = await queue.enqueue<ObservationPollPayload>({
         queueName: QueueName.OBSERVATION_POLL,
         payload: { provider: ObservationProvider.X, authorId: AUTHOR },
@@ -539,9 +545,10 @@ describe.skipIf(!hasTestDatabase())('Observation ingestion against Postgres', ()
     it('rejects a delete', async () => {
       await ingest(post({ providerPostId: 'permanent', text: 'gm' }));
 
-      const deleted = await harness.db.query('DELETE FROM observations WHERE provider_post_id = $1', [
-        'permanent',
-      ]);
+      const deleted = await harness.db.query(
+        'DELETE FROM observations WHERE provider_post_id = $1',
+        ['permanent']
+      );
 
       expect(deleted.kind).toBe('failure');
       expect(await countOf('observations')).toBe(1);
@@ -567,8 +574,7 @@ describe.skipIf(!hasTestDatabase())('Observation ingestion against Postgres', ()
     it('returns an author newest first, with a deterministic tie-break', async () => {
       // The poll handler takes its cursor from the first row, so this ordering is
       // load-bearing rather than cosmetic — and the in-memory double mirrors it.
-      const at = (seconds: number): Timestamp =>
-        new Date(`2026-08-19T10:00:0${seconds}.000Z`);
+      const at = (seconds: number): Timestamp => new Date(`2026-08-19T10:00:0${seconds}.000Z`);
       for (const [providerPostId, seconds] of [
         ['a-oldest', 0],
         ['b-tied', 1],

@@ -1651,9 +1651,49 @@ export const MIGRATIONS: readonly Migration[] = [
       END; $$;
     `,
   },
+  {
+    id: '0025_live_text_narratives',
+    description:
+      'Bounded text interpretation attempts, pinned policies and auditable live narrative reports',
+    up: `
+      CREATE TABLE IF NOT EXISTS nit_text_policies(policy_hash TEXT PRIMARY KEY,configuration JSONB NOT NULL,created_at TIMESTAMPTZ NOT NULL);
+      CREATE TABLE IF NOT EXISTS nit_text_attempts(attempt_id UUID PRIMARY KEY,observation_id UUID NOT NULL REFERENCES observations(observation_id),
+        policy_hash TEXT NOT NULL REFERENCES nit_text_policies(policy_hash),interpreter_hash TEXT NOT NULL,
+        runtime_policy_hash TEXT NOT NULL REFERENCES nit_text_policies(policy_hash),input_hash TEXT NOT NULL,
+        started_at TIMESTAMPTZ NOT NULL,deadline_at TIMESTAMPTZ NOT NULL,reserved_cost_micros BIGINT NOT NULL CHECK(reserved_cost_micros>=0),
+        UNIQUE(observation_id,policy_hash),CHECK(started_at<deadline_at));
+      CREATE TABLE IF NOT EXISTS nit_text_results(attempt_id UUID PRIMARY KEY REFERENCES nit_text_attempts(attempt_id),
+        status TEXT NOT NULL CHECK(status IN ('captured','unavailable','invalid','unknown')),payload JSONB,available_at TIMESTAMPTZ NOT NULL);
+      CREATE TABLE IF NOT EXISTS nit_text_budgets(day DATE PRIMARY KEY,requests BIGINT NOT NULL CHECK(requests>=0),
+        reserved_cost_micros BIGINT NOT NULL CHECK(reserved_cost_micros>=0));
+      CREATE TABLE IF NOT EXISTS nit_text_health(runtime_key TEXT PRIMARY KEY,policy_hash TEXT NOT NULL REFERENCES nit_text_policies(policy_hash),
+        checked_at TIMESTAMPTZ NOT NULL,expires_at TIMESTAMPTZ NOT NULL,incomplete BOOLEAN NOT NULL,CHECK(checked_at<expires_at));
+      CREATE TABLE IF NOT EXISTS nit_token_search_index(token_id UUID PRIMARY KEY,original_name TEXT NOT NULL,original_ticker TEXT NOT NULL,
+        name_normalized TEXT NOT NULL,ticker_normalized TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS nit_token_search_ticker_idx ON nit_token_search_index(ticker_normalized);
+      CREATE TABLE IF NOT EXISTS nit_narrative_reports(report_id UUID PRIMARY KEY,episode_id UUID NOT NULL REFERENCES research_records(record_id),
+        policy_hash TEXT NOT NULL REFERENCES nit_text_policies(policy_hash),input_hash TEXT NOT NULL,state TEXT NOT NULL,
+        report JSONB NOT NULL,available_at TIMESTAMPTZ NOT NULL,UNIQUE(episode_id,policy_hash,input_hash));
+      CREATE INDEX IF NOT EXISTS nit_text_attempts_policy_idx ON nit_text_attempts(policy_hash,started_at);
+      CREATE INDEX IF NOT EXISTS nit_narrative_reports_episode_idx ON nit_narrative_reports(episode_id,available_at DESC);
+      DO $$ DECLARE table_name TEXT; BEGIN
+        FOREACH table_name IN ARRAY ARRAY['nit_text_policies','nit_text_attempts','nit_text_results','nit_narrative_reports'] LOOP
+          EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I',table_name||'_append_only',table_name);
+          EXECUTE format('CREATE TRIGGER %I BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION reject_mutation()',table_name||'_append_only',table_name);
+        END LOOP;
+      END; $$;
+    `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
+  'nit_text_policies',
+  'nit_text_attempts',
+  'nit_text_results',
+  'nit_text_budgets',
+  'nit_text_health',
+  'nit_token_search_index',
+  'nit_narrative_reports',
   'agent_task_cancellations',
   'agent_guides',
   'agent_tasks',

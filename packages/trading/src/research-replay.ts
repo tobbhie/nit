@@ -21,6 +21,7 @@ import { ExecutionMode, OrderSide } from './runtime';
 import { StrategySnapshot, createStrategySnapshot } from './strategy';
 import { paperPolicy } from './paper-policy';
 import { units, amount, UNIT } from './fixed';
+import { marketDiscoveryEvidence } from './market-discovery-evidence';
 
 type Variant = 'A' | 'B' | 'C' | 'W';
 function signedAmount(value: bigint): string {
@@ -57,6 +58,7 @@ export interface ResearchReplayEvent {
 }
 export interface ResearchDataset {
   readonly featureHashes?: Readonly<Record<string, string>>;
+  readonly discoveryHashes?: Readonly<Record<string, string>>;
   readonly schemaVersion: 1;
   readonly periodStart: string;
   readonly decisionEnd: string;
@@ -72,6 +74,8 @@ export interface ResearchDataset {
   readonly universe: readonly {
     scenarioId: string;
     episodeId: string;
+    /** Required for a live open-universe episode: immutable membership evidence known at discovery. */
+    membershipFeatureSnapshotId?: string;
     tokenMint: string;
     discoveredAt: string;
     outcomeClass: 'live' | 'dead' | 'failed' | 'illiquid' | 'ungraduated';
@@ -153,6 +157,7 @@ export class PostgresResearchReplay {
       time(item.discoveredAt);
     }
     const featureHashes: Record<string, string> = {};
+    const discoveryHashes: Record<string, string> = {};
     for (const event of raw.events) {
       const scenario = raw.universe.find(
         (s) => s.scenarioId === event.scenarioId && s.tokenMint === event.tokenMint
@@ -169,8 +174,36 @@ export class PostgresResearchReplay {
         scenario.episodeId,
         new Date(scenario.discoveredAt)
       );
-      if (episode?.kind !== 'episode' || !episode.data.tokenMints.includes(event.tokenMint))
-        throw new Error('Ex-ante episode identity is unavailable');
+      if (episode?.kind !== 'episode') throw new Error('Ex-ante episode identity is unavailable');
+      if (!episode.data.tokenMints.includes(event.tokenMint)) {
+        if (episode.data.universeMode === 'open' && raw.discovery === 'market_census') {
+          // The market baseline must not require prior NIT selection. Pin independent
+          // canonical discovery instead of conditioning its universe on a narrative feature.
+          const discovery = await marketDiscoveryEvidence(
+            this.db,
+            event.tokenMint,
+            new Date(scenario.discoveredAt)
+          );
+          if (discovery === null) throw new Error('Ex-ante market census discovery is unavailable');
+          discoveryHashes[scenario.scenarioId] = discovery.hash;
+        } else {
+          const membership =
+            scenario.membershipFeatureSnapshotId === undefined
+              ? null
+              : await new PostgresResearchStore(this.db).at(
+                  scenario.membershipFeatureSnapshotId,
+                  new Date(scenario.discoveredAt)
+                );
+          if (
+            episode.data.universeMode !== 'open' ||
+            membership?.kind !== 'feature' ||
+            membership.data.episodeId !== episode.recordId ||
+            membership.data.tokenMint !== event.tokenMint
+          )
+            throw new Error('Ex-ante live episode membership is unavailable');
+          featureHashes[membership.recordId] = evidenceHash(membership);
+        }
+      }
       if (!['opportunity', 'market'].includes(event.kind) || !event.id.trim())
         throw new Error('Invalid replay event');
       for (const n of Object.values(event.latencyMs))
@@ -228,6 +261,7 @@ export class PostgresResearchReplay {
     const manifest = {
       ...raw,
       featureHashes,
+      discoveryHashes,
       universe: [...raw.universe].sort((a, b) =>
         a.scenarioId < b.scenarioId ? -1 : a.scenarioId > b.scenarioId ? 1 : 0
       ),

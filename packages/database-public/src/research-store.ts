@@ -58,9 +58,20 @@ export class PostgresResearchStore {
           record.data.artifactIds.forEach((id) => get(id, 'artifact'));
           if (
             episode.kind !== 'episode' ||
-            record.data.candidates.some((c) => !episode.data.tokenMints.includes(c.tokenMint))
+            (episode.data.universeMode !== 'open' &&
+              record.data.candidates.some((c) => !episode.data.tokenMints.includes(c.tokenMint)))
           )
             throw new Error('Interpretation introduces a mint outside its episode');
+          if (episode.data.universeMode === 'open') {
+            const mints = [...new Set(record.data.candidates.map((c) => c.tokenMint))];
+            const known = await rows<{ address: string }>(
+              db,
+              "SELECT address FROM tokens WHERE chain='solana' AND address=ANY($1::text[]) AND discovered_at<=$2",
+              [mints, record.availableAt]
+            );
+            if (known.length !== mints.length)
+              throw new Error('Live interpretation introduces an unknown or future token');
+          }
         }
         if (record.kind === 'feature') {
           const episode = get(record.data.episodeId, 'episode');
@@ -163,7 +174,9 @@ export class PostgresResearchStore {
     for (const id of [...new Set(ids)].sort()) {
       let artifact = await this.at(id, asOf);
       if (artifact?.kind !== 'artifact') throw new Error('Expected available source artifact');
+      if (artifact.data.independenceEligible === false) continue;
       const hash = artifact.data.contentHash;
+      const normalizedHash = artifact.data.normalizedContentHash;
       for (let depth = 0; artifact.data.derivativeOf !== null; depth++) {
         if (depth >= 64) throw new Error('Artifact lineage exceeds depth bound');
         const ancestor = await this.at(artifact.data.derivativeOf, asOf);
@@ -177,6 +190,7 @@ export class PostgresResearchStore {
         `content:${hash}`,
         `content:${artifact.data.contentHash}`,
         `source:${artifact.data.provider}:${artifact.data.sourceId}`,
+        ...(normalizedHash === undefined ? [] : [`normalized:${normalizedHash}`]),
       ]);
       for (let i = groups.length - 1; i >= 0; i--) {
         const other = groups[i]!;

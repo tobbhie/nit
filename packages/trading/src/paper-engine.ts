@@ -18,6 +18,7 @@ import { PaperPolicy, paperPolicy } from './paper-policy';
 import { paperRows } from './paper-store';
 import { Clock, OrderSide } from './runtime';
 import { StrategySnapshot } from './strategy';
+import { MarketDiscoveryEvidence, marketDiscoveryEvidence } from './market-discovery-evidence';
 
 interface PortfolioRow {
   portfolio_id: string;
@@ -482,10 +483,32 @@ async function resolverRejection(
     `SELECT 1 FROM candidate_scenarios c JOIN candidate_resolution_reports r
     ON r.resolution_id::text=$2 WHERE c.narrative_id=$1 AND c.expires_at>$3
       AND c.report->>'materialHash'=r.report->>'materialHash'
-      AND c.report->>'policyHash'=r.report->>'policyHash' FOR SHARE OF c`,
+      AND c.report->>'policyHash'=r.report->>'policyHash'
+      AND c.report->>'sourceSignalId'=(SELECT s.signal_id::text FROM signals s
+        WHERE s.source='nit' AND s.kind='narrative' AND s.canonical_narrative_id=c.narrative_id
+          AND s.source_version NOT LIKE 'resolver:%' AND s.available_at<=$3
+        ORDER BY s.available_at DESC,s.signal_id DESC LIMIT 1) FOR SHARE OF c`,
     [signal.canonicalNarrativeId, asObject(signal.payload)['resolutionId'], now]
   );
-  return rows.length === 1 ? null : 'CANDIDATE_STATE_CHANGED';
+  if (rows.length !== 1) return 'CANDIDATE_STATE_CHANGED';
+  const featureId = asObject(signal.payload)['featureSnapshotId'];
+  if (typeof featureId !== 'string') return null;
+  const producer = await paperRows<{ version: string }>(
+    db,
+    `SELECT i.payload->'data'->>'extractorVersion' AS version
+    FROM research_records f JOIN research_records i ON i.record_id=(f.payload->'data'->>'interpretationId')::uuid
+    WHERE f.record_id=$1 AND f.kind='feature' AND i.kind='interpretation' AND f.available_at<=$2 AND i.available_at<=$2`,
+    [featureId, now]
+  );
+  const version = producer[0]?.version;
+  if (version === undefined || !version.startsWith('live-text-v1:')) return null;
+  const healthy = await paperRows(
+    db,
+    `SELECT 1 FROM nit_text_health WHERE runtime_key='live-text-v1'
+    AND policy_hash=$1 AND checked_at<=$2 AND expires_at>$2 AND NOT incomplete`,
+    [version.slice('live-text-v1:'.length), now]
+  );
+  return healthy.length === 1 ? null : 'NARRATIVE_PRODUCER_UNAVAILABLE';
 }
 
 function entryRejection(
@@ -659,15 +682,28 @@ async function recordDecision(
       typeof payload['featureSnapshotId'] === 'string' ? payload['featureSnapshotId'] : null;
     const episodeId = typeof payload['episodeId'] === 'string' ? payload['episodeId'] : null;
     let feature: unknown = null;
+    let marketDiscovery: MarketDiscoveryEvidence | null = null;
     if (episodeId !== null) {
-      const episodes = await paperRows<{ payload: { data: { tokenMints: string[] } } }>(
+      const episodes = await paperRows<{
+        payload: { data: { tokenMints: string[]; universeMode?: 'open' } };
+      }>(
         db,
         "SELECT payload FROM research_records WHERE record_id=$1 AND kind='episode' AND available_at<=$2",
         [episodeId, now]
       );
       if (
+        episodes[0]?.payload.data.universeMode === 'open' &&
+        featureId === null &&
+        (type === 'abstain' || ['E00', 'E02'].includes(portfolio.strategy_snapshot.entry.policyId))
+      )
+        marketDiscovery = await marketDiscoveryEvidence(db, signal.tokenMint ?? '', now);
+      if (
         episodes[0] === undefined ||
-        !episodes[0].payload.data.tokenMints.includes(signal.tokenMint ?? '')
+        !(
+          episodes[0].payload.data.tokenMints.includes(signal.tokenMint ?? '') ||
+          (episodes[0].payload.data.universeMode === 'open' &&
+            (featureId !== null || marketDiscovery !== null))
+        )
       )
         throw new ValidationError('Decision episode is unavailable or wrong mint');
     }
@@ -715,6 +751,7 @@ async function recordDecision(
       availableAt: signal.availableAt.toISOString(),
       payload: signal.payload,
       feature,
+      marketDiscovery,
       policyHash: portfolio.config_hash,
     };
     await paperRows(

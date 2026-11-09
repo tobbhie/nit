@@ -33,6 +33,7 @@ export default defineConfig({
       '@nit/database-public': resolve(__dirname, 'packages/database-public/src'),
       '@nit/queue': resolve(__dirname, 'packages/queue/src'),
       '@nit/observation': resolve(__dirname, 'packages/observation/src'),
+      '@nit/narrative-intelligence': resolve(__dirname, 'packages/narrative-intelligence/src'),
       '@nit/market': resolve(__dirname, 'packages/market/src'),
       '@nit/wallet-intelligence': resolve(__dirname, 'packages/wallet-intelligence/src'),
       '@nit/observability': resolve(__dirname, 'packages/observability/src'),

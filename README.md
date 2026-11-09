@@ -455,3 +455,12 @@ and the already-used Zod validator; no vendor SDK, telemetry, signer or live
 execution dependency is introduced. Actual provider billing and the complete
 2 GB deployment load still need operational validation. Learning, promotion and
 paper-trade capabilities remain separate future phases.
+
+## Automated text narratives
+
+The optional narrative worker now turns captured text into validated interpretations,
+separate narrative and token-link assessments, immutable provenance and resolver inputs.
+It supports a provider-neutral gateway and a literal watch-only catalog adapter.
+See [text producer coverage and operation](packages/narrative-intelligence/README.md).
+Broader semantic/media interpretation and a configured real gateway remain required
+for the agreed full-system live test.
