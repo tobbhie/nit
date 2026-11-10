@@ -9,6 +9,57 @@ const MAX_BORSH_STRING_BYTES = 16_384;
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 const BASE58_VALUES = new Map([...BASE58_ALPHABET].map((character, index) => [character, index]));
 
+/** Skip only known non-lifecycle Pump logs. Unknown/truncated evidence is fetched. */
+export function isPumpLifecycleNotification(message: unknown, programAddress: string): boolean {
+  if (
+    !isRecord(message) ||
+    !isRecord(message.params) ||
+    !isRecord(message.params.result) ||
+    !isRecord(message.params.result.value)
+  )
+    return true;
+  const logs = message.params.result.value.logs;
+  if (!Array.isArray(logs) || logs.length === 0 || logs.some((v: unknown) => typeof v !== 'string'))
+    return true;
+  const stack: string[] = [];
+  let trade = false;
+  let unknown = false;
+  let invoked = false;
+  let framed = false;
+  for (const item of logs as string[]) {
+    if (/truncat/i.test(item)) return true;
+    const invoke = /^Program ([1-9A-HJ-NP-Za-km-z]+) invoke \[(\d+)\]$/.exec(item);
+    if (invoke !== null) {
+      const depth = Number(invoke[2]);
+      if (depth < 1 || depth > 64) return true;
+      stack.length = depth - 1;
+      stack.push(invoke[1]!);
+      framed = true;
+      if (invoke[1] === programAddress) invoked = true;
+      continue;
+    }
+    const ended = /^Program ([1-9A-HJ-NP-Za-km-z]+) (?:success|failed:.*)$/.exec(item);
+    if (ended !== null) {
+      if (stack.at(-1) !== ended[1]) return true;
+      stack.pop();
+      continue;
+    }
+    if (stack.at(-1) !== programAddress) continue;
+    const instruction = /^Program log: Instruction: ([A-Za-z0-9_]+)$/.exec(item);
+    if (instruction === null) continue;
+    if (/^(?:Create|Migrate)(?:V[0-9]+)?$/.test(instruction[1]!)) return true;
+    if (
+      /^(?:Buy|Sell)(?:V[0-9]+)?$|^BuyExact(?:Sol|Quote)In(?:V[0-9]+)?$|^(MultiHopCurveSwap|CloseUserVolumeAccumulator|SweepCreatorFee|CollectCreatorFeeV2)$/.test(
+        instruction[1]!
+      )
+    )
+      trade = true;
+    else unknown = true;
+  }
+  if (!framed || stack.length !== 0) return true;
+  return invoked ? !trade || unknown : false;
+}
+
 /** Decodes the two Pump events that alter NIT's canonical token-market lifecycle. */
 export class PumpEventDecoder implements SolanaMarketTransactionDecoder {
   decode(transaction: SolanaLaunchTransaction): Result<readonly DecodedMarketOccurrence[], Error> {

@@ -456,6 +456,56 @@ execution dependency is introduced. Actual provider billing and the complete
 2 GB deployment load still need operational validation. Learning, promotion and
 paper-trade capabilities remain separate future phases.
 
+## Local configuration and first start
+
+The local template is [env.example](env.example); the private local file is `.env`
+in the repository root. It lists runtime database credentials and optional X,
+RPC, wallet, Telegram, narrative, R2, observer and research settings. Examples use
+placeholders, with external services disabled. Replace the required `DB_HOST`,
+`DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` and `DB_SSL` values with your dedicated
+NIT development database settings. Never use the PostgreSQL superuser.
+`NIT_TEST_DATABASE_URL` is separate and does not configure the running apps.
+
+`NIT_CONFIG_PATH` points to the schema-compatible
+[development YAML](config/development.sanitized.yaml). `DB_*` environment variables
+override its dummy values. Optional settings are commented out deliberately:
+uncomment a setting only after filling it. Empty optional path variables can be
+treated as configured paths by workers. Do not set them to empty strings.
+
+Use Node 22+ for the local launcher. After filling the database settings, build with `pnpm build`. When you explicitly
+choose to start locally, `pnpm local:control` loads `.env` and starts only the
+loopback control API at `http://127.0.0.1:3000` (or the configured port). Startup
+checks/applies database migrations. `/health` and `/ready` are API endpoints;
+there is no browser dashboard and this command does not start trading workers.
+Do not run a `local:*` command until startup is authorized. Existing shell
+environment variables take precedence over `.env` values. The launcher loads the
+file before spawning the selected Node process so `NODE_EXTRA_CA_CERTS` is present
+at process startup. For Supabase set `DB_SSL=true` and use its public database CA
+at `config/certs/supabase-prod-ca-2021.crt`; certificate/hostname verification stays
+enabled. `node scripts/local.mjs --check control` checks only local file paths;
+it does not start any app, connect to a database or apply migrations.
+
+Start additional services individually, after their private configuration is ready:
+
+| Command                | Additional settings                                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------------------- |
+| `pnpm local:market`    | Market enable flag, RPC endpoints/programs; execution-facts JSON for the fact producer            |
+| `pnpm local:wallet`    | Wallet enable flag, RPC endpoints, private watchlist and convergence policy                       |
+| `pnpm local:ingestion` | X capture JSON and bearer; without that explicit path, development uses the toy ingestion handler |
+| `pnpm local:narrative` | Narrative JSON, gateway bearer when selected; R2 credentials when media is enabled                |
+| `pnpm local:paper`     | Paper command JSON; a registered forward-paper portfolio for `serve`                              |
+| `pnpm local:console`   | Console JSON and Telegram token with explicit operator/chat/portfolio allowlists                  |
+| `pnpm local:observer`  | Agent configuration/command JSON and its optional gateway bearer                                  |
+| `pnpm local:research`  | Explicit one-off research/replay command JSON                                                     |
+
+The JSON paths in `env.example` are illustrative, not bundled policy files.
+Gateway/model IDs, grants, FFmpeg paths, storage endpoint/bucket, strategy values,
+source accounts and operator IDs belong in the respective configuration schemas,
+not invented environment variables. Keep those filled files outside the checkout.
+See [narrative settings](packages/narrative-intelligence/RICH_MODE.md),
+[paper operations](deploy/README.md) and the worker's command schema before
+enabling it. `.env` and filled configuration are never part of a public commit.
+
 ## Automated narrative evidence
 
 The optional narrative worker turns captured text and explicitly enabled media into validated interpretations,

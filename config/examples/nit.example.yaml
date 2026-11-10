@@ -1,13 +1,27 @@
-# Fake development values only. Do not copy production values here.
+# Public development template. Replace placeholders privately before startup.
+# Runtime DB_* environment variables take precedence over database fields.
 environment: development
+version:
+  schemaVersion: '1.0.0'
+  buildId: local
 database:
-  url: "postgresql://nit_dev:nit_dev@localhost:5432/nit_dev"
-telegram:
-  token: "FAKE_TELEGRAM_TOKEN"
-  default_chat_id: "000000000"
-providers:
-  social:
-    enabled: false
-intelligence:
-  implementation: toy
-
+  host: 127.0.0.1
+  port: 5432
+  database: nit_dev
+  user: nit_dev
+  password: REPLACE_WITH_NIT_LOCAL_PASSWORD
+  ssl: false
+  poolMin: 0
+  poolMax: 2
+queue: {}
+providers: {}
+solanaMarket:
+  enabled: false
+solanaWallet:
+  enabled: false
+featureFlags:
+  privateIntelligence: false
+  productionAlerts: false
+  execution: false
+  privateSources: false
+logLevel: info

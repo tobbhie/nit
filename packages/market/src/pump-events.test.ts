@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { LaunchSource } from '@nit/domain';
-import { PumpEventDecoder, encodeBase58 } from './pump-events';
+import { PumpEventDecoder, encodeBase58, isPumpLifecycleNotification } from './pump-events';
 import { SolanaLaunchTransaction } from './solana-rpc';
 
 const EVENT_CPI_TAG = bytes(228, 69, 165, 46, 81, 203, 154, 29);
@@ -9,6 +9,57 @@ const MIGRATION_EVENT = bytes(189, 233, 93, 185, 92, 148, 234, 148);
 const PROGRAM = 'ConfiguredPumpProgram111111111111111111111111';
 
 describe('PumpEventDecoder', () => {
+  it('filters only known trade-only logs from the emitting Pump program', () => {
+    const program = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+    const notice = (logs: unknown): unknown => ({ params: { result: { value: { logs } } } });
+    const logs = (name: string): string[] => [
+      'Program ' + program + ' invoke [1]',
+      'Program log: Instruction: ' + name,
+      'Program ' + program + ' success',
+    ];
+    expect(isPumpLifecycleNotification(notice(logs('BuyV3')), program)).toBe(false);
+    expect(isPumpLifecycleNotification(notice(logs('Sell')), program)).toBe(false);
+    for (const name of [
+      'MultiHopCurveSwap',
+      'CloseUserVolumeAccumulator',
+      'SweepCreatorFee',
+      'CollectCreatorFeeV2',
+    ])
+      expect(isPumpLifecycleNotification(notice(logs(name)), program)).toBe(false);
+    expect(
+      isPumpLifecycleNotification(
+        notice([
+          'Program 11111111111111111111111111111111 invoke [1]',
+          'Program log: Instruction: Create',
+          'Program 11111111111111111111111111111111 success',
+        ]),
+        program
+      )
+    ).toBe(false);
+    expect(isPumpLifecycleNotification(notice(['Program log: Instruction: Create']), program)).toBe(
+      true
+    );
+    for (const name of ['Create', 'CreateV2', 'Migrate', 'FutureInstruction'])
+      expect(isPumpLifecycleNotification(notice(logs(name)), program)).toBe(true);
+    expect(isPumpLifecycleNotification(notice([...logs('Buy'), 'Log truncated']), program)).toBe(
+      true
+    );
+    expect(isPumpLifecycleNotification(notice([]), program)).toBe(true);
+    expect(isPumpLifecycleNotification(notice('missing logs'), program)).toBe(true);
+    expect(
+      isPumpLifecycleNotification(
+        notice([
+          'Program ' + program + ' invoke [1]',
+          'Program log: Instruction: Buy',
+          'Program ' + program + ' invoke [2]',
+          'Program log: Instruction: Migrate',
+          'Program ' + program + ' success',
+          'Program ' + program + ' success',
+        ]),
+        program
+      )
+    ).toBe(true);
+  });
   it('decodes CreateEvent CPI data with exact nested instruction identity', () => {
     const mint = repeated(1);
     const curve = repeated(2);

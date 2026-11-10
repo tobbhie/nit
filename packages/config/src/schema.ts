@@ -81,6 +81,7 @@ export const SolanaMarketConfigSchema = z
       minRequestIntervalMs: z.number().int().nonnegative().default(200),
       reconciliation: z
         .object({
+          enabled: z.boolean().default(true),
           intervalMs: z.number().int().positive().default(60_000),
           overlapSlots: z.number().int().nonnegative().default(250),
           initialLookbackSlots: z.number().int().nonnegative().default(2_000),

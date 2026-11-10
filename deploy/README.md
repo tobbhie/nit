@@ -45,7 +45,8 @@ Enable these instances individually after their configuration is verified:
 `NIT_X_BEARER_TOKEN` are set. Without that explicit path it retains its development
 toy job handler, which production guards reject. Captured research interpretations
 can also be published through the research worker. Automated production currently
-covers a bounded text path; broader semantic/media understanding remains unfinished.
+covers a bounded text path with opt-in rich semantic/media evidence; the rich
+gateway, decoder and storage settings must be configured separately.
 A healthy control API is only
 database/process health, not proof the trading pipeline has complete coverage.
 
@@ -57,6 +58,18 @@ and database retention/archive planning before an extended run. Never delete
 immutable trading evidence to recover space without an explicit archive policy.
 
 ## Execution fact contract
+
+For an explicitly limited live-only local collection stage, set
+`NIT_SOLANA_RECONCILIATION_ENABLED=false`. This stops the historical scheduler and
+repair consumer, but keeps confirmed lifecycle intake and fact refresh running.
+Market health is labeled degraded with `live_only_unrepaired_gaps`; it is not a
+complete feed or unattended paper-test acceptance. The default is `true`.
+Validate historical RPC throughput before enabling repair on high-volume programs.
+Both Pump creation and Pump-to-AMM migration events are emitted by the configured
+Pump program, sharing one WebSocket. The AMM program remains the owner checked
+for pool execution facts. Known trade-only Pump logs are filtered before HTTP
+transaction lookup; unknown/truncated logs still fetch. The live queue is bounded
+and closes an overloaded subscription, reporting the gap for reconciliation.
 
 Set `NIT_EXECUTION_FACTS_CONFIG_PATH` to JSON with explicit `pumpProgram`,
 `swapProgram`, `swapGlobalConfig`, `intervalMs`, `maxTargets`, `maxSlotAgeMs` and

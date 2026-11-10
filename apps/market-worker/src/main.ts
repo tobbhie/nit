@@ -21,6 +21,7 @@ import {
   PostgresSolanaReconciliationCursorRepository,
   PostgresUnitOfWork,
   PumpEventDecoder,
+  isPumpLifecycleNotification,
   SolanaConfirmedLogSubscriber,
   SolanaConfirmedOccurrenceIngestor,
   SolanaLaunchReconciler,
@@ -86,7 +87,9 @@ async function main(): Promise<void> {
   const decoder = new PumpEventDecoder();
   const programBySource = new Map<LaunchSource, string>([
     [LaunchSource.PUMP_FUN, marketConfig.pumpFunProgramAddress],
-    [LaunchSource.PUMPSWAP, marketConfig.pumpSwapProgramAddress],
+    // CompletePumpAmmMigrationEvent is emitted by Pump, not the destination AMM.
+    // Keep destination-specific cursors/decoders, sharing the emitting program's socket.
+    [LaunchSource.PUMPSWAP, marketConfig.pumpFunProgramAddress],
   ]);
   const reconcilers = new Map<LaunchSource, SolanaLaunchReconciler>();
   const ingestorsByProgram = new Map<string, Ingestor[]>();
@@ -126,14 +129,19 @@ async function main(): Promise<void> {
     onError: (error): void =>
       logger.error('Failed to schedule reconciliation', { error: error.message }),
   });
+  let lastLiveSuccessAt: Date | null = null;
   const subscribers = [...ingestorsByProgram.entries()].map(
     ([programAddress, ingestors]) =>
       new SolanaConfirmedLogSubscriber({
         endpoint: marketConfig.websocketEndpoint,
         programAddress,
+        notificationFilter: (message): boolean =>
+          isPumpLifecycleNotification(message, programAddress),
         ingestor: compositeIngestor(ingestors),
-        onIngested: (summary): void =>
-          logger.info('Confirmed Solana transaction ingested', { ...summary }),
+        onIngested: (summary): void => {
+          lastLiveSuccessAt = new Date();
+          logger.info('Confirmed Solana transaction ingested', { ...summary });
+        },
         onError: (error): void =>
           logger.error('Confirmed Solana ingestion interrupted', {
             error: error.message,
@@ -149,12 +157,25 @@ async function main(): Promise<void> {
         const depth = await queue.pendingDepth(QueueName.TOKEN_RECONCILIATION);
         return depth.kind === 'success' ? depth.value : -1;
       },
-      lastSuccessfulCycleAt: () => worker.getStats().lastSuccessAt,
-      errorCount: () => worker.getStats().errorCount,
+      lastSuccessfulCycleAt: () => lastLiveSuccessAt ?? worker.getStats().lastSuccessAt,
+      errorCount: () =>
+        worker.getStats().errorCount + subscribers.reduce((n, s) => n + s.getStats().errors, 0),
     }
   );
   const healthTimer = setInterval(() => {
-    void health.report().then((report) => logger.info('health', { ...report }));
+    void health
+      .report()
+      .then((report) =>
+        logger.info('health', {
+          ...report,
+          status: marketConfig.reconciliation.enabled ? report.status : 'degraded',
+          reconciliationEnabled: marketConfig.reconciliation.enabled,
+          coverage: marketConfig.reconciliation.enabled
+            ? 'live_and_repair'
+            : 'live_only_unrepaired_gaps',
+          subscriptions: subscribers.map((s) => s.getStats()),
+        })
+      );
   }, 30_000);
 
   let shuttingDown = false;
@@ -172,11 +193,13 @@ async function main(): Promise<void> {
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 
-  scheduler.start();
+  if (marketConfig.reconciliation.enabled) scheduler.start();
+  else logger.warn('Historical reconciliation paused; live-only gaps are not repaired');
   for (const subscriber of subscribers) subscriber.start();
   logger.info('Market worker started', {
     reconciliationSources: [...programBySource.keys()],
     websocketConnections: subscribers.length,
+    reconciliationEnabled: marketConfig.reconciliation.enabled,
   });
   const refresh = async (): Promise<void> => {
     if (refresher === undefined) return;
@@ -193,7 +216,14 @@ async function main(): Promise<void> {
       }
     }
   };
-  const workloads = [worker.run(), refresh()];
+  const live = new Promise<void>((resolve) =>
+    abort.signal.addEventListener('abort', () => resolve(), { once: true })
+  );
+  const workloads = [
+    live,
+    refresh(),
+    ...(marketConfig.reconciliation.enabled ? [worker.run()] : []),
+  ];
   try {
     await Promise.all(workloads);
   } finally {

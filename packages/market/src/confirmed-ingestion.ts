@@ -114,6 +114,8 @@ export interface SolanaConfirmedLogSubscriberOptions {
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
   onIngested?: (summary: ConfirmedIngestionSummary) => void;
   onError?: (error: Error) => void;
+  maxPendingNotifications?: number;
+  notificationFilter?: (message: unknown) => boolean;
 }
 
 /** A reconnecting confirmed `logsSubscribe` client; reconciliation repairs every gap. */
@@ -133,6 +135,12 @@ export class SolanaConfirmedLogSubscriber {
   private stopped = true;
   private reconnectAttempt = 0;
   private tail: Promise<void> = Promise.resolve();
+  private pending = 0;
+  private filtered = 0;
+  private overflows = 0;
+  private errors = 0;
+  private readonly maxPending: number;
+  private readonly notificationFilter: ((message: unknown) => boolean) | undefined;
 
   constructor(options: SolanaConfirmedLogSubscriberOptions) {
     this.endpoint = websocketEndpoint(options.endpoint);
@@ -148,6 +156,17 @@ export class SolanaConfirmedLogSubscriber {
     this.clearTimer = options.clearTimer ?? clearTimeout;
     this.onIngested = options.onIngested;
     this.onError = options.onError;
+    this.maxPending = positive(options.maxPendingNotifications, 128, 'notification backlog');
+    if (this.maxPending > 10000) throw new Error('Notification backlog limit exceeds hard cap');
+    this.notificationFilter = options.notificationFilter;
+  }
+  getStats(): { pending: number; filtered: number; overflows: number; errors: number } {
+    return {
+      pending: this.pending,
+      filtered: this.filtered,
+      overflows: this.overflows,
+      errors: this.errors,
+    };
   }
 
   start(): void {
@@ -179,7 +198,6 @@ export class SolanaConfirmedLogSubscriber {
     this.connection = connection;
     connection.onOpen(() => {
       if (this.connection !== connection || this.stopped) return;
-      this.reconnectAttempt = 0;
       connection.send(
         JSON.stringify({
           jsonrpc: '2.0',
@@ -196,7 +214,7 @@ export class SolanaConfirmedLogSubscriber {
     connection.onError((error) => {
       if (this.connection !== connection || this.stopped) return;
       this.report(error);
-      connection.close();
+      this.disconnect(connection);
     });
     connection.onClose(() => {
       if (this.connection !== connection) return;
@@ -211,29 +229,71 @@ export class SolanaConfirmedLogSubscriber {
       message = JSON.parse(data) as unknown;
     } catch {
       this.report(new Error('Solana WebSocket returned invalid JSON'));
-      connection.close();
+      this.disconnect(connection);
+      return;
+    }
+    if (isRecord(message) && message.id === 1) {
+      if (typeof message.result !== 'number' || message.error !== undefined) {
+        this.report(new Error('Solana log subscription was rejected'));
+        this.disconnect(connection);
+      }
       return;
     }
     const parsed = parseConfirmedLogNotification(message);
     if (parsed.kind === 'failure') {
       this.report(parsed.error);
-      connection.close();
+      this.disconnect(connection);
       return;
     }
     if (parsed.value === null) return;
-    const notification = parsed.value;
-
-    this.tail = this.tail.then(async () => {
-      const ingested = await this.ingestor.ingest(notification.signature, notification.slot);
-      if (ingested.kind === 'failure') {
-        this.report(ingested.error);
-        if (this.connection === connection) connection.close();
+    if (this.notificationFilter !== undefined) {
+      try {
+        if (!this.notificationFilter(message)) {
+          this.filtered++;
+          return;
+        }
+      } catch {
+        this.report(new Error('Notification filtering failed'));
+        this.disconnect(connection);
         return;
       }
-      this.onIngested?.(ingested.value);
-    });
+    }
+    if (this.pending >= this.maxPending) {
+      this.overflows++;
+      this.report(
+        new Error('Confirmed notification backlog limit reached; reconciliation required')
+      );
+      this.disconnect(connection);
+      return;
+    }
+    const notification = parsed.value;
+    this.pending++;
+    this.tail = this.tail
+      .then(async () => {
+        const ingested = await this.ingestor.ingest(notification.signature, notification.slot);
+        if (ingested.kind === 'failure') {
+          this.report(ingested.error);
+          if (this.connection === connection) this.disconnect(connection);
+          return;
+        }
+        this.onIngested?.(ingested.value);
+        if (this.connection === connection) this.reconnectAttempt = 0;
+      })
+      .catch(() => {
+        this.report(new Error('Confirmed ingestion handler failed; reconciliation required'));
+        if (this.connection === connection) this.disconnect(connection);
+      })
+      .finally(() => {
+        this.pending--;
+      });
   }
 
+  private disconnect(connection: SolanaWebSocketConnection): void {
+    if (this.connection !== connection) return;
+    this.connection = undefined;
+    connection.close();
+    this.scheduleReconnect();
+  }
   private scheduleReconnect(): void {
     if (this.stopped || this.reconnectTimer !== undefined) return;
     const delay = Math.min(
@@ -248,12 +308,13 @@ export class SolanaConfirmedLogSubscriber {
   }
 
   private report(error: Error): void {
+    this.errors++;
     this.onError?.(error);
   }
 }
 
 function defaultConnectionFactory(endpoint: string): SolanaWebSocketConnection {
-  const socket = new WebSocketClient(endpoint);
+  const socket = new WebSocketClient(endpoint, { maxPayload: 1048576, handshakeTimeout: 15000 });
   return {
     onOpen: (listener): void => {
       socket.on('open', listener);

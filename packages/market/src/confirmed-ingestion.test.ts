@@ -123,6 +123,99 @@ describe('SolanaConfirmedOccurrenceIngestor', () => {
 });
 
 describe('confirmed Solana log subscription', () => {
+  it('bounds queued notifications and closes the overloaded connection for reconciliation', async () => {
+    const connection = new FakeConnection();
+    let release: () => void = () => undefined;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: string[] = [];
+    const subscriber = new SolanaConfirmedLogSubscriber({
+      endpoint: 'wss://rpc.example.test',
+      programAddress: OCCURRENCE.programAddress,
+      maxPendingNotifications: 2,
+      connectionFactory: (): SolanaWebSocketConnection => connection,
+      ingestor: {
+        ingest: async (signature, slot): Promise<Result<ConfirmedIngestionSummary, Error>> => {
+          calls.push(signature);
+          await barrier;
+          return success({
+            signature,
+            slot,
+            fetched: 0,
+            discovered: 0,
+            graduated: 0,
+            duplicates: 0,
+          });
+        },
+      },
+    });
+    subscriber.start();
+    connection.open();
+    for (let i = 0; i < 3; i++)
+      connection.message(JSON.stringify(notification('sig-' + i, 42 + i, null)));
+    expect(subscriber.getStats()).toMatchObject({ pending: 2, overflows: 1, errors: 1 });
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toEqual(['sig-0', 'sig-1']);
+    expect(subscriber.getStats().pending).toBe(0);
+    subscriber.stop();
+  });
+  it('recovers the processing tail after a thrown ingestor and reports rejected subscriptions', async () => {
+    const connection = new FakeConnection();
+    const calls: string[] = [];
+    const subscriber = new SolanaConfirmedLogSubscriber({
+      endpoint: 'wss://rpc.example.test',
+      programAddress: OCCURRENCE.programAddress,
+      connectionFactory: (): SolanaWebSocketConnection => connection,
+      ingestor: {
+        ingest: (signature, slot): Promise<Result<ConfirmedIngestionSummary, Error>> => {
+          calls.push(signature);
+          if (signature === 'bad') throw new Error('Synthetic handler failure');
+          return Promise.resolve(
+            success({
+              signature,
+              slot,
+              fetched: 0,
+              discovered: 0,
+              graduated: 0,
+              duplicates: 0,
+            })
+          );
+        },
+      },
+    });
+    subscriber.start();
+    connection.open();
+    connection.message(JSON.stringify(notification('bad', 42, null)));
+    connection.message(JSON.stringify(notification('good', 43, null)));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toEqual(['bad', 'good']);
+    expect(subscriber.getStats().pending).toBe(0);
+    expect(subscriber.getStats().errors).toBe(1);
+    subscriber.stop();
+    const rejected = new FakeConnection();
+    const other = new SolanaConfirmedLogSubscriber({
+      endpoint: 'wss://rpc.example.test',
+      programAddress: OCCURRENCE.programAddress,
+      connectionFactory: (): SolanaWebSocketConnection => rejected,
+      ingestor: {
+        ingest: (): Promise<Result<ConfirmedIngestionSummary, Error>> =>
+          Promise.reject(new Error('Should not ingest a subscription error')),
+      },
+    });
+    other.start();
+    rejected.open();
+    rejected.message(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        error: { code: 429, message: 'Untrusted provider response' },
+      })
+    );
+    expect(other.getStats().errors).toBe(1);
+    other.stop();
+  });
   it('parses only successful log notifications', () => {
     const valid = notification('signature-1', 42, null);
     const failed = notification('signature-2', 43, { InstructionError: [0, 'Custom'] });

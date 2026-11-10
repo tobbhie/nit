@@ -57,6 +57,10 @@ function solanaMarketInput(fileConfig: Partial<Config>): unknown {
       enabledFile?.minRequestIntervalMs,
     reconciliation: {
       ...enabledFile?.reconciliation,
+      enabled:
+        parseBooleanEnv(process.env['NIT_SOLANA_RECONCILIATION_ENABLED']) ??
+        enabledFile?.reconciliation.enabled ??
+        true,
       intervalMs:
         parseIntEnv(process.env['NIT_SOLANA_RECONCILIATION_INTERVAL_MS']) ??
         enabledFile?.reconciliation.intervalMs,
