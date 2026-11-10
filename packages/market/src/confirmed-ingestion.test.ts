@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { Chain, LaunchSource, Result, success } from '@nit/domain';
+import { Chain, LaunchSource, Result, failure, success } from '@nit/domain';
 import {
   ConfirmedIngestionSummary,
+  PreparedConfirmedIngestion,
+  SolanaConfirmedProgramIngestor,
   SolanaConfirmedLogSubscriber,
   SolanaConfirmedOccurrenceIngestor,
   SolanaWebSocketConnection,
@@ -96,6 +98,84 @@ class RecordingDiscovery implements ReconciliationDiscovery {
 }
 
 describe('SolanaConfirmedOccurrenceIngestor', () => {
+  it('does not apply any decoder output when another decoder fails', async () => {
+    let writes = 0;
+    const source = {
+      readConfirmedTransaction: (): Promise<Result<Record<string, unknown>, Error>> =>
+        Promise.resolve(success({ slot: 42 })),
+      decodeConfirmedTransaction: (): Result<readonly ReconciledMarketOccurrence[], Error> =>
+        success([OCCURRENCE]),
+    };
+    const ingestor = {
+      apply: (): Promise<Result<ConfirmedIngestionSummary, Error>> => {
+        writes++;
+        return Promise.reject(new Error('Must not write'));
+      },
+    };
+    const program = new SolanaConfirmedProgramIngestor([
+      { source, ingestor },
+      {
+        source: {
+          ...source,
+          decodeConfirmedTransaction: (): Result<readonly ReconciledMarketOccurrence[], Error> =>
+            failure(new Error('Malformed migration')),
+        },
+        ingestor,
+      },
+    ]);
+    expect((await program.ingest('signature-1', 42)).kind).toBe('failure');
+    expect(writes).toBe(0);
+  });
+  it('shares one transaction read and finishes all decoding before any writes', async () => {
+    let reads = 0;
+    const writes: number[] = [];
+    const source = {
+      readConfirmedTransaction: (): Promise<Result<Record<string, unknown>, Error>> => {
+        reads++;
+        return Promise.resolve(success({ slot: 42 }));
+      },
+      decodeConfirmedTransaction: (): Result<readonly ReconciledMarketOccurrence[], Error> =>
+        success([OCCURRENCE]),
+    };
+    const targets = [0, 1].map((index) => ({
+      source,
+      ingestor: {
+        apply: (
+          signature: string,
+          slot: number,
+          occurrences: readonly ReconciledMarketOccurrence[]
+        ): Promise<Result<ConfirmedIngestionSummary, Error>> => {
+          writes.push(index);
+          return Promise.resolve(
+            success({
+              signature,
+              slot,
+              fetched: occurrences.length,
+              discovered: 1,
+              graduated: 0,
+              duplicates: 0,
+            })
+          );
+        },
+      },
+    }));
+    const program = new SolanaConfirmedProgramIngestor(targets);
+    const prepared = await program.prepare('signature-1', 42);
+    expect(reads).toBe(1);
+    expect(writes).toEqual([]);
+    if (prepared.kind === 'failure') throw prepared.error;
+    expect(await prepared.value()).toEqual(
+      success({
+        signature: 'signature-1',
+        slot: 42,
+        fetched: 2,
+        discovered: 2,
+        graduated: 0,
+        duplicates: 0,
+      })
+    );
+    expect(writes).toEqual([0, 1]);
+  });
   it('routes a confirmed transaction through raw persistence before discovery', async () => {
     const source = new StubSource();
     const occurrences = new RecordingOccurrences();
@@ -123,6 +203,121 @@ describe('SolanaConfirmedOccurrenceIngestor', () => {
 });
 
 describe('confirmed Solana log subscription', () => {
+  it('bounds independent mint commits, keeps same-mint order and lets empty decodes drain', async () => {
+    const connection = new FakeConnection();
+    const started: string[] = [];
+    const completed: string[] = [];
+    const releases = new Map<string, () => void>();
+    let active = 0,
+      peak = 0;
+    const subscriber = new SolanaConfirmedLogSubscriber({
+      endpoint: 'wss://rpc.example.test',
+      programAddress: OCCURRENCE.programAddress,
+      maxConcurrentCommits: 2,
+      connectionFactory: (): SolanaWebSocketConnection => connection,
+      ingestor: {
+        ingest: (): Promise<Result<ConfirmedIngestionSummary, Error>> =>
+          Promise.reject(new Error('Must prepare')),
+        prepare: (signature, slot): Promise<Result<PreparedConfirmedIngestion, Error>> => {
+          const apply: PreparedConfirmedIngestion = async () => {
+            started.push(signature);
+            if (signature !== 'empty') {
+              peak = Math.max(peak, ++active);
+              await new Promise<void>((resolve) => releases.set(signature, resolve));
+              active--;
+            }
+            completed.push(signature);
+            return success({
+              signature,
+              slot,
+              fetched: 0,
+              discovered: 0,
+              graduated: 0,
+              duplicates: 0,
+            });
+          };
+          apply.keys = signature === 'empty' ? [] : [signature === 'laterA' ? 'A' : signature];
+          return Promise.resolve(success(apply));
+        },
+      },
+    });
+    const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+    subscriber.start();
+    connection.open();
+    for (const signature of ['A', 'B', 'C', 'laterA', 'empty'])
+      connection.message(JSON.stringify(notification(signature, 42, null)));
+    await flush();
+    expect(started).toEqual(['A', 'B', 'empty']);
+    expect(completed).toEqual(['empty']);
+    releases.get('A')!();
+    await flush();
+    expect(started).toEqual(['A', 'B', 'empty', 'C']);
+    releases.get('B')!();
+    await flush();
+    expect(started.at(-1)).toBe('laterA');
+    releases.get('C')!();
+    releases.get('laterA')!();
+    await flush();
+    expect(peak).toBe(2);
+    expect(completed.indexOf('laterA')).toBeGreaterThan(completed.indexOf('A'));
+    expect(subscriber.getStats().pending).toBe(0);
+    subscriber.stop();
+  });
+  it('overlaps bounded HTTP preparation but preserves notification order for writes', async () => {
+    const connection = new FakeConnection();
+    const releases = new Map<string, (result: Result<PreparedConfirmedIngestion, Error>) => void>();
+    const started: string[] = [];
+    const applied: string[] = [];
+    const subscriber = new SolanaConfirmedLogSubscriber({
+      endpoint: 'wss://rpc.example.test',
+      programAddress: OCCURRENCE.programAddress,
+      maxConcurrentPreparations: 2,
+      connectionFactory: (): SolanaWebSocketConnection => connection,
+      ingestor: {
+        ingest: (): Promise<Result<ConfirmedIngestionSummary, Error>> => {
+          return Promise.reject(new Error('Preparation should be used'));
+        },
+        prepare: (signature): Promise<Result<PreparedConfirmedIngestion, Error>> =>
+          new Promise((resolve) => {
+            started.push(signature);
+            releases.set(signature, resolve);
+          }),
+      },
+    });
+    const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+    const complete = (signature: string): void =>
+      releases.get(signature)!(
+        success(() => {
+          applied.push(signature);
+          return Promise.resolve(
+            success({
+              signature,
+              slot: 42,
+              fetched: 0,
+              discovered: 0,
+              graduated: 0,
+              duplicates: 0,
+            })
+          );
+        })
+      );
+    subscriber.start();
+    connection.open();
+    for (const signature of ['first', 'second', 'third'])
+      connection.message(JSON.stringify(notification(signature, 42, null)));
+    await flush();
+    expect(started).toEqual(['first', 'second']);
+    complete('second');
+    await flush();
+    expect(started).toEqual(['first', 'second', 'third']);
+    expect(applied).toEqual([]);
+    complete('third');
+    complete('first');
+    await flush();
+    expect(applied).toEqual(['first', 'second', 'third']);
+    expect(subscriber.getStats().pending).toBe(0);
+    subscriber.stop();
+  });
   it('bounds queued notifications and closes the overloaded connection for reconciliation', async () => {
     const connection = new FakeConnection();
     let release: () => void = () => undefined;
@@ -139,14 +334,16 @@ describe('confirmed Solana log subscription', () => {
         ingest: async (signature, slot): Promise<Result<ConfirmedIngestionSummary, Error>> => {
           calls.push(signature);
           await barrier;
-          return success({
-            signature,
-            slot,
-            fetched: 0,
-            discovered: 0,
-            graduated: 0,
-            duplicates: 0,
-          });
+          return Promise.resolve(
+            success({
+              signature,
+              slot,
+              fetched: 0,
+              discovered: 0,
+              graduated: 0,
+              duplicates: 0,
+            })
+          );
         },
       },
     });

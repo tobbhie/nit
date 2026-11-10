@@ -203,6 +203,17 @@ export class SolanaRpcReconciliationSource implements SolanaReconciliationSource
     signature: string,
     expectedSlot: number
   ): Promise<Result<readonly ReconciledMarketOccurrence[], Error>> {
+    const transaction = await this.readConfirmedTransaction(signature, expectedSlot);
+    return transaction.kind === 'failure'
+      ? transaction
+      : this.decodeConfirmedTransaction(signature, expectedSlot, transaction.value);
+  }
+
+  /** Read once for all lifecycle decoders sharing an emitting program. */
+  async readConfirmedTransaction(
+    signature: string,
+    expectedSlot: number
+  ): Promise<Result<Record<string, unknown>, Error>> {
     if (signature.trim() === '' || !isSlot(expectedSlot)) {
       return failure(new Error('Solana confirmed transaction identity is invalid'));
     }
@@ -227,6 +238,16 @@ export class SolanaRpcReconciliationSource implements SolanaReconciliationSource
       );
     }
 
+    return success(transactionResponse.value);
+  }
+
+  decodeConfirmedTransaction(
+    signature: string,
+    expectedSlot: number,
+    transaction: Record<string, unknown>
+  ): Result<readonly ReconciledMarketOccurrence[], Error> {
+    if (signature.trim() === '' || !isSlot(expectedSlot) || transaction.slot !== expectedSlot)
+      return failure(new Error('Solana confirmed transaction identity is invalid'));
     const observedAt = new Date(this.clock());
     if (!Number.isFinite(observedAt.getTime())) {
       return failure(new Error('Solana RPC clock returned an invalid observation time'));
@@ -239,7 +260,7 @@ export class SolanaRpcReconciliationSource implements SolanaReconciliationSource
         launchSource: this.launchSource,
         programAddress: this.programAddress,
         observedAt,
-        transaction: transactionResponse.value,
+        transaction,
       });
     } catch (error) {
       return failure(

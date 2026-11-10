@@ -1,17 +1,8 @@
 import { readFile, stat } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { bootstrap } from '@nit/composition';
+import { ConfigurationError, LaunchSource, QueueName, createVersion } from '@nit/domain';
 import {
-  ConfigurationError,
-  LaunchSource,
-  QueueName,
-  Result,
-  createVersion,
-  failure,
-  success,
-} from '@nit/domain';
-import {
-  ConfirmedIngestionSummary,
   ExecutionFactsConfigSchema,
   ExecutionFactsRefresher,
   SolanaExecutionFactsSource,
@@ -24,6 +15,7 @@ import {
   isPumpLifecycleNotification,
   SolanaConfirmedLogSubscriber,
   SolanaConfirmedOccurrenceIngestor,
+  SolanaConfirmedProgramIngestor,
   SolanaLaunchReconciler,
   SolanaReconciliationHandler,
   SolanaReconciliationScheduler,
@@ -31,10 +23,6 @@ import {
 } from '@nit/market';
 import { HealthReporter, Logger } from '@nit/observability';
 import { JobQueue, Worker } from '@nit/queue';
-
-interface Ingestor {
-  ingest(signature: string, slot: number): Promise<Result<ConfirmedIngestionSummary, Error>>;
-}
 
 async function main(): Promise<void> {
   const { config, db } = await bootstrap(process.env['NIT_CONFIG_PATH'], {
@@ -92,7 +80,10 @@ async function main(): Promise<void> {
     [LaunchSource.PUMPSWAP, marketConfig.pumpFunProgramAddress],
   ]);
   const reconcilers = new Map<LaunchSource, SolanaLaunchReconciler>();
-  const ingestorsByProgram = new Map<string, Ingestor[]>();
+  const ingestorsByProgram = new Map<
+    string,
+    { source: SolanaRpcReconciliationSource; ingestor: SolanaConfirmedOccurrenceIngestor }[]
+  >();
 
   for (const [launchSource, programAddress] of programBySource) {
     const source = new SolanaRpcReconciliationSource({
@@ -112,7 +103,10 @@ async function main(): Promise<void> {
       })
     );
     const ingestors = ingestorsByProgram.get(programAddress) ?? [];
-    ingestors.push(new SolanaConfirmedOccurrenceIngestor(source, occurrences, discovery));
+    ingestors.push({
+      source,
+      ingestor: new SolanaConfirmedOccurrenceIngestor(source, occurrences, discovery),
+    });
     ingestorsByProgram.set(programAddress, ingestors);
   }
 
@@ -137,7 +131,7 @@ async function main(): Promise<void> {
         programAddress,
         notificationFilter: (message): boolean =>
           isPumpLifecycleNotification(message, programAddress),
-        ingestor: compositeIngestor(ingestors),
+        ingestor: new SolanaConfirmedProgramIngestor(ingestors),
         onIngested: (summary): void => {
           lastLiveSuccessAt = new Date();
           logger.info('Confirmed Solana transaction ingested', { ...summary });
@@ -163,19 +157,17 @@ async function main(): Promise<void> {
     }
   );
   const healthTimer = setInterval(() => {
-    void health
-      .report()
-      .then((report) =>
-        logger.info('health', {
-          ...report,
-          status: marketConfig.reconciliation.enabled ? report.status : 'degraded',
-          reconciliationEnabled: marketConfig.reconciliation.enabled,
-          coverage: marketConfig.reconciliation.enabled
-            ? 'live_and_repair'
-            : 'live_only_unrepaired_gaps',
-          subscriptions: subscribers.map((s) => s.getStats()),
-        })
-      );
+    void health.report().then((report) =>
+      logger.info('health', {
+        ...report,
+        status: marketConfig.reconciliation.enabled ? report.status : 'degraded',
+        reconciliationEnabled: marketConfig.reconciliation.enabled,
+        coverage: marketConfig.reconciliation.enabled
+          ? 'live_and_repair'
+          : 'live_only_unrepaired_gaps',
+        subscriptions: subscribers.map((s) => s.getStats()),
+      })
+    );
   }, 30_000);
 
   let shuttingDown = false;
@@ -231,30 +223,6 @@ async function main(): Promise<void> {
     await Promise.allSettled(workloads);
     await db.close();
   }
-}
-
-function compositeIngestor(ingestors: readonly Ingestor[]): Ingestor {
-  return {
-    async ingest(signature, slot): Promise<Result<ConfirmedIngestionSummary, Error>> {
-      const combined: ConfirmedIngestionSummary = {
-        signature,
-        slot,
-        fetched: 0,
-        discovered: 0,
-        graduated: 0,
-        duplicates: 0,
-      };
-      for (const ingestor of ingestors) {
-        const result = await ingestor.ingest(signature, slot);
-        if (result.kind === 'failure') return failure(result.error);
-        combined.fetched += result.value.fetched;
-        combined.discovered += result.value.discovered;
-        combined.graduated += result.value.graduated;
-        combined.duplicates += result.value.duplicates;
-      }
-      return success(combined);
-    },
-  };
 }
 
 main().catch((error: unknown) => {

@@ -67,9 +67,15 @@ complete feed or unattended paper-test acceptance. The default is `true`.
 Validate historical RPC throughput before enabling repair on high-volume programs.
 Both Pump creation and Pump-to-AMM migration events are emitted by the configured
 Pump program, sharing one WebSocket. The AMM program remains the owner checked
-for pool execution facts. Known trade-only Pump logs are filtered before HTTP
+for pool execution facts. Known non-lifecycle Pump logs are filtered before HTTP
 transaction lookup; unknown/truncated logs still fetch. The live queue is bounded
 and closes an overloaded subscription, reporting the gap for reconciliation.
+Live intake reads each transaction once for both lifecycle decoders. Up to four
+rate-limited RPC reads overlap. Up to two independent mint writes overlap; writes
+for the same mint retain notification order, so a later migration cannot overtake
+an earlier creation. Empty decodes do not hold a database slot. The 128-notification
+backlog cap remains in force. Measure sustained backlog and RPC latency before
+leaving the worker unattended; increasing the cap does not increase throughput.
 
 Set `NIT_EXECUTION_FACTS_CONFIG_PATH` to JSON with explicit `pumpProgram`,
 `swapProgram`, `swapGlobalConfig`, `intervalMs`, `maxTargets`, `maxSlotAgeMs` and
@@ -83,10 +89,14 @@ for an unbounded universe.
 This adapter reads `getMultipleAccounts` and `getBlockTime` from the configured
 Solana RPC. It exposes public market/mint/vault addresses and request timing to
 that provider. No private keys, signing or transaction submission. Raw account
-evidence is retained in PostgreSQL. It checks legacy SPL mint ownership and
+evidence is retained in PostgreSQL. It checks SPL/Token-2022 mint ownership and
 authorities, supported curve/pool layouts, vault binding, reserve availability,
-slot freshness and PumpSwap trading-disable flags. It rejects Token 2022 and
-unsupported newer reward, cashback, quote and virtual reserve modes. Atomic chain
+slot freshness and PumpSwap trading-disable flags. Token-2022 support is limited
+to metadata-pointer/token-metadata mint extensions and immutable-owner vaults;
+unknown extensions, transfer fees, hooks, delegates and pauses fail closed.
+Ordinary SOL curves include the documented 150/166-byte layouts; Mayhem,
+cashback, non-SOL quote and depth modes remain unsupported. Holder-reward SOL
+curves use the same reserve model, as documented by Pump. Atomic chain
 amounts are converted to exact human decimal quantities before entering the paper
 engine. Capture time identifies each read; chain-state time remains explicit so
 repeated captures cannot rejuvenate stale reserves. These
@@ -97,6 +107,24 @@ Protocol references: [Pump IDL](https://github.com/pump-fun/pump-public-docs/blo
 [PumpSwap IDL](https://github.com/pump-fun/pump-public-docs/blob/main/idl/pump_amm.json),
 [Solana account batches](https://solana.com/docs/rpc/http/getmultipleaccounts).
 Validate live account samples before expanding supported modes.
+
+## Token artwork discovery
+
+Artwork bytes do not come from the token program's balance data. Pump's
+`CreateEvent.uri` is retained as `tokens.raw_payload.uri`. Resolve that URI to a
+metadata JSON document, then follow its `image` field to the artwork. For other
+launch adapters, obtain the URI from Metaplex metadata or Token-2022's metadata
+pointer/metadata extension rather than treating the mint address as an image URL.
+
+The rich narrative token-representation path already follows this chain through
+its media processor, captures the metadata hash and artwork evidence, then
+interprets the image. It runs only with the narrative worker, gateway and media
+configuration enabled; market-only collection does not download artwork. JSON
+and image resolution are deterministic operations; interpretation is separate.
+Use explicit approved HTTPS origins and an IPFS gateway, response/time limits,
+content hashes and private archival storage. A missing/broken image must leave
+artwork unavailable without blocking canonical token discovery. Do not enable
+the model gateway just to obtain an image URL.
 
 ## Acceptance before the 48-hour run
 

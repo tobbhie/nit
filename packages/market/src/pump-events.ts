@@ -49,7 +49,7 @@ export function isPumpLifecycleNotification(message: unknown, programAddress: st
     if (instruction === null) continue;
     if (/^(?:Create|Migrate)(?:V[0-9]+)?$/.test(instruction[1]!)) return true;
     if (
-      /^(?:Buy|Sell)(?:V[0-9]+)?$|^BuyExact(?:Sol|Quote)In(?:V[0-9]+)?$|^(MultiHopCurveSwap|CloseUserVolumeAccumulator|SweepCreatorFee|CollectCreatorFeeV2)$/.test(
+      /^(?:Buy|Sell)(?:V[0-9]+)?$|^BuyExact(?:Sol|Quote)In(?:V[0-9]+)?$|^(?:MultiHopCurveSwap|CloseUserVolumeAccumulator|InitUserVolumeAccumulator|SweepCreatorFee|CollectCreatorFee|ExtendAccount|MigrateBondingCurveCreator|DistributeCreatorFees|ClaimCashback|DistributeFeeToHolders)(?:V[0-9]+)?$/.test(
         instruction[1]!
       )
     )

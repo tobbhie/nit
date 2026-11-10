@@ -24,6 +24,13 @@ describe('PumpEventDecoder', () => {
       'CloseUserVolumeAccumulator',
       'SweepCreatorFee',
       'CollectCreatorFeeV2',
+      'CollectCreatorFee',
+      'InitUserVolumeAccumulator',
+      'ExtendAccount',
+      'MigrateBondingCurveCreator',
+      'DistributeCreatorFeesV2',
+      'ClaimCashbackV2',
+      'DistributeFeeToHolders',
     ])
       expect(isPumpLifecycleNotification(notice(logs(name)), program)).toBe(false);
     expect(
@@ -59,6 +66,19 @@ describe('PumpEventDecoder', () => {
         program
       )
     ).toBe(true);
+    expect(
+      isPumpLifecycleNotification(
+        notice([
+          'Program ' + program + ' invoke [1]',
+          'Program log: Instruction: BuyV3',
+          'Program ' + program + ' invoke [2]',
+          'Program log: Instruction: DistributeFeeToHolders',
+          'Program ' + program + ' success',
+          'Program ' + program + ' success',
+        ]),
+        program
+      )
+    ).toBe(false);
   });
   it('decodes CreateEvent CPI data with exact nested instruction identity', () => {
     const mint = repeated(1);

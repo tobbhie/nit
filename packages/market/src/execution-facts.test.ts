@@ -65,7 +65,108 @@ function change(input: RpcAccount, mutation: (data: Buffer) => void): RpcAccount
   mutation(data);
   return account(data, input.owner);
 }
+
+const token2022 = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+function extendedMint(entries: [number, Buffer][]): RpcAccount {
+  const prefix = Buffer.alloc(166);
+  Buffer.from(mint().data[0], 'base64').copy(prefix);
+  prefix[165] = 1;
+  return account(
+    Buffer.concat([
+      prefix,
+      ...entries.map(([type, value]) => {
+        const header = Buffer.alloc(4);
+        header.writeUInt16LE(type);
+        header.writeUInt16LE(value.length, 2);
+        return Buffer.concat([header, value]);
+      }),
+    ]),
+    token2022
+  );
+}
+function metadata(): Buffer {
+  const prefix = Buffer.alloc(64);
+  Buffer.alloc(32, 4).copy(prefix, 32);
+  const string = (value: string): Buffer => {
+    const b = Buffer.from(value);
+    const n = Buffer.alloc(4);
+    n.writeUInt32LE(b.length);
+    return Buffer.concat([n, b]);
+  };
+  return Buffer.concat([
+    prefix,
+    string('Token'),
+    string('TOK'),
+    string('ipfs://test-metadata'),
+    Buffer.alloc(4),
+  ]);
+}
 describe('production account facts', () => {
+  it('accepts Token-2022 metadata-only mints and the current SOL curve layout', async () => {
+    const current = Buffer.alloc(166);
+    Buffer.from(curve().data[0], 'base64').copy(current);
+    current[124] = 1; // Holder rewards do not alter trading reserves.
+    current.writeBigUInt64LE(123n, 125);
+    current.writeBigUInt64LE(456n, 133);
+    current.writeBigUInt64LE(30000000000n, 142);
+    const result = await source([
+      account(current, config.pumpProgram),
+      extendedMint([
+        [18, Buffer.alloc(64)],
+        [19, metadata()],
+      ]),
+    ]).capture(target);
+    expect(result.raw['paperExecution']).toMatchObject({
+      verified: true,
+      tradable: true,
+      sellable: true,
+    });
+  });
+  it.each([1, 3, 6, 9, 10, 12, 14, 25, 26, 99])(
+    'rejects unmodelled mint extension %s',
+    async (type) => {
+      await expect(
+        source([curve(), extendedMint([[type, Buffer.alloc(64)]])]).capture(target)
+      ).rejects.toThrow('Unsupported Token-2022');
+    }
+  );
+  it('rejects duplicate, truncated, wrong-type and spoofed Token-2022 metadata', async () => {
+    const spoofed = metadata();
+    spoofed[32] = 9;
+    const good = extendedMint([
+      [18, Buffer.alloc(64)],
+      [19, metadata()],
+    ]);
+    const variants = [
+      extendedMint([
+        [18, Buffer.alloc(64)],
+        [18, Buffer.alloc(64)],
+      ]),
+      extendedMint([[19, spoofed]]),
+      change(good, (d) => {
+        d[165] = 2;
+      }),
+      change(good, (d) => {
+        d[82] = 1;
+      }),
+      change(good, (d) => {
+        d.writeUInt16LE(65535, 168);
+      }),
+    ];
+    for (const variant of variants)
+      await expect(source([curve(), variant]).capture(target)).rejects.toThrow();
+  });
+  it.each([81, 82, 83, 115, 123, 124, 141, 150, 158])(
+    'rejects unsupported current curve mode at byte %s',
+    async (offset) => {
+      const current = Buffer.alloc(166);
+      Buffer.from(curve().data[0], 'base64').copy(current);
+      current[offset] = offset == 124 ? 2 : 1;
+      await expect(
+        source([account(current, config.pumpProgram), mint()]).capture(target)
+      ).rejects.toThrow('Unsupported bonding curve');
+    }
+  );
   it('preserves exact integer reserves, account evidence and slot time', async () => {
     const result = await source([curve(), mint()]).capture(target);
     expect(result.observedAt.toISOString()).toBe('1970-01-01T00:16:41.000Z');
@@ -174,16 +275,26 @@ describe('production account facts', () => {
     wsol.copy(pool, 75);
     Buffer.alloc(32, 6).copy(pool, 139);
     Buffer.alloc(32, 7).copy(pool, 171);
-    const vault = (base: Buffer): RpcAccount => {
+    const vault = (base: Buffer, extended = false, extension = 7): RpcAccount => {
       const data = Buffer.alloc(165);
       base.copy(data);
       Buffer.alloc(32, 5).copy(data, 32);
       data.writeBigUInt64LE(100000n, 64);
       data[108] = 1;
-      return account(data, mint().owner);
+      if (!extended) return account(data, mint().owner);
+      const framed = Buffer.alloc(170);
+      data.copy(framed);
+      framed[165] = 2;
+      framed.writeUInt16LE(extension, 166);
+      return account(framed, token2022);
     };
     const global = programAccount('GlobalConfig', 321);
-    const run = async (changed = false): Promise<Record<string, unknown>> => {
+    const run = async (
+      changed = false,
+      extended = false,
+      extension = 7,
+      wrongOwner = false
+    ): Promise<Record<string, unknown>> => {
       let count = 0;
       const adapter = new SolanaExecutionFactsSource(
         (method): Promise<unknown> => {
@@ -198,8 +309,13 @@ describe('production account facts', () => {
                 ? [account(pool, config.swapProgram)]
                 : [
                     account(finalPool, config.swapProgram),
-                    mint(),
-                    vault(Buffer.alloc(32, 4)),
+                    extended
+                      ? extendedMint([
+                          [18, Buffer.alloc(64)],
+                          [19, metadata()],
+                        ])
+                      : mint(),
+                    vault(Buffer.alloc(32, 4), extended && !wrongOwner, extension),
                     vault(wsol),
                     account(global, config.swapProgram),
                   ],
@@ -211,6 +327,12 @@ describe('production account facts', () => {
       return (await adapter.capture({ ...target, venue: 'pumpswap' })).raw;
     };
     expect((await run())['paperExecution']).toMatchObject({ sellable: true, tradable: true });
+    expect((await run(false, true))['paperExecution']).toMatchObject({
+      sellable: true,
+      tradable: true,
+    });
+    await expect(run(false, true, 8)).rejects.toThrow('Unsupported Token-2022 vault extension');
+    await expect(run(false, true, 7, true)).rejects.toThrow('unexpected account owner');
     global[56] = 16;
     expect((await run())['paperExecution']).toMatchObject({ sellable: false });
     await expect(run(true)).rejects.toThrow('identity changed');

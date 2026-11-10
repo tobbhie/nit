@@ -1,7 +1,11 @@
 import { RawData, WebSocket as WebSocketClient } from 'ws';
 import { Result, failure, success } from '@nit/domain';
-import { ReconciliationDiscovery, SolanaMarketOccurrenceRepository } from './reconciliation';
-import { SolanaConfirmedTransactionSource } from './solana-rpc';
+import {
+  ReconciledMarketOccurrence,
+  ReconciliationDiscovery,
+  SolanaMarketOccurrenceRepository,
+} from './reconciliation';
+import { SolanaConfirmedTransactionSource, SolanaRpcReconciliationSource } from './solana-rpc';
 
 export interface ConfirmedIngestionSummary {
   signature: string;
@@ -23,8 +27,15 @@ export class SolanaConfirmedOccurrenceIngestor {
   async ingest(signature: string, slot: number): Promise<Result<ConfirmedIngestionSummary, Error>> {
     const fetched = await this.source.fetchConfirmedTransaction(signature, slot);
     if (fetched.kind === 'failure') return fetched;
+    return this.apply(signature, slot, fetched.value);
+  }
 
-    for (const occurrence of fetched.value) {
+  async apply(
+    signature: string,
+    slot: number,
+    fetched: readonly ReconciledMarketOccurrence[]
+  ): Promise<Result<ConfirmedIngestionSummary, Error>> {
+    for (const occurrence of fetched) {
       const recorded = await this.occurrences.record(
         this.source.chain,
         this.source.launchSource,
@@ -33,10 +44,10 @@ export class SolanaConfirmedOccurrenceIngestor {
       if (recorded.kind === 'failure') return recorded;
     }
 
-    const launches = fetched.value.flatMap((occurrence) =>
+    const launches = fetched.flatMap((occurrence) =>
       occurrence.kind === 'launch' ? [occurrence.launch] : []
     );
-    const graduations = fetched.value.flatMap((occurrence) =>
+    const graduations = fetched.flatMap((occurrence) =>
       occurrence.kind === 'graduation' ? [occurrence.graduation] : []
     );
     const origin = { chain: this.source.chain, launchSource: this.source.launchSource };
@@ -54,11 +65,76 @@ export class SolanaConfirmedOccurrenceIngestor {
     return success({
       signature,
       slot,
-      fetched: fetched.value.length,
+      fetched: fetched.length,
       discovered: launchOutcome.discovered.length,
       graduated: graduationOutcome.graduated.length,
       duplicates: launchOutcome.duplicates.length + graduationOutcome.duplicates.length,
     });
+  }
+}
+
+export type PreparedConfirmedIngestion = (() => Promise<
+  Result<ConfirmedIngestionSummary, Error>
+>) & {
+  /** Decoded mint identities; absence retains the legacy global write order. */
+  keys?: readonly string[];
+};
+export interface ConfirmedNotificationIngestor {
+  ingest(signature: string, slot: number): Promise<Result<ConfirmedIngestionSummary, Error>>;
+  prepare?(signature: string, slot: number): Promise<Result<PreparedConfirmedIngestion, Error>>;
+}
+
+/** One HTTP read, multiple decoders; preparation performs no database writes. */
+export class SolanaConfirmedProgramIngestor implements ConfirmedNotificationIngestor {
+  constructor(
+    private readonly targets: readonly {
+      source: Pick<
+        SolanaRpcReconciliationSource,
+        'readConfirmedTransaction' | 'decodeConfirmedTransaction'
+      >;
+      ingestor: Pick<SolanaConfirmedOccurrenceIngestor, 'apply'>;
+    }[]
+  ) {
+    if (targets.length === 0) throw new Error('At least one lifecycle decoder is required');
+  }
+  async prepare(
+    signature: string,
+    slot: number
+  ): Promise<Result<PreparedConfirmedIngestion, Error>> {
+    const transaction = await this.targets[0]!.source.readConfirmedTransaction(signature, slot);
+    if (transaction.kind === 'failure') return transaction;
+    const decoded: (readonly ReconciledMarketOccurrence[])[] = [];
+    for (const target of this.targets) {
+      const result = target.source.decodeConfirmedTransaction(signature, slot, transaction.value);
+      if (result.kind === 'failure') return result;
+      decoded.push(result.value);
+    }
+    const apply: PreparedConfirmedIngestion = async () => {
+      const combined = { signature, slot, fetched: 0, discovered: 0, graduated: 0, duplicates: 0 };
+      for (const [index, target] of this.targets.entries()) {
+        const result = await target.ingestor.apply(signature, slot, decoded[index]!);
+        if (result.kind === 'failure') return result;
+        combined.fetched += result.value.fetched;
+        combined.discovered += result.value.discovered;
+        combined.graduated += result.value.graduated;
+        combined.duplicates += result.value.duplicates;
+      }
+      return success(combined);
+    };
+    apply.keys = [
+      ...new Set(
+        decoded.flatMap((items) =>
+          items.map((item) =>
+            item.kind === 'launch' ? item.launch.address : item.graduation.address
+          )
+        )
+      ),
+    ];
+    return success(apply);
+  }
+  async ingest(signature: string, slot: number): Promise<Result<ConfirmedIngestionSummary, Error>> {
+    const prepared = await this.prepare(signature, slot);
+    return prepared.kind === 'failure' ? prepared : prepared.value();
   }
 }
 
@@ -106,7 +182,7 @@ export type SolanaWebSocketFactory = (endpoint: string) => SolanaWebSocketConnec
 export interface SolanaConfirmedLogSubscriberOptions {
   endpoint: string;
   programAddress: string;
-  ingestor: Pick<SolanaConfirmedOccurrenceIngestor, 'ingest'>;
+  ingestor: ConfirmedNotificationIngestor;
   connectionFactory?: SolanaWebSocketFactory;
   reconnectBaseMs?: number;
   reconnectMaxMs?: number;
@@ -115,6 +191,8 @@ export interface SolanaConfirmedLogSubscriberOptions {
   onIngested?: (summary: ConfirmedIngestionSummary) => void;
   onError?: (error: Error) => void;
   maxPendingNotifications?: number;
+  maxConcurrentPreparations?: number;
+  maxConcurrentCommits?: number;
   notificationFilter?: (message: unknown) => boolean;
 }
 
@@ -122,7 +200,7 @@ export interface SolanaConfirmedLogSubscriberOptions {
 export class SolanaConfirmedLogSubscriber {
   private readonly endpoint: string;
   private readonly programAddress: string;
-  private readonly ingestor: Pick<SolanaConfirmedOccurrenceIngestor, 'ingest'>;
+  private readonly ingestor: ConfirmedNotificationIngestor;
   private readonly connectionFactory: SolanaWebSocketFactory;
   private readonly reconnectBaseMs: number;
   private readonly reconnectMaxMs: number;
@@ -140,6 +218,13 @@ export class SolanaConfirmedLogSubscriber {
   private overflows = 0;
   private errors = 0;
   private readonly maxPending: number;
+  private readonly maxPreparations: number;
+  private activePreparations = 0;
+  private readonly preparationQueue: (() => void)[] = [];
+  private readonly maxCommits: number;
+  private activeCommits = 0;
+  private readonly commitQueue: (() => void)[] = [];
+  private readonly commitTails = new Map<string, Promise<void>>();
   private readonly notificationFilter: ((message: unknown) => boolean) | undefined;
 
   constructor(options: SolanaConfirmedLogSubscriberOptions) {
@@ -158,6 +243,14 @@ export class SolanaConfirmedLogSubscriber {
     this.onError = options.onError;
     this.maxPending = positive(options.maxPendingNotifications, 128, 'notification backlog');
     if (this.maxPending > 10000) throw new Error('Notification backlog limit exceeds hard cap');
+    this.maxPreparations = positive(
+      options.maxConcurrentPreparations,
+      4,
+      'preparation concurrency'
+    );
+    if (this.maxPreparations > 16) throw new Error('Preparation concurrency exceeds hard cap');
+    this.maxCommits = positive(options.maxConcurrentCommits, 2, 'commit concurrency');
+    if (this.maxCommits > 16) throw new Error('Commit concurrency exceeds hard cap');
     this.notificationFilter = options.notificationFilter;
   }
   getStats(): { pending: number; filtered: number; overflows: number; errors: number } {
@@ -268,24 +361,100 @@ export class SolanaConfirmedLogSubscriber {
     }
     const notification = parsed.value;
     this.pending++;
+    const prepared = this.prepare(notification);
     this.tail = this.tail
       .then(async () => {
-        const ingested = await this.ingestor.ingest(notification.signature, notification.slot);
-        if (ingested.kind === 'failure') {
-          this.report(ingested.error);
-          if (this.connection === connection) this.disconnect(connection);
-          return;
-        }
-        this.onIngested?.(ingested.value);
-        if (this.connection === connection) this.reconnectAttempt = 0;
+        const preparation = await prepared;
+        // Dispatch in notification order. Only writes touching the same mint wait
+        // for one another; empty decodes do not occupy a database commit slot.
+        void (
+          preparation.kind === 'failure'
+            ? Promise.resolve(preparation)
+            : this.commit(preparation.value)
+        )
+          .then((ingested) => {
+            if (ingested.kind === 'failure') {
+              this.report(ingested.error);
+              if (this.connection === connection) this.disconnect(connection);
+            } else {
+              this.onIngested?.(ingested.value);
+              if (this.connection === connection) this.reconnectAttempt = 0;
+            }
+          })
+          .catch(() => {
+            this.report(new Error('Confirmed ingestion handler failed; reconciliation required'));
+            if (this.connection === connection) this.disconnect(connection);
+          })
+          .finally(() => {
+            this.pending--;
+          });
       })
       .catch(() => {
         this.report(new Error('Confirmed ingestion handler failed; reconciliation required'));
         if (this.connection === connection) this.disconnect(connection);
-      })
-      .finally(() => {
         this.pending--;
       });
+  }
+
+  private commit(
+    prepared: PreparedConfirmedIngestion
+  ): Promise<Result<ConfirmedIngestionSummary, Error>> {
+    const keys = [...new Set(prepared.keys ?? ['*'])];
+    if (keys.length === 0) return Promise.resolve().then(prepared);
+    const predecessors = keys.includes('*')
+      ? [...this.commitTails.values()]
+      : [...keys.map((key) => this.commitTails.get(key)), this.commitTails.get('*')];
+    const committed = Promise.all(predecessors).then(
+      () =>
+        new Promise<Result<ConfirmedIngestionSummary, Error>>((resolve, reject) => {
+          const run = (): void => {
+            this.activeCommits++;
+            void Promise.resolve()
+              .then(prepared)
+              .then(resolve, reject)
+              .finally(() => {
+                this.activeCommits--;
+                this.commitQueue.shift()?.();
+              });
+          };
+          if (this.activeCommits < this.maxCommits) run();
+          else this.commitQueue.push(run);
+        })
+    );
+    const settled = committed.then(
+      () => undefined,
+      () => undefined
+    );
+    for (const key of keys) this.commitTails.set(key, settled);
+    void settled.then(() => {
+      for (const key of keys)
+        if (this.commitTails.get(key) === settled) this.commitTails.delete(key);
+    });
+    return committed;
+  }
+
+  private prepare(
+    notification: ConfirmedLogNotification
+  ): Promise<Result<PreparedConfirmedIngestion, Error>> {
+    return new Promise((resolve) => {
+      const run = (): void => {
+        this.activePreparations++;
+        void Promise.resolve()
+          .then(() =>
+            this.ingestor.prepare === undefined
+              ? success(() => this.ingestor.ingest(notification.signature, notification.slot))
+              : this.ingestor.prepare(notification.signature, notification.slot)
+          )
+          .catch(() => failure(new Error('Confirmed transaction preparation failed')))
+          .then(resolve)
+          .finally(() => {
+            this.activePreparations--;
+            this.preparationQueue.shift()?.();
+          });
+      };
+      if (this.activePreparations < this.maxPreparations) run();
+      else this.preparationQueue.push(run);
+    });
   }
 
   private disconnect(connection: SolanaWebSocketConnection): void {

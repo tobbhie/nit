@@ -4,6 +4,7 @@ import { encodeBase58 } from './pump-events';
 
 export const EXECUTION_FACTS_SOURCE = 'solana-account-facts:v1';
 const TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 const WSOL = 'So11111111111111111111111111111111111111112';
 const Address = z.string().regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
 export const ExecutionFactsConfigSchema = z
@@ -71,7 +72,7 @@ export class SolanaExecutionFactsSource {
       throw new Error('RPC account context is stale or in the future');
     const occurredAt = new Date(blockTime * 1000);
     const observedAt = new Date(this.clock());
-    const mint = legacyMint(batch.value[1]);
+    const mint = tokenMint(batch.value[1], target.mint);
     const risk = mint.readUInt32LE(0) !== 0 || mint.readUInt32LE(46) !== 0;
     let token: bigint;
     let cash: bigint;
@@ -81,9 +82,7 @@ export class SolanaExecutionFactsSource {
     let sellable = true;
     if (target.venue === 'pump_fun_bonding_curve') {
       const curve = owned(batch.value[0], this.config.pumpProgram, 'BondingCurve');
-      // Legacy SOL curves only. New quote/reward layouts require a new model version.
-      if (![49, 81, 82, 83].includes(curve.length) || curve.subarray(81).some((byte) => byte !== 0))
-        throw new Error('Unsupported bonding curve account layout or mode');
+      validateCurve(curve);
       token = curve.readBigUInt64LE(8);
       cash = curve.readBigUInt64LE(16);
       realToken = curve.readBigUInt64LE(24);
@@ -105,8 +104,8 @@ export class SolanaExecutionFactsSource {
         key(pool, 171) !== addresses[3]
       )
         throw new Error('Pool mint or vault identity changed');
-      token = vault(batch.value[2], target.mint, target.marketAddress);
-      cash = vault(batch.value[3], WSOL, target.marketAddress);
+      token = vault(batch.value[2], target.mint, target.marketAddress, batch.value[1]!.owner);
+      cash = vault(batch.value[3], WSOL, target.marketAddress, TOKEN_PROGRAM);
       realToken = token;
       realCash = cash;
       const global = owned(batch.value[4], this.config.swapProgram, 'GlobalConfig');
@@ -123,7 +122,7 @@ export class SolanaExecutionFactsSource {
         contextSlot: batch.context.slot,
         addresses,
         accounts: batch.value,
-        checks: 'legacy-token-owner-mint-authorities-vaults-and-supported-layout',
+        checks: 'token-owner-mint-authorities-metadata-only-extensions-vaults-and-supported-layout',
         limitations: [
           'not-a-sell-simulation',
           'not-holder-or-bundle-risk-analysis',
@@ -178,10 +177,27 @@ function owned(account: RpcAccount | null | undefined, owner: string, name: stri
     throw new Error('Unknown program account discriminator');
   return data;
 }
-function legacyMint(account: RpcAccount | null | undefined): Buffer {
-  const data = bytes(account, TOKEN_PROGRAM);
+function tokenMint(account: RpcAccount | null | undefined, mintAddress: string): Buffer {
+  const owner = account?.owner;
+  if (owner !== TOKEN_PROGRAM && owner !== TOKEN_2022_PROGRAM)
+    throw new Error('Unsupported token program');
+  const data = bytes(account, owner);
+  if (owner === TOKEN_PROGRAM && data.length !== 82)
+    throw new Error('Unsupported token mint layout');
+  if (owner === TOKEN_2022_PROGRAM) {
+    const extensions = tokenExtensions(data, 82, 1);
+    for (const [type, value] of extensions) {
+      // Only metadata extensions: no fees, hooks, delegates, pauses or scaled amounts.
+      if (type === 18 && value.length === 64) continue;
+      if (type === 19) {
+        validateTokenMetadata(value, mintAddress);
+        continue;
+      }
+      throw new Error('Unsupported Token-2022 mint extension');
+    }
+  }
   if (
-    data.length !== 82 ||
+    data.length < 82 ||
     data[45] !== 1 ||
     (data[44] as number) > 18 ||
     ![0, 1].includes(data.readUInt32LE(0)) ||
@@ -190,10 +206,39 @@ function legacyMint(account: RpcAccount | null | undefined): Buffer {
     throw new Error('Unsupported or uninitialized token mint');
   return data;
 }
-function vault(account: RpcAccount | null | undefined, mint: string, authority: string): bigint {
-  const data = bytes(account, TOKEN_PROGRAM);
+
+function validateCurve(curve: Buffer): void {
+  // Current Pump IDL: SOL/default quote, ordinary constant-product reserves only.
+  // The 150-byte allocation predates the final post-completion fields (166 bytes).
+  if (![49, 81, 82, 83, 150, 166].includes(curve.length))
+    throw new Error('Unsupported bonding curve account layout or mode');
+  if ((curve[81] ?? 0) !== 0 || (curve[82] ?? 0) !== 0)
+    throw new Error('Unsupported bonding curve account layout or mode');
   if (
-    data.length !== 165 ||
+    curve.length >= 150 &&
+    (curve.subarray(83, 124).some((v) => v !== 0) ||
+      (curve[124] ?? 0) > 1 ||
+      curve[141] !== 0 ||
+      curve.subarray(150).some((v) => v !== 0))
+  )
+    throw new Error('Unsupported bonding curve quote, flags or depth mode');
+}
+function vault(
+  account: RpcAccount | null | undefined,
+  mint: string,
+  authority: string,
+  owner: string
+): bigint {
+  const data = bytes(account, owner);
+  if (owner === TOKEN_2022_PROGRAM) {
+    for (const [type, value] of tokenExtensions(data, 165, 2)) {
+      if (type !== 7 || value.length !== 0)
+        throw new Error('Unsupported Token-2022 vault extension');
+    }
+  } else if (owner !== TOKEN_PROGRAM || data.length !== 165)
+    throw new Error('Unsupported token vault layout');
+  if (
+    data.length < 165 ||
     key(data, 0) !== mint ||
     key(data, 32) !== authority ||
     data[108] !== 1 ||
@@ -202,6 +247,63 @@ function vault(account: RpcAccount | null | undefined, mint: string, authority: 
   )
     throw new Error('Invalid, frozen, delegated or closable pool vault');
   return data.readBigUInt64LE(64);
+}
+
+/** Token-2022 keeps the legacy prefix, zero mint padding, account type and u16 TLVs. */
+function tokenExtensions(
+  data: Buffer,
+  baseLength: number,
+  accountType: number
+): Map<number, Buffer> {
+  const result = new Map<number, Buffer>();
+  if (data.length === baseLength) return result;
+  if (
+    data.length < 166 ||
+    data.length === 355 ||
+    data[165] !== accountType ||
+    data.subarray(baseLength, 165).some((v) => v !== 0)
+  )
+    throw new Error('Malformed Token-2022 account framing');
+  let offset = 166;
+  while (offset < data.length) {
+    if (data.subarray(offset).every((v) => v === 0)) break;
+    if (offset + 4 > data.length) throw new Error('Truncated Token-2022 extension');
+    const type = data.readUInt16LE(offset);
+    const length = data.readUInt16LE(offset + 2);
+    offset += 4;
+    if (type === 0 || result.has(type) || offset + length > data.length)
+      throw new Error('Malformed Token-2022 extension');
+    result.set(type, data.subarray(offset, offset + length));
+    offset += length;
+  }
+  return result;
+}
+
+function validateTokenMetadata(value: Buffer, mintAddress: string): void {
+  if (value.length < 64 || key(value, 32) !== mintAddress)
+    throw new Error('Token metadata mint mismatch');
+  let offset = 64;
+  const string = (): void => {
+    if (offset + 4 > value.length) throw new Error('Truncated token metadata');
+    const length = value.readUInt32LE(offset);
+    offset += 4;
+    if (length > 16384 || offset + length > value.length)
+      throw new Error('Invalid token metadata string');
+    new TextDecoder('utf-8', { fatal: true }).decode(value.subarray(offset, offset + length));
+    offset += length;
+  };
+  string();
+  string();
+  string();
+  if (offset + 4 > value.length) throw new Error('Truncated token metadata');
+  const count = value.readUInt32LE(offset);
+  offset += 4;
+  if (count > 64) throw new Error('Token metadata field limit exceeded');
+  for (let i = 0; i < count; i++) {
+    string();
+    string();
+  }
+  if (offset !== value.length) throw new Error('Unexpected token metadata trailing bytes');
 }
 function key(data: Buffer, offset: number): string {
   if (data.length < offset + 32) throw new Error('Truncated public key');
