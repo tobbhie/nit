@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ObservationProvider, Result, failure, success } from '@nit/domain';
+import { ObservationProvider, MediaType, Result, failure, success } from '@nit/domain';
 import { AuthorFetchRequest, ObservationSourceAdapter, SourcePost } from './contracts';
 
 const id = z.string().regex(/^\d{1,30}$/);
@@ -25,11 +25,39 @@ const Post = z
     created_at: z.string().datetime(),
     text: z.string().max(16000),
     referenced_tweets: z.array(z.object({ type: z.string(), id })).optional(),
+    attachments: z
+      .object({ media_keys: z.array(z.string().min(1).max(100)).max(4).optional() })
+      .optional(),
   })
   .passthrough();
 const Page = z.object({
   data: z.array(Post).max(100).optional(),
   errors: z.array(z.unknown()).optional(),
+  includes: z
+    .object({
+      media: z
+        .array(
+          z.object({
+            media_key: z.string().min(1).max(100),
+            type: z.enum(['photo', 'video', 'animated_gif']),
+            url: z.string().url().optional(),
+            duration_ms: z.number().int().nonnegative().optional(),
+            variants: z
+              .array(
+                z.object({
+                  content_type: z.string(),
+                  bit_rate: z.number().nonnegative().optional(),
+                  url: z.string().url(),
+                })
+              )
+              .max(32)
+              .optional(),
+          })
+        )
+        .max(400)
+        .optional(),
+    })
+    .optional(),
   meta: z.object({ next_token: z.string().max(2000).optional() }),
 });
 export interface XSourceOptions {
@@ -78,7 +106,9 @@ export class XObservationSource implements ObservationSourceAdapter {
         if (this.options.signal?.aborted === true) throw new Error('X capture stopped');
         const url = new URL(`https://api.x.com/2/users/${request.authorId}/tweets`);
         url.searchParams.set('max_results', '100');
-        url.searchParams.set('tweet.fields', 'author_id,created_at,referenced_tweets');
+        url.searchParams.set('tweet.fields', 'author_id,created_at,referenced_tweets,attachments');
+        url.searchParams.set('expansions', 'attachments.media_keys');
+        url.searchParams.set('media.fields', 'media_key,type,url,duration_ms,variants');
         if (request.sinceProviderPostId !== undefined)
           url.searchParams.set('since_id', request.sinceProviderPostId);
         else if (request.since !== undefined)
@@ -98,8 +128,32 @@ export class XObservationSource implements ObservationSourceAdapter {
             authorId: post.author_id,
             publishedAt: new Date(post.created_at),
             text: post.text,
-            media: [],
-            raw: post,
+            media: (post.attachments?.media_keys ?? []).map((key) => {
+              const attachment = page.includes?.media?.find((m) => m.media_key === key);
+              if (attachment === undefined) throw new Error('Incomplete X media expansion');
+              const sourceUrl =
+                attachment.type === 'photo'
+                  ? attachment.url
+                  : attachment.variants
+                      ?.filter((v) => v.content_type === 'video/mp4')
+                      .sort((a, b) => (a.bit_rate ?? 0) - (b.bit_rate ?? 0))[0]?.url;
+              if (sourceUrl === undefined) throw new Error('Unavailable X media resource');
+              return {
+                providerMediaKey: key,
+                mediaType: attachment.type === 'photo' ? MediaType.IMAGE : MediaType.VIDEO,
+                sourceUrl,
+                ...(attachment.duration_ms === undefined
+                  ? {}
+                  : { durationMs: attachment.duration_ms }),
+              };
+            }),
+            raw: {
+              ...post,
+              media_expansions:
+                page.includes?.media?.filter((m) =>
+                  post.attachments?.media_keys?.includes(m.media_key)
+                ) ?? [],
+            },
             ...(post.referenced_tweets?.find((reference) => reference.type === 'quoted') ===
             undefined
               ? {}

@@ -6,7 +6,9 @@ import {
   normalized,
   phrase,
   subjectKey,
+  MediaRepresentationSchema,
 } from './contracts';
+import { z } from 'zod';
 
 export interface InterpretedSource {
   source: SourceText;
@@ -22,6 +24,8 @@ export interface NarrativeGroup {
   startsAt: Date;
   expiresAt: Date;
   sources: InterpretedSource[];
+  memberIds?: string[];
+  previousGroupKey?: string | null;
 }
 export interface TokenFacts {
   mint: string;
@@ -29,6 +33,15 @@ export interface TokenFacts {
   ticker: string;
   launchTime: Date;
   discoveredAt: Date;
+  representation?: TextExtraction['representation'];
+  mediaRepresentations?: z.infer<typeof MediaRepresentationSchema>[];
+  enrichmentEvidence?: {
+    tokenId: string;
+    extractorHash: string;
+    inputHash: string;
+    availableAt: string;
+    payloadHash: string;
+  };
 }
 export interface ScoredNarrative {
   narrativeStrengthBps: number;
@@ -46,10 +59,45 @@ export interface ScoredNarrative {
       directReference: number;
       temporal: number;
       contradiction: number;
+      semantic: number;
+      visual: number;
+      ocr: number;
+      transcript: number;
     };
     launchRelation: 'PRE_CATALYST_LAUNCH' | 'POST_CATALYST_LAUNCH';
+    enrichmentEvidence?: TokenFacts['enrichmentEvidence'];
   }[];
   overflow: boolean;
+}
+export function topicInGroup(
+  input: InterpretedSource,
+  topic: TextExtraction['topics'][number],
+  group: NarrativeGroup,
+  policy: NarrativePolicy
+): boolean {
+  return group.memberIds === undefined
+    ? subjectKey(topic.subjectQuote, policy).key === group.subject.key &&
+        normalized(topic.catalystQuote) === group.catalystKey
+    : group.memberIds.includes(evidenceHash({ artifact: input.artifactId, topic }));
+}
+function similarity(a: readonly number[], b: readonly number[]): number {
+  if (a.length !== b.length) return 0;
+  const norm = Math.sqrt(a.reduce((n, v) => n + v * v, 0) * b.reduce((n, v) => n + v * v, 0));
+  return norm === 0
+    ? 0
+    : Math.max(
+        0,
+        Math.min(10000, Math.round((a.reduce((n, v, i) => n + v * b[i]!, 0) / norm) * 10000))
+      );
+}
+function dhashSimilarity(a: string, b: string): number {
+  let bits = BigInt(`0x${a}`) ^ BigInt(`0x${b}`);
+  let count = 0;
+  while (bits !== 0n) {
+    count++;
+    bits &= bits - 1n;
+  }
+  return Math.floor(((64 - count) * 10000) / 64);
 }
 
 export function groupSources(
@@ -101,7 +149,19 @@ function independent(input: readonly InterpretedSource[]): InterpretedSource[][]
     if (item.source.derivativeIds.length > 0 || !item.novel) continue;
     const keys = new Set([
       `author:${item.source.provider}:${item.source.authorId}`,
-      `content:${evidenceHash(normalized(item.source.text))}`,
+      `content:${evidenceHash(
+        normalized(
+          item.source.text.trim() === ''
+            ? (item.extraction.mediaRepresentations ?? [])
+                .map((m) => m.sha256)
+                .sort()
+                .join(' ')
+            : item.source.text
+        )
+      )}`,
+      ...(item.extraction.mediaRepresentations ?? []).flatMap((m) =>
+        [m.sha256, ...m.frameHashes].map((h) => `media:${h}`)
+      ),
     ]);
     const sources = [item];
     for (let i = groups.length - 1; i >= 0; i--) {
@@ -117,10 +177,15 @@ function independent(input: readonly InterpretedSource[]): InterpretedSource[][]
   return groups.map((g) => g.sources);
 }
 const scaled = (n: number, d: number): number => Math.min(10000, Math.floor((n * 10000) / d));
-function weighted(features: Record<string, number>, weights: Record<string, number>): number {
+function weighted(
+  features: Record<string, number>,
+  weights: Record<string, number | undefined>
+): number {
   return Math.floor(
-    Object.entries(weights).reduce((sum, [key, weight]) => sum + (features[key] ?? 0) * weight, 0) /
-      10000
+    Object.entries(weights).reduce(
+      (sum, [key, weight]) => sum + (features[key] ?? 0) * (weight ?? 0),
+      0
+    ) / 10000
   );
 }
 function containsMint(text: string, mint: string): boolean {
@@ -138,12 +203,7 @@ export function scoreGroup(
     (s) => s.source.publishedAt.getTime() + policy.attentionWindowMs > asOf.getTime()
   );
   const stance = (item: InterpretedSource, value: string): boolean =>
-    item.extraction.topics.some(
-      (t) =>
-        subjectKey(t.subjectQuote, policy).key === group.subject.key &&
-        normalized(t.catalystQuote) === group.catalystKey &&
-        t.stance === value
-    );
+    item.extraction.topics.some((t) => topicInGroup(item, t, group, policy) && t.stance === value);
   const support = available.filter((s) => stance(s, 'support'));
   const contradicts = available.some((s) => stance(s, 'contradiction'));
   const roots = independent(support);
@@ -184,27 +244,34 @@ export function scoreGroup(
   const candidates: ScoredNarrative['candidates'] = [];
   const contexts = available.flatMap((s) =>
     s.extraction.topics
-      .filter(
-        (t) =>
-          subjectKey(t.subjectQuote, policy).key === group.subject.key &&
-          normalized(t.catalystQuote) === group.catalystKey
-      )
+      .filter((t) => topicInGroup(s, t, group, policy))
       .map((t) => ({
         text: t.contextQuote,
+        modality:
+          t.evidenceId === undefined
+            ? 'text'
+            : s.extraction.mediaEvidence?.find((e) => e.id === t.evidenceId)?.modality,
+        meaning: t.meaning,
+        media: (s.extraction.mediaRepresentations ?? []).filter((m) =>
+          t.evidenceId === undefined
+            ? s.extraction.topics.length === 1
+            : s.extraction.mediaEvidence?.some(
+                (e) => e.id === t.evidenceId && e.mediaId === m.mediaId
+              )
+        ),
         support: t.stance === 'support',
         ambiguous: s.extraction.topics.some(
           (other) =>
-            normalized(other.catalystQuote) !== group.catalystKey &&
-            t.contextQuote.includes(other.catalystQuote)
+            !topicInGroup(s, other, group, policy) && t.contextQuote.includes(other.catalystQuote)
         ),
       }))
   );
   const catalyst = times.length === 0 ? group.startsAt.getTime() : Math.min(...times);
   for (const token of tokens) {
     if (token.discoveredAt > asOf) throw new Error('Future token evidence');
-    const direct = contexts.some((c) => containsMint(c.text, token.mint));
+    const direct = contexts.some((c) => c.modality === 'text' && containsMint(c.text, token.mint));
     const supportedDirect = contexts.some(
-      (c) => c.support && !c.ambiguous && containsMint(c.text, token.mint)
+      (c) => c.modality === 'text' && c.support && !c.ambiguous && containsMint(c.text, token.mint)
     );
     const exact = contexts.some((c) => phrase(c.text, token.name));
     const ticker = contexts.some((c) =>
@@ -213,7 +280,55 @@ export function scoreGroup(
       )
     );
     const identity = group.subject.aliases.some((alias) => phrase(token.name, alias));
-    if (!direct && !exact && !ticker && !identity) continue;
+    const sourceMedia = contexts.flatMap((c) => c.media);
+    const tokenMedia = token.mediaRepresentations ?? [];
+    const samePixels = (
+      a: z.infer<typeof MediaRepresentationSchema>,
+      b: z.infer<typeof MediaRepresentationSchema>
+    ): boolean => a.sha256 === b.sha256 || a.frameHashes.some((h) => b.frameHashes.includes(h));
+    const exactVisual = sourceMedia.some((a) => tokenMedia.some((b) => samePixels(a, b)));
+    const supportedVisual = contexts.some(
+      (c) =>
+        c.support && !c.ambiguous && c.media.some((a) => tokenMedia.some((b) => samePixels(a, b)))
+    );
+    const visual = exactVisual
+      ? 10000
+      : Math.max(
+          0,
+          ...sourceMedia.flatMap((a) =>
+            a.dhashes.flatMap((h) =>
+              tokenMedia.flatMap((b) =>
+                b.decoderVersion === a.decoderVersion
+                  ? b.dhashes.map((j) => dhashSimilarity(h, j))
+                  : []
+              )
+            )
+          )
+        );
+    const sem = policy.semantics;
+    const semantic =
+      token.representation?.modelVersion === sem?.modelVersion
+        ? Math.max(
+            0,
+            ...contexts.map((c) =>
+              c.meaning?.modelVersion === sem?.modelVersion && c.meaning !== undefined
+                ? similarity(c.meaning.vector, token.representation!.vector)
+                : 0
+            )
+          )
+        : 0;
+    const retrievedSemantic = sem !== undefined && semantic >= sem.retrievalBps;
+    const retrievedVisual = sem !== undefined && visual >= sem.visualMatchBps;
+    if (
+      !direct &&
+      !exact &&
+      !ticker &&
+      !identity &&
+      !retrievedSemantic &&
+      !exactVisual &&
+      !retrievedVisual
+    )
+      continue;
     const vector = {
       lexical: exact ? 10000 : ticker ? 5000 : 0,
       identity: identity ? 10000 : 0,
@@ -223,20 +338,36 @@ export function scoreGroup(
         10000 - scaled(Math.abs(token.launchTime.getTime() - catalyst), policy.temporalWindowMs)
       ),
       contradiction: contradicts ? 10000 : 0,
+      semantic,
+      visual,
+      ocr: contexts.some(
+        (c) =>
+          c.modality === 'ocr' && (phrase(c.text, token.name) || containsMint(c.text, token.mint))
+      )
+        ? 10000
+        : 0,
+      transcript: contexts.some((c) => c.modality === 'transcript' && phrase(c.text, token.name))
+        ? 10000
+        : 0,
     };
     const { contradiction, ...positive } = policy.linkWeights;
     let score = Math.max(
       0,
       weighted(vector, positive) - Math.floor((vector.contradiction * contradiction) / 10000)
     );
-    if (!direct) score = Math.min(score, policy.lexicalOnlyCapBps);
+    if (!direct && !exactVisual) score = Math.min(score, policy.lexicalOnlyCapBps);
     if (score < policy.inclusionBps) continue;
     const reasons = [
       direct ? 'EXACT_MINT_REFERENCE' : 'LEXICAL_ONLY_NOT_VERIFIED',
       token.launchTime.getTime() <= catalyst ? 'PRE_CATALYST_LAUNCH' : 'POST_CATALYST_LAUNCH',
       'INTERPRETATION_NOT_VERIFIED_FACT',
-      'SEMANTIC_VISUAL_MEDIA_UNAVAILABLE',
+      ...(sem === undefined
+        ? ['SEMANTIC_VISUAL_MEDIA_UNAVAILABLE']
+        : ['VERSIONED_SEMANTIC_EVIDENCE', 'MEDIA_INTERPRETATION_NOT_VERIFIED_FACT']),
     ];
+    if (exactVisual) reasons.push('EXACT_SOURCE_ARTWORK_MATCH_NOT_ENDORSEMENT');
+    else if (retrievedVisual) reasons.push('PERCEPTUAL_SIMILARITY_NOT_IDENTITY_PROOF');
+    if (retrievedSemantic) reasons.push('SEMANTIC_SIMILARITY_NOT_IDENTITY_PROOF');
     if (group.subject.ambiguous) reasons.push('AMBIGUOUS_SUBJECT_ALIAS');
     if (contexts.some((c) => c.ambiguous && containsMint(c.text, token.mint)))
       reasons.push('AMBIGUOUS_SOURCE_CONTEXT');
@@ -248,11 +379,14 @@ export function scoreGroup(
       linkConfidenceBps: score,
       status: contradicts
         ? 'contradictory'
-        : status === 'confirmed' && supportedDirect && score >= policy.alertBps
+        : status === 'confirmed' && (supportedDirect || supportedVisual) && score >= policy.alertBps
           ? 'confirmed'
           : 'pending',
       reasonCodes: reasons,
       features: vector,
+      ...(token.enrichmentEvidence === undefined
+        ? {}
+        : { enrichmentEvidence: token.enrichmentEvidence }),
       launchRelation:
         token.launchTime.getTime() <= catalyst ? 'PRE_CATALYST_LAUNCH' : 'POST_CATALYST_LAUNCH',
     });

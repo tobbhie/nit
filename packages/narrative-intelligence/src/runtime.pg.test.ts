@@ -23,6 +23,7 @@ import {
   configuration as baseConfiguration,
   extraction,
 } from './narrative.fixtures';
+import { richConfiguration, richInput, tokenExtraction } from './rich.fixtures';
 
 describe.skipIf(!hasTestDatabase())('automated text provenance to deterministic paper path', () => {
   let harness: TestDatabase;
@@ -53,7 +54,7 @@ describe.skipIf(!hasTestDatabase())('automated text provenance to deterministic 
     now = new Date(NOW);
     await paperRows(
       harness.db,
-      'TRUNCATE nit_narrative_reports,nit_text_results,nit_text_attempts,nit_text_policies,nit_text_budgets,nit_token_search_index,research_records,signals,domain_events,observations,tokens,strategy_entry_versions,strategy_exit_versions,strategy_protection_versions,strategy_risk_versions CASCADE'
+      'TRUNCATE nit_semantic_members,nit_semantic_nodes,nit_media_objects,nit_token_interpretations,nit_narrative_reports,nit_text_results,nit_text_attempts,nit_text_policies,nit_text_budgets,nit_token_search_index,research_records,signals,domain_events,observations,tokens,strategy_entry_versions,strategy_exit_versions,strategy_protection_versions,strategy_risk_versions CASCADE'
     );
   });
   async function observation(
@@ -615,6 +616,208 @@ describe.skipIf(!hasTestDatabase())('automated text provenance to deterministic 
     expect(
       await paperRows(harness.db, 'SELECT COUNT(*)::text AS count FROM nit_token_search_index')
     ).toEqual([{ count: '201' }]);
+  });
+
+  it('converges live paraphrases, retrieves semantic competitors and pins metered token representations', async () => {
+    const config = richConfiguration();
+    await observation();
+    await observation('b', `Nova party opens ${MINT_A} ${MINT_B} for b`);
+    await token();
+    await token(MINT_B);
+    const model: TextInterpreter = {
+      kind: 'gateway',
+      identity: {
+        name: 'fixture-rich',
+        version: 'fixture-rich',
+        promptHash: '1'.repeat(64),
+        isToyImplementation: false,
+      },
+      interpret: (s) =>
+        Promise.resolve(
+          s.purpose === 'token_representation'
+            ? tokenExtraction()
+            : richInput(s.authorId, s.text).extraction
+        ),
+    };
+    const runtime = new LiveNarrativeRuntime(harness.db, model, config, () => now);
+    expect((await runtime.cycle()).incomplete).toBe(true);
+    now = new Date(now.getTime() + 1);
+    expect((await runtime.cycle()).incomplete).toBe(false);
+    expect((await source()).payload.candidates).toHaveLength(2);
+    expect(
+      await paperRows(harness.db, 'SELECT COUNT(*)::text AS count FROM nit_semantic_nodes')
+    ).toEqual([{ count: '1' }]);
+    expect(
+      await paperRows(
+        harness.db,
+        'SELECT requests::text AS requests,reserved_cost_micros::text AS cost FROM nit_text_budgets'
+      )
+    ).toEqual([{ requests: '4', cost: '4' }]);
+    const ledger = await paperRows<{ state: string; input_hash: string; policy_hash: string }>(
+      harness.db,
+      'SELECT state,input_hash,policy_hash FROM nit_token_interpretations'
+    );
+    expect(
+      ledger.every(
+        (r) =>
+          r.state === 'captured' &&
+          r.input_hash.length === 64 &&
+          r.policy_hash === runtime.policyHash
+      )
+    ).toBe(true);
+    expect(
+      (
+        await harness.db.query(
+          "UPDATE nit_token_interpretations SET state='unknown' WHERE state='captured'"
+        )
+      ).kind
+    ).toBe('failure');
+  });
+  it('keeps a failed token interpretation terminal and blocks semantic-universe completeness without repurchasing it', async () => {
+    const config = richConfiguration();
+    await token();
+    const interpret = vi.fn(() => Promise.reject(new Error('Synthetic gateway outage')));
+    const model: TextInterpreter = {
+      kind: 'gateway',
+      identity: {
+        name: 'fixture-rich',
+        version: 'fixture-rich',
+        promptHash: '1'.repeat(64),
+        isToyImplementation: false,
+      },
+      interpret,
+    };
+    const runtime = new LiveNarrativeRuntime(harness.db, model, config, () => now);
+    expect((await runtime.cycle()).incomplete).toBe(true);
+    now = new Date(now.getTime() + 1);
+    expect((await runtime.cycle()).incomplete).toBe(true);
+    expect(interpret).toHaveBeenCalledTimes(1);
+    expect(await paperRows(harness.db, 'SELECT state FROM nit_token_interpretations')).toEqual([
+      { state: 'unknown' },
+    ]);
+    expect(
+      await paperRows(harness.db, 'SELECT requests::text AS requests FROM nit_text_budgets')
+    ).toEqual([{ requests: '1' }]);
+  });
+  it('retrieves a token by its exact source frame even when lexical and semantic retrieval do not match', async () => {
+    const config = richConfiguration();
+    config.policy.linkWeights = {
+      lexical: 0,
+      identity: 0,
+      directReference: 0,
+      temporal: 0,
+      visual: 10000,
+      contradiction: 10000,
+    };
+    await observation('a', 'Nova festival begins for everyone');
+    await observation('b', 'Nova party opens for everyone');
+    await token();
+    const id = randomUUID();
+    await paperRows(
+      harness.db,
+      `INSERT INTO media(media_id,observation_id,provider_media_key,media_type,source_url,created_at)
+      SELECT $1,observation_id,'m','image','https://media.invalid/image',$2 FROM observations WHERE author_id='a'`,
+      [id, now]
+    );
+    const model: TextInterpreter = {
+      kind: 'gateway',
+      identity: {
+        name: 'fixture-rich',
+        version: 'fixture-rich',
+        promptHash: '1'.repeat(64),
+        isToyImplementation: false,
+      },
+      interpret: (s) => {
+        if (s.purpose === 'token_representation')
+          return Promise.resolve({
+            ...tokenExtraction(),
+            representation: { modelVersion: 'fixture-embedding-v1', vector: [0, 1] },
+            mediaRepresentations: [
+              {
+                mediaId: s.observationId,
+                sha256: 'c'.repeat(64),
+                frameHashes: ['b'.repeat(64)],
+                dhashes: ['1234567890abcdef'],
+                durationMs: null,
+              },
+            ],
+          });
+        const value = richInput(s.authorId, s.text).extraction;
+        if (s.authorId === 'a')
+          value.mediaRepresentations = [
+            {
+              mediaId: id,
+              sha256: 'a'.repeat(64),
+              frameHashes: ['b'.repeat(64)],
+              dhashes: ['1234567890abcdef'],
+              durationMs: null,
+            },
+          ];
+        return Promise.resolve(value);
+      },
+    };
+    // A canonical artwork reference legitimizes the captured token representation.
+    await paperRows(harness.db, 'UPDATE nit_text_health SET incomplete=true');
+    const tokens = await paperRows<{ token_id: string }>(harness.db, 'SELECT token_id FROM tokens');
+    await paperRows(
+      harness.db,
+      "INSERT INTO token_artwork(artwork_id,token_id,source_url,created_at) VALUES ($1,$1,'https://media.invalid/artwork',$2)",
+      [tokens[0]!.token_id, now]
+    );
+    const runtime = new LiveNarrativeRuntime(harness.db, model, config, () => now);
+    expect((await runtime.cycle()).incomplete).toBe(false);
+    const candidates = (await source()).payload.candidates as {
+      tokenMint: string;
+      linkConfidenceBps: number;
+    }[];
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]!.tokenMint).toBe(MINT_A);
+    expect(candidates[0]!.linkConfidenceBps).toBe(10000);
+    now = new Date(now.getTime() + 1001);
+    const published = await source();
+    const resolver = new CandidateResolver(
+      harness.db,
+      {
+        latest: (
+          mint: string
+        ): Promise<ReturnType<typeof success<ReturnType<typeof fixtureMarket>>>> =>
+          Promise.resolve(success(fixtureMarket(now, '1000', mint))),
+      },
+      { now: (): Date => now },
+      POLICY,
+      'SOL'
+    );
+    const resolved = await resolver.resolve(published.canonical_narrative_id);
+    if (resolved.kind === 'failure') throw resolved.error;
+    const candidate = resolved.value.candidates[0]!;
+    expect(candidate.qualification?.E01).toBe(true);
+    expect(candidate.evidence?.wallet).toBe('unavailable');
+    const run = await new PostgresPaperRegistry(harness.db).createRun({
+      strategy: fixtureStrategy({ entry: 'E01' }),
+      mode: ExecutionMode.FORWARD_PAPER,
+      codeHash: 'a'.repeat(64),
+      codeCommitSha: 'rich-media-fixture',
+      periodStart: NOW,
+      periodEnd: new Date(now.getTime() + 3600000),
+      cashAsset: 'SOL',
+      initialCash: '100',
+    });
+    if (run.kind === 'failure') throw run.error;
+    const trader = new PostgresPaperTrader(harness.db, { now: (): Date => now });
+    expect(
+      (
+        await trader.tick(
+          run.value.portfolioId,
+          fixtureMarket(now, '1000', MINT_A),
+          candidate.narrativeSignalId
+        )
+      ).kind
+    ).toBe('success');
+    now = new Date(now.getTime() + 1000);
+    await trader.tick(run.value.portfolioId, fixtureMarket(now, '1000', MINT_A));
+    expect(
+      await paperRows(harness.db, 'SELECT 1 FROM positions WHERE open_quantity>0')
+    ).toHaveLength(1);
   });
 
   it('withdraws prior candidates on overflow and closes expired attention without reinference', async () => {

@@ -7,7 +7,12 @@ import {
   SourceText,
   TextInterpreter,
   phrase,
+  RichPrompt,
+  RICH_PROMPT_HASH,
+  ExtractionSchema,
+  validateExtraction,
 } from './contracts';
+import { MediaProcessor, PreparedMedia, readBounded } from './media';
 
 /** Marked development scaffolding; the live runtime rejects it. */
 export class ToyTextInterpreter implements TextInterpreter {
@@ -71,6 +76,9 @@ export interface GatewayOptions {
   maxOutputTokens: number;
   maxChargeMicros: number;
   fetcher?: typeof fetch;
+  rich?: { modelVersion: string; dimensions: number };
+  mediaProcessor?: MediaProcessor;
+  allowExternalMedia?: boolean;
 }
 /** Provider-neutral JSON protocol. Vendor translation and billing enforcement belong to the configured gateway. */
 export class GatewayTextInterpreter implements TextInterpreter {
@@ -78,6 +86,11 @@ export class GatewayTextInterpreter implements TextInterpreter {
   readonly identity: InterpreterIdentity;
   private readonly endpoint: string;
   constructor(private readonly options: GatewayOptions) {
+    if (
+      options.mediaProcessor !== undefined &&
+      (options.rich === undefined || options.allowExternalMedia !== true)
+    )
+      throw new Error('Explicit rich-media disclosure grant required');
     const url = new URL(options.endpoint);
     if (
       url.protocol !== 'https:' ||
@@ -94,17 +107,60 @@ export class GatewayTextInterpreter implements TextInterpreter {
     this.identity = {
       name: 'json-text-gateway',
       version: options.modelVersion,
-      promptHash: PROMPT_HASH,
+      promptHash: options.rich === undefined ? PROMPT_HASH : RICH_PROMPT_HASH,
       isToyImplementation: false,
     };
   }
   async interpret(source: SourceText, signal: AbortSignal): Promise<unknown> {
+    const prepared: PreparedMedia[] = [];
+    let tokenMetadata: import('./contracts').TextExtraction['tokenMetadata'];
+    const attachments = [...(source.media ?? [])];
+    if (
+      source.purpose === 'token_representation' &&
+      source.metadataUrl !== undefined &&
+      this.options.mediaProcessor !== undefined
+    ) {
+      const document = await this.options.mediaProcessor.metadata(source.metadataUrl, signal);
+      const artwork =
+        document.image === null || attachments.length > 0
+          ? null
+          : { mediaId: source.observationId, sourceUrl: document.image };
+      if (artwork !== null) attachments.push({ ...artwork, mediaType: 'image', durationMs: null });
+      tokenMetadata = {
+        sourceUrl: source.metadataUrl,
+        sha256: document.sha256,
+        text: document.text,
+        artwork,
+      };
+    }
+    if ((source.media?.length ?? 0) > 4) throw new Error('Attachment overflow');
+    if (this.options.mediaProcessor !== undefined) {
+      for (const ref of attachments)
+        prepared.push(await this.options.mediaProcessor.prepare(ref, signal));
+    }
+    const promptHash = this.identity.promptHash;
     const body = JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: this.options.rich === undefined ? 1 : 2,
       modelVersion: this.options.modelVersion,
-      prompt: Prompt,
-      promptHash: PROMPT_HASH,
-      untrustedSource: { id: source.observationId, text: source.text },
+      prompt: this.options.rich === undefined ? Prompt : RichPrompt,
+      promptHash,
+      untrustedSource: {
+        id: source.observationId,
+        text: source.text,
+        ...(tokenMetadata === undefined ? {} : { metadataDocument: tokenMetadata.text }),
+        ...(this.options.rich === undefined
+          ? {}
+          : { media: prepared.map((m) => ({ ...m.representation, parts: m.parts })) }),
+      },
+      ...(this.options.rich === undefined
+        ? {}
+        : {
+            purpose: source.purpose ?? 'observation',
+            embedding: {
+              modelVersion: this.options.rich.modelVersion,
+              dimensions: this.options.rich.dimensions,
+            },
+          }),
       limits: {
         maxOutputTokens: this.options.maxOutputTokens,
         maxChargeMicros: this.options.maxChargeMicros,
@@ -127,33 +183,48 @@ export class GatewayTextInterpreter implements TextInterpreter {
         await response.body?.cancel();
         throw new Error('Unavailable text gateway');
       }
-      const reader = response.body.getReader();
-      const chunks: Uint8Array[] = [];
-      let size = 0;
-      try {
-        for (;;) {
-          const chunk = await reader.read();
-          if (chunk.done) break;
-          const value: unknown = chunk.value;
-          if (!(value instanceof Uint8Array)) throw new Error('Invalid gateway body');
-          size += value.length;
-          if (size > 32000) {
-            await reader.cancel();
-            throw new Error('Text gateway response exceeds budget');
-          }
-          chunks.push(value);
-        }
-      } finally {
-        reader.releaseLock();
-      }
+      const bytes = await readBounded(
+        response,
+        this.options.rich === undefined ? 32000 : 262144,
+        signal
+      );
       if (signal.aborted) throw new Error('Text gateway interrupted');
-      const result = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+      const result = JSON.parse(bytes.toString('utf8')) as Record<string, unknown>;
       if (
         result['modelVersion'] !== this.options.modelVersion ||
-        result['promptHash'] !== PROMPT_HASH
+        result['promptHash'] !== promptHash
       )
         throw new Error('Text gateway identity mismatch');
-      return result['extraction'];
+      if (this.options.rich === undefined) {
+        if (ExtractionSchema.parse(result['extraction']).schemaVersion !== 1)
+          throw new Error('Rich schema requires explicit capability');
+        return result['extraction'];
+      }
+      const parsed = ExtractionSchema.parse(result['extraction']);
+      if (
+        parsed.schemaVersion !== 2 ||
+        parsed.mediaRepresentations !== undefined ||
+        parsed.tokenMetadata !== undefined
+      )
+        throw new Error('Invalid rich interpretation');
+      for (const embedding of [parsed.representation, ...parsed.topics.map((t) => t.meaning)]) {
+        if (
+          embedding !== undefined &&
+          (embedding.modelVersion !== this.options.rich.modelVersion ||
+            embedding.vector.length !== this.options.rich.dimensions)
+        )
+          throw new Error('Embedding identity mismatch');
+      }
+      if (parsed.representation === undefined || parsed.topics.some((t) => t.meaning === undefined))
+        throw new Error('Missing configured semantic representations');
+      return validateExtraction(
+        {
+          ...parsed,
+          mediaRepresentations: prepared.map((m) => m.representation),
+          ...(tokenMetadata === undefined ? {} : { tokenMetadata }),
+        },
+        source
+      );
     } catch {
       throw new Error('Text gateway response unavailable or invalid');
     }

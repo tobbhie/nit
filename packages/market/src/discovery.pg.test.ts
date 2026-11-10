@@ -92,7 +92,7 @@ describe.skipIf(!hasTestDatabase())('Market discovery against Postgres', () => {
     // block the reset. The queue tables are here because discovery now writes to
     // them: the enrichment jobs commit with the token.
     const truncated = await harness.db.query(
-      `TRUNCATE token_artwork, market_snapshots, token_markets, creator_profiles, tokens,
+      `TRUNCATE nit_token_interpretations, token_artwork, market_snapshots, token_markets, creator_profiles, tokens,
                 domain_events, job_history, durable_jobs RESTART IDENTITY`
     );
     expect(truncated.kind).toBe('success');

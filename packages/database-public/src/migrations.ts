@@ -1684,9 +1684,61 @@ export const MIGRATIONS: readonly Migration[] = [
       END; $$;
     `,
   },
+  {
+    id: '0026_semantic_media_evidence',
+    description:
+      'Immutable semantic memberships, token representations and independent media durability',
+    up: `
+      CREATE TABLE IF NOT EXISTS nit_semantic_nodes(node_id TEXT PRIMARY KEY,policy_hash TEXT NOT NULL,
+        subject JSONB NOT NULL,catalyst TEXT NOT NULL,vector JSONB NOT NULL,bucket TIMESTAMPTZ NOT NULL,
+        previous_node_id TEXT REFERENCES nit_semantic_nodes(node_id),available_at TIMESTAMPTZ NOT NULL);
+      CREATE INDEX IF NOT EXISTS nit_semantic_nodes_subject_idx ON nit_semantic_nodes(policy_hash,(subject->>'key'),bucket);
+      CREATE TABLE IF NOT EXISTS nit_semantic_members(member_id TEXT NOT NULL,policy_hash TEXT NOT NULL,
+        node_id TEXT NOT NULL REFERENCES nit_semantic_nodes(node_id),relation TEXT NOT NULL,compared JSONB NOT NULL,
+        available_at TIMESTAMPTZ NOT NULL,PRIMARY KEY(member_id,policy_hash));
+      CREATE TABLE IF NOT EXISTS nit_media_objects(media_id UUID PRIMARY KEY,source_url TEXT NOT NULL,media_type TEXT NOT NULL,
+        sha256 TEXT NOT NULL,size_bytes BIGINT NOT NULL,duration_ms INTEGER,object_key TEXT,
+        durability_state TEXT NOT NULL CHECK(durability_state IN ('pending','uploading','durable','failed')),
+        upload_attempts INTEGER NOT NULL,last_attempt_at TIMESTAMPTZ,available_at TIMESTAMPTZ NOT NULL,
+        working_dir TEXT,local_state TEXT NOT NULL DEFAULT 'pending' CHECK(local_state IN ('pending','local_ready','deleted','lost')));
+      CREATE TABLE IF NOT EXISTS nit_token_interpretations(token_id UUID NOT NULL REFERENCES tokens(token_id),
+        extractor_hash TEXT NOT NULL,policy_hash TEXT NOT NULL REFERENCES nit_text_policies(policy_hash),input_hash TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending','captured','invalid','unknown')),payload JSONB,
+        started_at TIMESTAMPTZ NOT NULL,deadline_at TIMESTAMPTZ NOT NULL,available_at TIMESTAMPTZ,
+        PRIMARY KEY(token_id,extractor_hash));
+      DO $$ DECLARE table_name TEXT; BEGIN
+        FOREACH table_name IN ARRAY ARRAY['nit_semantic_nodes','nit_semantic_members'] LOOP
+          EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I',table_name||'_append_only',table_name);
+          EXECUTE format('CREATE TRIGGER %I BEFORE UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION reject_mutation()',table_name||'_append_only',table_name);
+        END LOOP;
+      END; $$;
+      CREATE OR REPLACE FUNCTION nit_token_result_once() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN
+        IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Token interpretation is immutable'; END IF;
+        IF OLD.state<>'pending' OR NEW.state='pending' OR NEW.token_id<>OLD.token_id OR NEW.extractor_hash<>OLD.extractor_hash
+          OR NEW.policy_hash<>OLD.policy_hash OR NEW.input_hash<>OLD.input_hash OR NEW.started_at<>OLD.started_at OR NEW.deadline_at<>OLD.deadline_at
+          OR NEW.available_at IS NULL THEN RAISE EXCEPTION 'Token interpretation has one terminal outcome'; END IF;
+        RETURN NEW;
+      END; $$;
+      DROP TRIGGER IF EXISTS nit_token_result_once ON nit_token_interpretations;
+      CREATE TRIGGER nit_token_result_once BEFORE UPDATE OR DELETE ON nit_token_interpretations FOR EACH ROW EXECUTE FUNCTION nit_token_result_once();
+      CREATE OR REPLACE FUNCTION nit_media_identity_immutable() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN
+        IF TG_OP='DELETE' THEN RAISE EXCEPTION 'Captured media identity is immutable'; END IF;
+        IF NEW.media_id<>OLD.media_id OR NEW.source_url<>OLD.source_url OR NEW.media_type<>OLD.media_type OR NEW.sha256<>OLD.sha256
+          OR NEW.size_bytes<>OLD.size_bytes OR NEW.available_at<>OLD.available_at OR NEW.duration_ms IS DISTINCT FROM OLD.duration_ms
+          THEN RAISE EXCEPTION 'Captured media identity is immutable'; END IF;
+        RETURN NEW;
+      END; $$;
+      DROP TRIGGER IF EXISTS nit_media_identity_immutable ON nit_media_objects;
+      CREATE TRIGGER nit_media_identity_immutable BEFORE UPDATE OR DELETE ON nit_media_objects FOR EACH ROW EXECUTE FUNCTION nit_media_identity_immutable();
+    `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
+  'nit_semantic_nodes',
+  'nit_semantic_members',
+  'nit_media_objects',
+  'nit_token_interpretations',
   'nit_text_policies',
   'nit_text_attempts',
   'nit_text_results',

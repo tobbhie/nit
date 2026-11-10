@@ -37,7 +37,7 @@ describe.skipIf(!hasTestDatabase())('token market lifecycle against Postgres', (
   beforeEach(async () => {
     unwrap(
       await harness.db.query(
-        'TRUNCATE token_artwork, market_snapshots, token_markets, tokens RESTART IDENTITY'
+        'TRUNCATE nit_token_interpretations, token_artwork, market_snapshots, token_markets, tokens RESTART IDENTITY'
       )
     );
     tokenId = generateTokenId();

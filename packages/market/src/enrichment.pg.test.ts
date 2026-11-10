@@ -108,7 +108,7 @@ describe.skipIf(!hasTestDatabase())('Market intelligence against Postgres', () =
     // TRUNCATE fires no row-level DELETE trigger, so the append-only triggers on
     // `tokens` and `market_snapshots` do not block the reset.
     const truncated = await harness.db.query(
-      `TRUNCATE token_artwork, market_snapshots, token_markets, creator_profiles, tokens,
+      `TRUNCATE nit_token_interpretations, token_artwork, market_snapshots, token_markets, creator_profiles, tokens,
                 domain_events, job_history, durable_jobs RESTART IDENTITY`
     );
     expect(truncated.kind).toBe('success');

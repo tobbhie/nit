@@ -32,6 +32,79 @@ const post = (id: string, author = '123'): Record<string, unknown> => ({
   text: 'Untrusted source text',
 });
 describe('X author capture', () => {
+  it('captures photo and playable video attachments through exact media-key expansions', async () => {
+    const { source, fetch } = fixture([
+      {
+        data: [{ ...post('20'), attachments: { media_keys: ['photo', 'clip'] } }],
+        meta: {},
+        includes: {
+          media: [
+            { media_key: 'photo', type: 'photo', url: 'https://pbs.twimg.com/test.png' },
+            {
+              media_key: 'clip',
+              type: 'video',
+              duration_ms: 1000,
+              variants: [
+                { content_type: 'application/x-mpegURL', url: 'https://video.twimg.com/test.m3u8' },
+                {
+                  content_type: 'video/mp4',
+                  bit_rate: 1000,
+                  url: 'https://video.twimg.com/large.mp4',
+                },
+                {
+                  content_type: 'video/mp4',
+                  bit_rate: 100,
+                  url: 'https://video.twimg.com/small.mp4',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    ]);
+    const result = await source.fetchAuthorPosts({ authorId: '123', limit: 10 });
+    expect(result.kind).toBe('success');
+    if (result.kind === 'success')
+      expect(result.value[0]!.media).toEqual([
+        {
+          providerMediaKey: 'photo',
+          mediaType: 'image',
+          sourceUrl: 'https://pbs.twimg.com/test.png',
+        },
+        {
+          providerMediaKey: 'clip',
+          mediaType: 'video',
+          sourceUrl: 'https://video.twimg.com/small.mp4',
+          durationMs: 1000,
+        },
+      ]);
+    const url = (fetch.mock.calls[0] as unknown as [URL])[0];
+    expect(url.searchParams.get('expansions')).toBe('attachments.media_keys');
+    expect(url.searchParams.get('media.fields')).toContain('variants');
+  });
+  it('does not advance past missing or unplayable media expansions', async () => {
+    for (const media of [
+      [],
+      [
+        {
+          media_key: 'clip',
+          type: 'video',
+          variants: [
+            { content_type: 'application/x-mpegURL', url: 'https://video.twimg.com/test.m3u8' },
+          ],
+        },
+      ],
+    ]) {
+      const { source } = fixture([
+        {
+          data: [{ ...post('20'), attachments: { media_keys: ['clip'] } }],
+          meta: {},
+          includes: { media },
+        },
+      ]);
+      expect((await source.fetchAuthorPosts({ authorId: '123', limit: 10 })).kind).toBe('failure');
+    }
+  });
   it('uses exact IDs, drains pagination, deduplicates and returns oldest first', async () => {
     const { source, fetch } = fixture([
       { data: [post('9007199254740995')], meta: { next_token: 'next' } },

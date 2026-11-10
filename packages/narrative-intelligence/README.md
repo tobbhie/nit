@@ -1,4 +1,4 @@
-# Automated text narrative producer
+# Automated narrative evidence producer
 
 `@nit/narrative-intelligence` turns persisted observations into captured source
 artifacts, bounded interpretations, attention episodes, deterministic candidate
@@ -6,10 +6,11 @@ assessments and provenance-backed NIT signals. The existing resolver, console an
 paper strategies consume these signals. The observing agent is optional and has
 no role in this producer's execution.
 
-This is the first **text evidence path**. Broader cultural interpretation,
-semantic/visual matching, media processing, identity knowledge, narrative
-merge/split and automatic revival attribution remain separate work. A captured
-claim or model interpretation is not a verified fact or evidence of profitability.
+This page describes the legacy **text evidence path**. Opt-in rich mode adds
+semantic grouping, immutable membership/branch history, linked attention revivals,
+token metadata embeddings and image/video/audio evidence. See
+[rich mode configuration, coverage and data exposure](RICH_MODE.md).
+A captured claim or model interpretation is not a verified fact or evidence of profitability.
 
 ## Interpretation and qualification
 
@@ -47,8 +48,9 @@ Retrieval checks names, explicit cashtags, catalog aliases and exact mint refere
 inside the topic's cited context. It retains competing mints, ticker collisions and
 older tokens. Timing supports relevance; launch age is not an exclusion. Lexical
 and alias-only scores are capped below alert eligibility. Confirmation also requires
-an unambiguous supported mint reference and sufficient narrative evidence. Semantic
-and media features remain explicitly unavailable. Market size does not choose a winner.
+an unambiguous supported mint reference and sufficient narrative evidence.
+Legacy mode reports semantic/media features unavailable. Rich mode supplies
+separate semantic, visual, OCR and transcript features. Market size does not choose a winner.
 
 A bounded, rebuildable normalized-metadata index retrieves a conservative superset
 of plausible text matches inside PostgreSQL. The universe limit applies to that
@@ -145,12 +147,13 @@ revised in bounded batches; producer health gates live-text narrative buys globa
 while the resolver's watch expiry also bounds cached eligibility.
 Monitor incompleteness and pause NIT entries during sustained backlog before a run.
 
-Text and reference metadata are supported; images/OCR/transcripts are not inspected.
-Missing text stays unavailable. Unknown copied-news origins, complete platform
+Legacy mode supports text and reference metadata; rich mode inspects captured
+frames/audio with OCR/transcript/visual descriptions returned by the gateway.
+Missing supported content stays unavailable. Unknown copied-news origins, complete platform
 coverage and authentic attention are not established. X author capture exists;
 Telegram channel intake remains separate from the Telegram decision console.
 
 Before the full-system 48-hour test, configure a real gateway, verify source and
 venue coverage, measure latency/storage/load, and exercise restart, withdrawal
-and outages. Complete the remaining semantic/media and market support needed for
-the agreed full-system test. This feature does not deploy the system.
+and outages. Configure the rich gateway and media/storage tools where enabled;
+unsupported market modes still fail closed. This feature does not deploy the system.

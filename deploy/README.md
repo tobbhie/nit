@@ -117,9 +117,34 @@ errors/backlogs, writes oldest first and stops an author's batch at the first
 failed write. The numeric persisted post ID is the restart cursor. Failures do
 not advance it. A backlog exceeding the configured budget needs operator action;
 it is reported as failed capture rather than silently dropped. Author failures
-are isolated. This initial adapter captures text and reference metadata, not
-downloaded media or complete platform coverage. Timeline limits/deletions and
+are isolated. The adapter captures text, references and photo/video attachment
+metadata through X media-key expansions. Missing/unplayable expansions fail the
+batch; video capture selects the smallest advertised MP4 variant. The narrative
+worker downloads attachments only with an explicit media grant and approved
+origins. This is not complete platform coverage. Timeline limits/deletions and
 provider indexing can still make historical coverage incomplete. Captured posts
 are untrusted observations and do not automatically become narrative trade signals.
 The provider interface already admits Telegram; no Telegram channel reader is
 enabled by this release.
+
+## Rich narrative prerequisites
+
+The optional rich protocol is documented in
+[the narrative package](../packages/narrative-intelligence/RICH_MODE.md). Configure
+the embedding model and dimensions on both policy and gateway, explicit media
+disclosure, approved source/IPFS origins, absolute FFmpeg/ffprobe paths and a
+private dedicated scratch directory. Install and pin decoder binaries separately;
+they are runtime tools, not vendored application dependencies. The worker's OS
+identity needs write access to that scratch directory under service sandboxing.
+Keep media CPU/memory below protection workloads and measure total RSS, including
+child decoders, on the 2 GB host. One producer session serializes decoding,
+metadata inference and archive recovery; uploads can overlap analysis.
+
+Media durability uses private R2 with `NIT_R2_ACCESS_KEY_ID` and
+`NIT_R2_SECRET_ACCESS_KEY` in the host environment. Use a NIT-only bucket-scoped
+credential; never place it in narrative JSON or repository files. Analysis does
+not wait for R2. Verify upload failure/recovery, scratch pressure, semantic index
+warm-up, budget exhaustion, model mismatch and producer withdrawal before the
+48-hour run. Strict semantic mode blocks new narrative entries until every known
+canonical token in its registry has a captured representation; size the initial
+registry and measure enrichment throughput before starting the experiment.

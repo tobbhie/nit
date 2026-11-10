@@ -13,13 +13,16 @@ import {
   normalized,
   validateExtraction,
   TextExtraction,
-  subjectKey,
+  SourceAttachment,
 } from './contracts';
-import { InterpretedSource, NarrativeGroup, TokenFacts, groupSources, scoreGroup } from './scoring';
+import { InterpretedSource, NarrativeGroup, TokenFacts, topicInGroup, scoreGroup } from './scoring';
+import { semanticGroups } from './semantic';
 
 const ENGINE_VERSION = 'live-text-v1';
 // Do not materialize arbitrary provider JSON a second time during interpretation.
 const SOURCE_FIELDS = `o.observation_id,o.provider,o.provider_post_id,o.author_id,o.published_at,o.ingested_at,o.text,o.quoted_provider_post_id,
+  (SELECT COALESCE(jsonb_agg(jsonb_build_object('mediaId',m.media_id,'mediaType',m.media_type,'sourceUrl',m.source_url,'durationMs',m.duration_ms)),'[]'::jsonb)
+    FROM (SELECT media_id,media_type,source_url,duration_ms FROM media WHERE observation_id=o.observation_id AND created_at<=$2 ORDER BY media_id LIMIT 5) m) AS media_refs,
   jsonb_build_object('referenced_tweets',
     (SELECT COALESCE(jsonb_agg(jsonb_build_object('id',LEFT(x.value->>'id',100))),'[]'::jsonb)
       FROM jsonb_array_elements(CASE WHEN jsonb_typeof(o.raw_payload->'referenced_tweets')='array'
@@ -30,6 +33,20 @@ const SOURCE_FIELDS = `o.observation_id,o.provider,o.provider_post_id,o.author_i
         THEN o.raw_payload->'referenced_posts' ELSE '[]'::jsonb END) WITH ORDINALITY x(value,n) WHERE x.n<=32)) AS raw_payload`;
 async function rows<T>(db: Executor, sql: string, values: unknown[] = []): Promise<T[]> {
   const result = await db.query<T>(sql, values);
+  if (result.kind === 'failure') throw result.error;
+  return result.value;
+}
+async function retrievalRows<T>(
+  db: DatabasePool,
+  sql: string,
+  values: unknown[],
+  timeoutMs: number
+): Promise<T[]> {
+  const result = await db.transaction(async (client) => {
+    const executor = clientExecutor(client);
+    await rows(executor, "SELECT set_config('statement_timeout',$1,true)", [String(timeoutMs)]);
+    return rows<T>(executor, sql, values);
+  });
   if (result.kind === 'failure') throw result.error;
   return result.value;
 }
@@ -50,6 +67,7 @@ interface ObservationRow {
   text: string | null;
   raw_payload: Record<string, unknown>;
   quoted_provider_post_id: string | null;
+  media_refs: SourceAttachment[];
 }
 function sourceOf(row: ObservationRow): SourceText {
   const refs: string[] = [];
@@ -72,6 +90,7 @@ function sourceOf(row: ObservationRow): SourceText {
     publishedAt: row.published_at,
     ingestedAt: row.ingested_at,
     derivativeIds: [...new Set(refs)],
+    media: row.media_refs,
   };
 }
 interface Descriptor {
@@ -81,6 +100,8 @@ interface Descriptor {
   catalystKey: string;
   startsAt: string;
   expiresAt: string;
+  memberIds?: string[];
+  previousGroupKey?: string | null;
 }
 interface StoredReport {
   group: Descriptor;
@@ -110,9 +131,17 @@ export class LiveNarrativeRuntime {
     private readonly db: DatabasePool,
     private readonly interpreter: TextInterpreter,
     config: NarrativeRuntimeConfig,
-    private readonly clock: () => Date = (): Date => new Date()
+    private readonly clock: () => Date = (): Date => new Date(),
+    private readonly mediaRecovery?: (signal: AbortSignal) => Promise<void>
   ) {
     this.config = NarrativeRuntimeSchema.parse(config);
+    if (
+      this.config.policy.semantics !== undefined &&
+      (this.config.interpreter.kind !== 'gateway' ||
+        this.config.interpreter.rich?.modelVersion !== this.config.policy.semantics.modelVersion ||
+        this.config.interpreter.rich.dimensions !== this.config.policy.semantics.dimensions)
+    )
+      throw new Error('Semantic policy requires its pinned rich gateway');
     if (
       interpreter.identity.isToyImplementation ||
       interpreter.kind !== this.config.interpreter.kind
@@ -129,6 +158,9 @@ export class LiveNarrativeRuntime {
         this.config.interpreter.kind === 'gateway' ? this.config.interpreter.endpoint : null,
       allowedOrigin:
         this.config.interpreter.kind === 'gateway' ? this.config.interpreter.allowedOrigin : null,
+      ...(this.config.interpreter.kind === 'gateway' && this.config.interpreter.rich !== undefined
+        ? { rich: this.config.interpreter.rich }
+        : {}),
     });
     this.policyHash = evidenceHash({
       engine: ENGINE_VERSION,
@@ -166,8 +198,25 @@ export class LiveNarrativeRuntime {
           this.config.interpreter.kind === 'gateway' ? this.config.interpreter.endpoint : null,
         allowedOrigin:
           this.config.interpreter.kind === 'gateway' ? this.config.interpreter.allowedOrigin : null,
+        ...(this.config.interpreter.kind === 'gateway' && this.config.interpreter.rich !== undefined
+          ? { rich: this.config.interpreter.rich }
+          : {}),
       });
       const start = this.clock();
+      if (this.mediaRecovery !== undefined) {
+        await this.health(true);
+        try {
+          await this.mediaRecovery(
+            AbortSignal.any([signal, AbortSignal.timeout(this.config.timeoutMs)])
+          );
+        } catch {
+          /* Archive recovery is bounded and never a prerequisite for sufficient evidence. */
+        }
+      }
+      if (this.config.policy.semantics !== undefined) {
+        await this.health(true);
+        await this.indexRepresentations(signal);
+      }
       // Unknown outcomes retain their reservation and cannot be automatically called again.
       await rows(
         this.db,
@@ -192,7 +241,6 @@ export class LiveNarrativeRuntime {
       for (const row of pending) {
         if (signal.aborted) break;
         const source = sourceOf(row);
-        await this.artifact(source);
         const attempt = await this.claim(source);
         if (attempt === null) {
           summary.incomplete = true;
@@ -204,7 +252,13 @@ export class LiveNarrativeRuntime {
         let status: 'captured' | 'unavailable' | 'invalid' | 'unknown' = 'unknown';
         let extraction: TextExtraction | null = null;
         try {
-          if (source.text.trim() === '') status = 'unavailable';
+          if (
+            source.text.trim() === '' &&
+            ((source.media?.length ?? 0) === 0 ||
+              this.config.interpreter.kind !== 'gateway' ||
+              this.config.interpreter.rich?.media === undefined)
+          )
+            status = 'unavailable';
           else {
             let raw: unknown;
             try {
@@ -215,6 +269,17 @@ export class LiveNarrativeRuntime {
             }
             try {
               extraction = validateExtraction(raw, source);
+              if (
+                this.config.policy.semantics !== undefined &&
+                (extraction.schemaVersion !== 2 ||
+                  extraction.topics.some(
+                    (t) =>
+                      t.meaning === undefined ||
+                      t.meaning.modelVersion !== this.config.policy.semantics!.modelVersion ||
+                      t.meaning.vector.length !== this.config.policy.semantics!.dimensions
+                  ))
+              )
+                throw new Error('Missing configured semantic evidence');
               if (
                 this.config.interpreter.kind === 'catalog' &&
                 extraction.topics.some((t) => t.stance !== 'uncertain')
@@ -239,6 +304,7 @@ export class LiveNarrativeRuntime {
           status = 'unknown';
           extraction = null;
         }
+        if (status === 'captured' && extraction !== null) await this.artifact(source, extraction);
         await rows(
           this.db,
           `INSERT INTO nit_text_results(attempt_id,status,payload,available_at) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
@@ -247,7 +313,7 @@ export class LiveNarrativeRuntime {
             status,
             extraction === null
               ? null
-              : JSON.stringify({ extraction, contentKey: contentHash(normalized(source.text)) }),
+              : JSON.stringify({ extraction, contentKey: this.contentKey(source, extraction) }),
             finished,
           ]
         );
@@ -348,7 +414,11 @@ export class LiveNarrativeRuntime {
           source.observationId,
           this.extractorHash,
           this.policyHash,
-          evidenceHash({ text: source.text, observationId: source.observationId }),
+          evidenceHash({
+            text: source.text,
+            media: source.media ?? [],
+            observationId: source.observationId,
+          }),
           now,
           deadline,
           cost,
@@ -359,10 +429,34 @@ export class LiveNarrativeRuntime {
     if (claimed.kind === 'failure') throw claimed.error;
     return claimed.value;
   }
-  private async artifact(source: SourceText): Promise<void> {
-    const id = stableId(['artifact', source.observationId]);
+  private sourceArtifactId(observationId: string): string {
+    return this.config.interpreter.kind === 'gateway' && this.config.interpreter.rich !== undefined
+      ? stableId(['rich-artifact', observationId, this.extractorHash])
+      : stableId(['artifact', observationId]);
+  }
+  private contentKey(source: SourceText, extraction: TextExtraction): string {
+    return contentHash(
+      normalized(
+        source.text.trim() === ''
+          ? (extraction.mediaRepresentations ?? [])
+              .map((m) => m.sha256)
+              .sort()
+              .join(' ')
+          : source.text
+      )
+    );
+  }
+  private async artifact(source: SourceText, extraction: TextExtraction): Promise<void> {
+    const id = this.sourceArtifactId(source.observationId);
     const research = new PostgresResearchStore(this.db);
     if ((await research.at(id, this.clock())) !== null) return;
+    const artifactText =
+      source.text.trim() === ''
+        ? `Captured media SHA-256: ${(extraction.mediaRepresentations ?? [])
+            .map((m) => m.sha256)
+            .sort()
+            .join(' ')}`
+        : source.text;
     const record: ResearchRecord = {
       recordId: id,
       kind: 'artifact',
@@ -377,16 +471,19 @@ export class LiveNarrativeRuntime {
         provider: source.provider,
         sourceId: source.postId,
         authorId: source.authorId,
-        contentHash: contentHash(source.text),
-        normalizedContentHash: contentHash(normalized(source.text)),
-        text: source.text,
+        contentHash: contentHash(artifactText),
+        normalizedContentHash: contentHash(normalized(artifactText)),
+        text: artifactText,
         sourceUrl:
           source.provider === 'x'
             ? `https://x.com/i/status/${encodeURIComponent(source.postId)}`
             : `https://t.me/#nit-source=${encodeURIComponent(`${source.authorId}/${source.postId}`)}`,
         derivativeOf: null,
         independenceEligible: source.derivativeIds.length === 0,
-        media: [],
+        media: (extraction.mediaRepresentations ?? []).map((m) => ({
+          hash: m.sha256,
+          storageReference: `nit/media/${m.sha256}`,
+        })),
       },
     };
     const saved = await research.append(record);
@@ -424,14 +521,16 @@ export class LiveNarrativeRuntime {
     );
     const inputs: InterpretedSource[] = captured.slice(0, this.config.sourceLimit).map((row) => ({
       source: sourceOf(row),
-      artifactId: stableId(['artifact', row.observation_id]),
+      artifactId: this.sourceArtifactId(row.observation_id),
       extraction: validateExtraction(row.payload.extraction, sourceOf(row)),
       novel:
         (first.find((f) => f.key === row.payload.contentKey)?.first_at.getTime() ?? 0) >=
         Math.floor(row.published_at.getTime() / this.config.policy.episodeWindowMs) *
           this.config.policy.episodeWindowMs,
     }));
-    const groups = new Map(groupSources(inputs, this.config.policy, now).map((g) => [g.key, g]));
+    const groups = new Map(
+      (await semanticGroups(this.db, inputs, this.config.policy, now)).map((g) => [g.key, g])
+    );
     const prior = await rows<{ report: StoredReport }>(
       this.db,
       `SELECT report FROM
@@ -480,6 +579,9 @@ export class LiveNarrativeRuntime {
           catalystKey: group.catalystKey,
           startsAt: group.startsAt.toISOString(),
           expiresAt: group.expiresAt.toISOString(),
+          ...(group.memberIds === undefined
+            ? {}
+            : { memberIds: group.memberIds, previousGroupKey: group.previousGroupKey ?? null }),
         },
         score,
         coverage: { complete: groupComplete, sourceOverflow, universeOverflow, evidenceOverflow },
@@ -501,6 +603,146 @@ export class LiveNarrativeRuntime {
         published++;
     }
     return published;
+  }
+
+  /** One bounded metadata/artwork interpretation per cycle, sharing the observation budget. */
+  private async indexRepresentations(signal: AbortSignal): Promise<void> {
+    if (
+      this.config.interpreter.kind !== 'gateway' ||
+      this.config.interpreter.rich === undefined ||
+      new Date(this.config.interpreter.expiresAt) <= this.clock() ||
+      signal.aborted
+    )
+      return;
+    const now = this.clock();
+    await rows(
+      this.db,
+      "UPDATE nit_token_interpretations SET state='unknown',available_at=$1 WHERE state='pending' AND deadline_at<=$1",
+      [now]
+    );
+    const selected = await rows<{
+      token_id: string;
+      name: string;
+      ticker: string;
+      description: string;
+      metadata_uri: string | null;
+      launch_time: Date;
+      discovered_at: Date;
+      artwork_id: string | null;
+      source_url: string | null;
+    }>(
+      this.db,
+      `SELECT t.token_id,t.name,t.ticker,LEFT(COALESCE(t.description,t.raw_payload->>'description',''),4000) AS description,LEFT(t.raw_payload->>'uri',2048) AS metadata_uri,t.launch_time,t.discovered_at,COALESCE(a.artwork_id,t.token_id) AS artwork_id,COALESCE(a.source_url,t.artwork_url) AS source_url
+      FROM tokens t LEFT JOIN token_artwork a ON a.token_id=t.token_id AND a.created_at<=$1 AND (a.analysed_at IS NULL OR a.analysed_at<=$1)
+      WHERE t.chain='solana' AND t.discovered_at<=$1 AND NOT EXISTS
+      (SELECT 1 FROM nit_token_interpretations r WHERE r.token_id=t.token_id AND r.extractor_hash=$2)
+      ORDER BY t.discovered_at,t.token_id LIMIT 1`,
+      [now, this.extractorHash]
+    );
+    for (const token of selected) {
+      const source: SourceText = {
+        observationId: token.token_id,
+        provider: 'token-metadata',
+        postId: token.token_id,
+        authorId: 'untrusted-token-metadata',
+        text: JSON.stringify({
+          name: token.name,
+          ticker: token.ticker,
+          description: token.description,
+        }),
+        publishedAt: token.launch_time,
+        ingestedAt: token.discovered_at,
+        derivativeIds: [],
+        purpose: 'token_representation',
+        media:
+          token.artwork_id !== null && token.source_url !== null
+            ? [
+                {
+                  mediaId: token.artwork_id,
+                  sourceUrl: token.source_url,
+                  mediaType: 'image',
+                  durationMs: null,
+                },
+              ]
+            : [],
+        ...(token.metadata_uri === null ? {} : { metadataUrl: token.metadata_uri }),
+      };
+      const deadline = new Date(now.getTime() + this.config.timeoutMs);
+      const reservation = await this.db.transaction(async (client) => {
+        const db = clientExecutor(client);
+        const reserved = await rows(
+          db,
+          `INSERT INTO nit_text_budgets(day,requests,reserved_cost_micros)
+          SELECT $1::date,1,$2::bigint WHERE $2::bigint<=$4::bigint AND $3::bigint>=1
+          ON CONFLICT(day) DO UPDATE SET requests=nit_text_budgets.requests+1,reserved_cost_micros=nit_text_budgets.reserved_cost_micros+$2::bigint
+          WHERE nit_text_budgets.requests<$3::bigint AND nit_text_budgets.reserved_cost_micros+$2::bigint<=$4::bigint RETURNING day`,
+          [
+            now.toISOString().slice(0, 10),
+            this.config.interpreter.kind === 'gateway'
+              ? this.config.interpreter.maxChargeMicros
+              : 0,
+            this.config.maxRequestsPerDay,
+            this.config.maxCostMicrosPerDay,
+          ]
+        );
+        if (reserved.length === 0) return false;
+        await rows(
+          db,
+          `INSERT INTO nit_token_interpretations(token_id,extractor_hash,policy_hash,input_hash,state,started_at,deadline_at)
+          VALUES ($1,$2,$3,$4,'pending',$5,$6)`,
+          [
+            token.token_id,
+            this.extractorHash,
+            this.policyHash,
+            evidenceHash({
+              text: source.text,
+              media: source.media ?? [],
+              metadataUrl: source.metadataUrl ?? null,
+            }),
+            now,
+            deadline,
+          ]
+        );
+        return true;
+      });
+      if (reservation.kind === 'failure') throw reservation.error;
+      if (!reservation.value) return;
+      const abort = AbortSignal.any([signal, AbortSignal.timeout(this.config.timeoutMs)]);
+      let state = 'unknown';
+      let payload: TextExtraction | null = null;
+      try {
+        const raw = await this.boundedInterpret(source, abort);
+        state = 'invalid';
+        const parsed = validateExtraction(raw, source);
+        if (
+          parsed.schemaVersion !== 2 ||
+          parsed.topics.length !== 0 ||
+          parsed.representation === undefined ||
+          parsed.representation.modelVersion !== this.config.policy.semantics?.modelVersion ||
+          parsed.representation.vector.length !== this.config.policy.semantics?.dimensions
+        )
+          throw new Error('Invalid token semantic representation');
+        payload = parsed;
+        state = 'captured';
+      } catch {
+        /* A terminal reservation is never retried automatically. */
+      }
+      if (abort.aborted || this.clock() >= deadline) {
+        state = 'unknown';
+        payload = null;
+      }
+      await rows(
+        this.db,
+        "UPDATE nit_token_interpretations SET state=$3,payload=$4,available_at=$5 WHERE token_id=$1 AND extractor_hash=$2 AND state='pending'",
+        [
+          token.token_id,
+          this.extractorHash,
+          state,
+          payload === null ? null : JSON.stringify(payload),
+          this.clock(),
+        ]
+      );
+    }
   }
 
   /** Rebuildable projection over immutable metadata; no narrative-derived admission. */
@@ -540,6 +782,15 @@ export class LiveNarrativeRuntime {
         (i.token_id IS NULL OR i.original_name IS DISTINCT FROM t.name OR i.original_ticker IS DISTINCT FROM t.ticker) LIMIT 1`,
       [asOf]
     );
+    if (this.config.policy.semantics !== undefined) {
+      const unrepresented = await rows(
+        this.db,
+        `SELECT 1 FROM tokens t WHERE t.chain='solana' AND t.discovered_at<=$1 AND NOT EXISTS
+        (SELECT 1 FROM nit_token_interpretations r WHERE r.token_id=t.token_id AND r.extractor_hash=$2 AND r.state='captured' AND r.available_at<=$1) LIMIT 1`,
+        [asOf, this.extractorHash]
+      );
+      if (unrepresented.length > 0) return false;
+    }
     return missing.length === 0;
   }
   private async retrieveTokens(
@@ -550,11 +801,7 @@ export class LiveNarrativeRuntime {
       ...new Set(
         group.sources.flatMap((s) =>
           s.extraction.topics
-            .filter(
-              (t) =>
-                subjectKey(t.subjectQuote, this.config.policy).key === group.subject.key &&
-                normalized(t.catalystQuote) === group.catalystKey
-            )
+            .filter((t) => topicInGroup(s, t, group, this.config.policy))
             .map((t) => t.contextQuote)
         )
       ),
@@ -576,24 +823,78 @@ export class LiveNarrativeRuntime {
       ),
     ];
     const aliases = group.subject.aliases.map(normalized).filter((a) => a !== '');
-    const found = await rows<{
+    const meaningVectors = group.sources.flatMap((s) =>
+      s.extraction.topics
+        .filter((t) => topicInGroup(s, t, group, this.config.policy))
+        .flatMap((t) => (t.meaning === undefined ? [] : [t.meaning.vector]))
+    );
+    const sourceMedia = group.sources.flatMap((s) => {
+      const topics = s.extraction.topics.filter((t) =>
+        topicInGroup(s, t, group, this.config.policy)
+      );
+      return (s.extraction.mediaRepresentations ?? []).filter((m) =>
+        topics.some((t) =>
+          t.evidenceId === undefined
+            ? s.extraction.topics.length === 1
+            : s.extraction.mediaEvidence?.some(
+                (e) => e.id === t.evidenceId && e.mediaId === m.mediaId
+              )
+        )
+      );
+    });
+    const hashes = [...new Set(sourceMedia.flatMap((m) => [m.sha256, ...m.frameHashes]))];
+    const dhashes = [...new Set(sourceMedia.flatMap((m) => m.dhashes))];
+    const found = await retrievalRows<{
+      token_id: string;
       address: string;
       name: string;
       ticker: string;
       launch_time: Date;
       discovered_at: Date;
       cache_missing: boolean;
+      enrichment: TextExtraction | null;
+      enrichment_input_hash: string | null;
+      enrichment_available_at: Date | null;
     }>(
       this.db,
-      `SELECT t.address,t.name,t.ticker,t.launch_time,t.discovered_at,
+      `SELECT t.token_id,t.address,t.name,t.ticker,t.launch_time,t.discovered_at,
+        jsonb_build_object('representation',r.payload->'representation','mediaRepresentations',COALESCE(r.payload->'mediaRepresentations','[]'::jsonb)) AS enrichment,
+        r.input_hash AS enrichment_input_hash,r.available_at AS enrichment_available_at,
         (i.token_id IS NULL OR i.original_name IS DISTINCT FROM t.name OR i.original_ticker IS DISTINCT FROM t.ticker) AS cache_missing
-      FROM tokens t LEFT JOIN nit_token_search_index i USING(token_id) WHERE t.chain='solana' AND t.discovered_at<=$1 AND (
+      FROM tokens t LEFT JOIN nit_token_search_index i USING(token_id)
+      LEFT JOIN nit_token_interpretations r ON r.token_id=t.token_id AND r.extractor_hash=$7 AND r.state='captured' AND r.available_at<=$1
+      WHERE t.chain='solana' AND t.discovered_at<=$1 AND (
         i.token_id IS NULL OR i.original_name IS DISTINCT FROM t.name OR i.original_ticker IS DISTINCT FROM t.ticker OR
         t.address=ANY($2::text[]) OR i.ticker_normalized=ANY($5::text[]) OR
         EXISTS (SELECT 1 FROM unnest($3::text[]) a(value) WHERE strpos(i.name_normalized,a.value)>0) OR
-        (i.name_normalized<>'' AND EXISTS (SELECT 1 FROM unnest($4::text[]) c(value) WHERE strpos(c.value,i.name_normalized)>0)))
+        (i.name_normalized<>'' AND EXISTS (SELECT 1 FROM unnest($4::text[]) c(value) WHERE strpos(c.value,i.name_normalized)>0)) OR
+        EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(r.payload->'mediaRepresentations','[]'::jsonb)) m WHERE
+          m->>'sha256'=ANY($9::text[]) OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(m->'frameHashes') f WHERE f.value=ANY($9::text[])) OR
+          EXISTS (SELECT 1 FROM jsonb_array_elements_text(m->'dhashes') h CROSS JOIN unnest($10::text[]) s(value)
+            WHERE (64-bit_count(('x'||h.value)::bit(64) # ('x'||s.value)::bit(64)))*10000/64 >= $12)) OR
+        EXISTS (SELECT 1 FROM jsonb_array_elements($8::jsonb) v WHERE
+          (SELECT CASE WHEN SUM((a.value::text)::float8^2)>0 AND SUM((b.value::text)::float8^2)>0 THEN
+            ROUND(GREATEST(0,LEAST(1,SUM((a.value::text)::float8*(b.value::text)::float8)/SQRT(SUM((a.value::text)::float8^2)*SUM((b.value::text)::float8^2))))*10000)::int ELSE 0 END
+            FROM jsonb_array_elements(v.value) WITH ORDINALITY a(value,n)
+            JOIN jsonb_array_elements(COALESCE(r.payload->'representation'->'vector','[]'::jsonb)) WITH ORDINALITY b(value,n) USING(n)) >= $11))
       ORDER BY cache_missing DESC,t.address LIMIT $6`,
-      [asOf, mints, aliases, contexts.map(normalized), tags, this.config.universeLimit + 1]
+      [
+        asOf,
+        mints,
+        aliases,
+        contexts.map(normalized),
+        tags,
+        this.config.universeLimit + 1,
+        this.extractorHash,
+        JSON.stringify(meaningVectors),
+        hashes,
+        dhashes,
+        this.config.policy.semantics === undefined
+          ? 10001
+          : this.config.policy.semantics.retrievalBps - 1,
+        this.config.policy.semantics?.visualMatchBps ?? 10001,
+      ],
+      this.config.timeoutMs
     );
     return {
       tokens: found.slice(0, this.config.universeLimit).map((t) => ({
@@ -602,6 +903,21 @@ export class LiveNarrativeRuntime {
         ticker: t.ticker,
         launchTime: t.launch_time,
         discoveredAt: t.discovered_at,
+        ...(t.enrichment?.representation === undefined || t.enrichment.representation === null
+          ? {}
+          : { representation: t.enrichment.representation }),
+        mediaRepresentations: t.enrichment?.mediaRepresentations ?? [],
+        ...(t.enrichment_input_hash === null || t.enrichment_available_at === null
+          ? {}
+          : {
+              enrichmentEvidence: {
+                tokenId: t.token_id,
+                extractorHash: this.extractorHash,
+                inputHash: t.enrichment_input_hash,
+                availableAt: t.enrichment_available_at.toISOString(),
+                payloadHash: evidenceHash(t.enrichment),
+              },
+            }),
       })),
       overflow: found.length > this.config.universeLimit,
       ready: found.every((t) => !t.cache_missing),
@@ -628,6 +944,10 @@ export class LiveNarrativeRuntime {
       const happened = new Date(
         Math.min(...group.sources.map((s) => s.source.publishedAt.getTime()))
       );
+      const previous =
+        group.previousGroupKey === undefined || group.previousGroupKey === null
+          ? null
+          : await research.at(stableId(['episode', group.previousGroupKey]), now);
       const episode: ResearchRecord = {
         recordId: episodeId,
         kind: 'episode',
@@ -639,11 +959,19 @@ export class LiveNarrativeRuntime {
         producerVersion: ENGINE_VERSION,
         evidenceIds: artifacts.slice(0, 32),
         data: {
-          narrativeId: `nit-text:${group.key}`,
+          narrativeId:
+            previous?.kind === 'episode' ? previous.data.narrativeId : `nit-text:${group.key}`,
           tokenMints: [],
           universeMode: 'open',
-          episodeType: 'viral_burst',
-          previousEpisodeId: null,
+          episodeType:
+            previous?.kind === 'episode'
+              ? 'revival'
+              : group.category === 'cto'
+                ? 'cto'
+                : group.category === 'promotion'
+                  ? 'promotion'
+                  : 'viral_burst',
+          previousEpisodeId: previous?.kind === 'episode' ? previous.recordId : null,
           originArtifactIds: artifacts.slice(0, 32),
         },
       };
@@ -672,7 +1000,11 @@ export class LiveNarrativeRuntime {
         evidenceIds: [episodeId, ...evidence],
         data: {
           episodeId,
-          title: `${group.subject.label}: ${group.category}`.slice(0, 200),
+          title:
+            `${group.subject.label}: ${group.memberIds === undefined ? group.category : group.catalystKey}`.slice(
+              0,
+              200
+            ),
           narrativeStrengthBps: report.score.narrativeStrengthBps,
           status: report.score.status,
           artifactIds: evidence,
