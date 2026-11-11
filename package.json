@@ -9,6 +9,7 @@
     "local:wallet": "node scripts/local.mjs wallet",
     "local:ingestion": "node scripts/local.mjs ingestion",
     "local:narrative": "node scripts/local.mjs narrative",
+    "local:narrative:pilot": "node scripts/narrative-pilot.mjs",
     "local:console": "node scripts/local.mjs console",
     "local:paper": "node scripts/local.mjs paper",
     "local:observer": "node scripts/local.mjs observer",

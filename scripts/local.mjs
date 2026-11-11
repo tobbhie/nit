@@ -28,7 +28,11 @@ if (args.length !== 1 || !Object.hasOwn(services, service)) {
   try {
     // Load into the parent, then inherit at child startup. NODE_EXTRA_CA_CERTS
     // is read before --env-file/preload JavaScript on some supported Node builds.
+    const inheritedOpenAIKey = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
     process.loadEnvFile(join(root, '.env'));
+    if (process.env.OPENAI_API_KEY === undefined && inheritedOpenAIKey !== undefined)
+      process.env.OPENAI_API_KEY = inheritedOpenAIKey;
     const entrypoint = join(root, 'apps', services[service], 'dist', 'main.js');
     accessSync(entrypoint, constants.R_OK);
     if (process.env.NODE_EXTRA_CA_CERTS) {

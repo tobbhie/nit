@@ -8,6 +8,7 @@ import {
   NarrativeRuntimeSchema,
   MediaProcessor,
   R2MediaArchive,
+  OpenAITextInterpreter,
 } from '@nit/narrative-intelligence';
 
 async function main(): Promise<void> {
@@ -46,29 +47,34 @@ async function main(): Promise<void> {
     const interpreter =
       input.interpreter.kind === 'catalog'
         ? new CatalogTextInterpreter(input.policy)
-        : new GatewayTextInterpreter({
-            endpoint: input.interpreter.endpoint,
-            allowedOrigin: input.interpreter.allowedOrigin,
-            modelVersion: input.interpreter.modelVersion,
-            maxInputBytes: input.interpreter.maxInputBytes,
-            maxOutputTokens: input.interpreter.maxOutputTokens,
-            maxChargeMicros: input.interpreter.maxChargeMicros,
-            bearer: process.env['NIT_NARRATIVE_GATEWAY_BEARER_TOKEN'] ?? '',
-            ...(input.interpreter.rich === undefined
-              ? {}
-              : {
-                  rich: {
-                    modelVersion: input.interpreter.rich.modelVersion,
-                    dimensions: input.interpreter.rich.dimensions,
-                  },
-                }),
-            ...(media === undefined
-              ? {}
-              : {
-                  mediaProcessor: media,
-                  allowExternalMedia: input.interpreter.rich?.allowExternalMedia === true,
-                }),
-          });
+        : input.interpreter.provider === 'openai'
+          ? new OpenAITextInterpreter({
+              ...input.interpreter,
+              bearer: process.env['OPENAI_API_KEY']?.trim() ?? '',
+            })
+          : new GatewayTextInterpreter({
+              endpoint: input.interpreter.endpoint,
+              allowedOrigin: input.interpreter.allowedOrigin,
+              modelVersion: input.interpreter.modelVersion,
+              maxInputBytes: input.interpreter.maxInputBytes,
+              maxOutputTokens: input.interpreter.maxOutputTokens,
+              maxChargeMicros: input.interpreter.maxChargeMicros,
+              bearer: process.env['NIT_NARRATIVE_GATEWAY_BEARER_TOKEN'] ?? '',
+              ...(input.interpreter.rich === undefined
+                ? {}
+                : {
+                    rich: {
+                      modelVersion: input.interpreter.rich.modelVersion,
+                      dimensions: input.interpreter.rich.dimensions,
+                    },
+                  }),
+              ...(media === undefined
+                ? {}
+                : {
+                    mediaProcessor: media,
+                    allowExternalMedia: input.interpreter.rich?.allowExternalMedia === true,
+                  }),
+            });
     const runtime = new LiveNarrativeRuntime(
       db,
       interpreter,

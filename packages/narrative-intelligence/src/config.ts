@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { PolicySchema } from './contracts';
 import { MediaConfigSchema } from './media';
+import { OPENAI_NARRATIVE_ENDPOINT, OPENAI_NARRATIVE_MODEL } from './openai';
 
 export const NarrativeRuntimeSchema = z
   .object({
@@ -10,6 +11,7 @@ export const NarrativeRuntimeSchema = z
       z
         .object({
           kind: z.literal('gateway'),
+          provider: z.literal('openai').optional(),
           endpoint: z.string().url(),
           allowedOrigin: z.string().url(),
           modelVersion: z.string().min(1).max(200),
@@ -41,6 +43,19 @@ export const NarrativeRuntimeSchema = z
   })
   .strict()
   .superRefine((c, ctx) => {
+    if (
+      c.interpreter.kind === 'gateway' &&
+      c.interpreter.provider === 'openai' &&
+      (c.interpreter.endpoint !== OPENAI_NARRATIVE_ENDPOINT ||
+        c.interpreter.allowedOrigin !== 'https://api.openai.com' ||
+        c.interpreter.modelVersion !== OPENAI_NARRATIVE_MODEL ||
+        c.interpreter.maxInputBytes > 64000 ||
+        c.interpreter.rich !== undefined)
+    )
+      ctx.addIssue({
+        code: 'custom',
+        message: 'OpenAI requires its pinned text-only configuration',
+      });
     if (
       c.interpreter.kind === 'gateway' &&
       c.interpreter.rich?.media !== undefined &&

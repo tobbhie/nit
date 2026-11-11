@@ -94,6 +94,56 @@ captured extraction, avoiding repeated model purchases for the same text.
 
 ## Running the worker
 
+### Direct OpenAI text pilot
+
+The text-only `OpenAITextInterpreter` implements the existing metered interpreter
+contract directly using the [OpenAI Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create).
+No additional service or dependency is needed. It sends only the fixed extraction
+instructions, the supplied source text and a strict output schema to
+`https://api.openai.com/v1/responses`. It sends no wallets, positions, token
+inventory, source URLs or observation identifiers. Requests disable response
+storage (`store: false`); this is not a claim of zero provider retention.
+There are no tools, redirects, automatic retries or fallback models.
+Refusals, truncated output, model mismatches and invented citations fail closed.
+
+Runtime JSON uses the existing `kind: "gateway"` shape with `provider: "openai"`,
+`endpoint: "https://api.openai.com/v1/responses"`,
+`allowedOrigin: "https://api.openai.com"`, and
+`modelVersion: "gpt-5.4-mini-2026-03-17"`. Supply `OPENAI_API_KEY` in the environment;
+the key is never pinned in database configuration. Local launchers prefer the
+project's `.env` OpenAI key over an inherited key. The existing expiry,
+external-context grant and daily request/cost reservations still apply.
+This adapter rejects rich configuration and does not provide embeddings or media
+interpretation. Other providers and rich mode continue using the JSON gateway.
+
+Before sending, the adapter conservatively estimates maximum text cost from UTF-8
+request bytes plus framing allowance and the output token limit. It requires this
+estimate to fit the reserved charge. Rates are $0.75/$4.50 per million input/output
+tokens, respectively, checked against the
+[pinned model documentation](https://developers.openai.com/api/docs/models/gpt-5.4-mini)
+on 2026-11-11. These are application estimates, not provider-enforced billing caps;
+review pricing before a deployment. Failed or unknown calls retain their full
+runtime reservation.
+
+After building, run `pnpm local:narrative:pilot --check` for an offline prerequisite
+check. `pnpm local:narrative:pilot --check-db` also configures the runtime and seeds
+the disposable schema, then removes it without any model request.
+`pnpm local:narrative:pilot --run` deliberately makes up to **three paid
+requests** using synthetic support and contradiction observations. It requires an
+explicit disposable `NIT_TEST_DATABASE_URL` on loopback, `OPENAI_API_KEY`, and
+`FEATURE_EXECUTION=false`. It never uses the application database configuration.
+The existing test harness migrates a fresh isolated schema and removes it after
+the pilot; no synthetic data is added to live Supabase tables. The synthetic
+calibration is test data, not a live trading policy. The daily reservation is
+90,000 microdollars ($0.09), and each response is limited to 2,048 output tokens.
+The runner prints only counts, results and estimated usage. Missing usage is
+explicitly counted as unmetered requests, so a zero reported estimate does not
+establish zero billing. A second cycle checks
+extraction reuse without another purchase. This validates text API connectivity,
+provenance persistence and signal publication; it does not validate paid X access,
+rich semantic grouping, artwork, live narrative coverage or trading profitability.
+Normal unit/integration tests never invoke this paid pilot.
+
 Set `NIT_NARRATIVE_CONFIG_PATH` to private JSON conforming to
 [the runtime schema](src/config.ts), then run `@nit/app-narrative-worker`.
 Supply every policy value and explicit cycle/source/universe/episode/daily limit.
