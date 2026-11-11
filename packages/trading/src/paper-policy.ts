@@ -3,6 +3,7 @@ import { StrategySnapshot, JsonValue, createStrategySnapshot } from './strategy'
 import { units } from './fixed';
 
 export interface PaperPolicy {
+  readonly tokenRiskPolicyHash?: string;
   readonly orderCash: string;
   readonly minimumIndependentWallets: number;
   readonly takeProfitMultiple: string;
@@ -44,7 +45,14 @@ export function paperPolicy(input: StrategySnapshot): PaperPolicy {
   const protection = object(snapshot.protection.config);
   const risk = object(snapshot.risk.config);
   const simulation = object(risk['simulation']);
+  const tokenRiskPolicyHash = risk['tokenRiskPolicyHash'];
+  if (
+    tokenRiskPolicyHash !== undefined &&
+    (typeof tokenRiskPolicyHash !== 'string' || !/^[0-9a-f]{64}$/.test(tokenRiskPolicyHash))
+  )
+    throw new ValidationError('Token risk policy requires a pinned SHA-256 hash');
   const result: PaperPolicy = {
+    ...(tokenRiskPolicyHash === undefined ? {} : { tokenRiskPolicyHash }),
     orderCash: money(entry['orderCash'], true),
     minimumIndependentWallets: integer(entry['minimumIndependentWallets'], 2),
     takeProfitMultiple: money(exit['takeProfitMultiple'], true),

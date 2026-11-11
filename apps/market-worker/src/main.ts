@@ -25,6 +25,9 @@ import {
   SolanaMarketRecoveryHandler,
   seedStoredMigrationRecovery,
   PostgresCreationHistoryProgress,
+  TokenRiskConfigSchema,
+  NativeTokenRiskCollector,
+  meteredRiskRpc,
 } from '@nit/market';
 import { HealthReporter, Logger } from '@nit/observability';
 import { JobQueue, Worker } from '@nit/queue';
@@ -38,6 +41,21 @@ async function main(): Promise<void> {
     throw new ConfigurationError('Solana market intake is disabled');
   }
   const marketConfig = config.solanaMarket;
+  const abort = new AbortController();
+  const riskPath = process.env['NIT_TOKEN_RISK_CONFIG_PATH'];
+  let riskCollector: NativeTokenRiskCollector | undefined;
+  if (riskPath !== undefined) {
+    if ((await stat(riskPath)).size > 65536)
+      throw new ConfigurationError('Token risk config exceeds 64 KiB');
+    const riskConfig = TokenRiskConfigSchema.parse(
+      JSON.parse(await readFile(riskPath, 'utf8')) as unknown
+    );
+    riskCollector = new NativeTokenRiskCollector(
+      db,
+      meteredRiskRpc(db, marketConfig.httpEndpoint, riskConfig, undefined, abort.signal),
+      riskConfig
+    );
+  }
   const factsPath = process.env['NIT_EXECUTION_FACTS_CONFIG_PATH'];
   let refresher: ExecutionFactsRefresher | undefined;
   let factsIntervalMs = 1000;
@@ -231,7 +249,6 @@ async function main(): Promise<void> {
   }, 30_000);
 
   let shuttingDown = false;
-  const abort = new AbortController();
   const shutdown = (): void => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -292,6 +309,26 @@ async function main(): Promise<void> {
     refresh(),
     recoveryWorker.run(),
     recoverySeeds(),
+    ...(riskCollector === undefined
+      ? []
+      : [
+          (async (): Promise<void> => {
+            while (!abort.signal.aborted) {
+              try {
+                logger.info('Token risk collection', {
+                  ...(await riskCollector.cycle(abort.signal)),
+                });
+              } catch {
+                logger.error('Token risk collection unavailable; provider bodies omitted');
+              }
+              try {
+                await delay(1000, undefined, { signal: abort.signal });
+              } catch {
+                break;
+              }
+            }
+          })(),
+        ]),
     ...(marketConfig.reconciliation.enabled ? [worker.run()] : []),
   ];
   try {

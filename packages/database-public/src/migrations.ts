@@ -1782,9 +1782,55 @@ export const MIGRATIONS: readonly Migration[] = [
 
     `,
   },
+  // Risk evidence is append-only; usage is bounded by provider/day/operation, not mint.
+  {
+    id: '0028_token_risk_evidence',
+    description: 'Native token risk evidence, pinned entry gates and collector quota rollups',
+    up: `
+    CREATE TABLE IF NOT EXISTS token_risk_policies (
+      policy_hash TEXT PRIMARY KEY CHECK(policy_hash ~ '^[0-9a-f]{64}$'),
+      policy JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS token_risk_assessments (
+      assessment_id UUID PRIMARY KEY, token_mint TEXT NOT NULL, market_address TEXT NOT NULL,
+      policy_hash TEXT NOT NULL REFERENCES token_risk_policies(policy_hash),
+      observed_at TIMESTAMPTZ NOT NULL, available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      gate JSONB NOT NULL, evidence JSONB NOT NULL,
+      CHECK(observed_at <= available_at),
+      CHECK(gate->>'tokenMint'=token_mint AND gate->>'marketAddress'=market_address AND gate->>'policyHash'=policy_hash
+        AND (gate->>'assessmentId')::uuid=assessment_id
+        AND (gate->>'observedAt')::timestamptz=observed_at AND (gate->>'availableAt')::timestamptz=available_at),
+      CHECK(gate->>'status' IN ('clear','blocked','incomplete','unavailable'))
+    );
+    CREATE INDEX IF NOT EXISTS token_risk_lookup ON token_risk_assessments(token_mint,market_address,observed_at DESC,available_at DESC);
+    CREATE OR REPLACE FUNCTION token_risk_immutable() RETURNS TRIGGER AS $$ BEGIN
+      RAISE EXCEPTION 'Token risk evidence is immutable';
+    END; $$ LANGUAGE plpgsql;
+    DROP TRIGGER IF EXISTS token_risk_policy_immutable ON token_risk_policies;
+    CREATE TRIGGER token_risk_policy_immutable BEFORE UPDATE OR DELETE ON token_risk_policies
+      FOR EACH ROW EXECUTE FUNCTION token_risk_immutable();
+    DROP TRIGGER IF EXISTS token_risk_assessment_immutable ON token_risk_assessments;
+    CREATE TRIGGER token_risk_assessment_immutable BEFORE UPDATE OR DELETE ON token_risk_assessments
+      FOR EACH ROW EXECUTE FUNCTION token_risk_immutable();
+    CREATE TABLE IF NOT EXISTS token_risk_provider_budgets (
+      day DATE NOT NULL, provider_key TEXT NOT NULL, requests BIGINT NOT NULL CHECK(requests>=0),
+      credits BIGINT NOT NULL CHECK(credits>=0), quota_hash TEXT NOT NULL CHECK(quota_hash ~ '^[0-9a-f]{64}$'), PRIMARY KEY(day,provider_key)
+    );
+    CREATE TABLE IF NOT EXISTS token_risk_provider_usage (
+      day DATE NOT NULL, provider_key TEXT NOT NULL, operation TEXT NOT NULL,
+      requests BIGINT NOT NULL DEFAULT 0, credits BIGINT NOT NULL DEFAULT 0,
+      succeeded BIGINT NOT NULL DEFAULT 0, failed BIGINT NOT NULL DEFAULT 0,
+      PRIMARY KEY(day,provider_key,operation)
+    );
+  `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
+  'token_risk_policies',
+  'token_risk_assessments',
+  'token_risk_provider_budgets',
+  'token_risk_provider_usage',
   'solana_creation_searches',
   'nit_semantic_nodes',
   'nit_semantic_members',

@@ -13,6 +13,7 @@ import {
   generateCandidateResolutionId,
   generateSignalId,
   failure,
+  tokenRiskEntryRejection,
 } from '@nit/domain';
 import {
   CandidateActionState as State,
@@ -56,6 +57,11 @@ export class CandidateResolver {
     private readonly policy: ResolverPolicy,
     private readonly cashAsset: string
   ) {
+    if (
+      policy.tokenRiskPolicyHash !== undefined &&
+      !/^[0-9a-f]{64}$/.test(policy.tokenRiskPolicyHash)
+    )
+      throw new Error('Invalid token risk policy hash');
     for (const value of [
       policy.minimumNarrativeStrengthBps,
       policy.minimumLinkConfidenceBps,
@@ -177,6 +183,7 @@ export class CandidateResolver {
             /* Invalid or unavailable evidence remains unknown. */
           }
         let marketStatus: ResolvedCandidate['marketStatus'] = 'unknown';
+        let riskRejection: string | null = null;
         const evidenceIds: EvidenceId[] = [
           ...source.evidence_ids,
           ...active.map((row) => row.wallet_swap_id),
@@ -195,6 +202,17 @@ export class CandidateResolver {
               ? 'safe'
               : 'blocked';
           evidenceIds.push(market.value.snapshotId as EvidenceId);
+          riskRejection = tokenRiskEntryRejection(
+            market.value.tokenRisk,
+            this.policy.tokenRiskPolicyHash,
+            market.value.tokenMint,
+            market.value.marketAddress,
+            now
+          );
+          if (this.policy.tokenRiskPolicyHash !== undefined && market.value.tokenRisk !== undefined)
+            evidenceIds.push(market.value.tokenRisk.assessmentId as EvidenceId);
+          if (riskRejection !== null && marketStatus !== 'blocked')
+            marketStatus = riskRejection === 'TOKEN_RISK_BLOCKED' ? 'blocked' : 'unknown';
         }
         const narrativeConfirmed =
           input.narrativeStrengthBps >= this.policy.minimumNarrativeStrengthBps &&
@@ -225,6 +243,7 @@ export class CandidateResolver {
         const linkageStatus =
           link.linkageStatus ?? (narrativeConfirmed ? 'confirmed' : 'observed_nonconfirming');
         const reasons = [...link.reasonCodes];
+        if (riskRejection !== null) reasons.push(riskRejection);
         if (token.length === 0) reasons.push('TOKEN_NOT_CANONICALLY_DISCOVERED');
         if (!narrativeConfirmed) reasons.push('NARRATIVE_LINK_NOT_QUALIFIED');
         if (!walletConfirmed) reasons.push('WALLET_CONFIRMATION_INSUFFICIENT');

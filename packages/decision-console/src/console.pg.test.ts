@@ -216,6 +216,13 @@ describe.skipIf(!hasTestDatabase())(
         ])
       ).toEqual([{ status: 'pending' }]);
     });
+    it('reports absent risk as unavailable rather than a reassuring rating', async () => {
+      consoleService = monitoring();
+      await command(`/risk ${TOKEN}`);
+      await consoleService.flush();
+      expect(api.sent.at(-1)?.body.text).toContain('No token-risk evidence');
+      expect(api.sent.at(-1)?.body.text).toContain('not a safe rating');
+    });
     it('refuses trader permissions or paper portfolio scope in monitoring mode', () => {
       for (const operator of [
         { userId: '1', chatId: '10', role: 'trader' as const, portfolioIds: [] },

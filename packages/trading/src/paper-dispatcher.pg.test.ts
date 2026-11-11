@@ -26,6 +26,7 @@ describe.skipIf(!hasTestDatabase())('continuous paper dispatch and approved mark
   }, 30_000);
   beforeEach(async () => {
     now = new Date(PAPER_START);
+    await paperRows(harness.db, 'TRUNCATE token_risk_assessments,token_risk_policies');
     await paperRows(
       harness.db,
       `TRUNCATE tokens,signals,strategy_entry_versions,
@@ -127,6 +128,57 @@ describe.skipIf(!hasTestDatabase())('continuous paper dispatch and approved mark
     if (created.kind === 'failure') throw created.error;
   }
 
+  it('attaches point-in-time risk for the current market without hiding newer unavailable evidence', async () => {
+    await publish();
+    const hash = 'a'.repeat(64);
+    const marketAddress = '33333333333333333333333333333333';
+    await paperRows(
+      harness.db,
+      "INSERT INTO token_risk_policies(policy_hash,policy) VALUES ($1,'{}')",
+      [hash]
+    );
+    async function assessment(
+      status: string,
+      available: Date,
+      market = marketAddress
+    ): Promise<void> {
+      const id = randomUUID();
+      const gate = {
+        assessmentId: id,
+        policyHash: hash,
+        tokenMint: PAPER_TOKEN,
+        marketAddress: market,
+        status,
+        reasonCodes: [],
+        observedAt: available.toISOString(),
+        availableAt: available.toISOString(),
+        expiresAt: new Date(available.getTime() + 60000).toISOString(),
+      };
+      await paperRows(
+        harness.db,
+        `INSERT INTO token_risk_assessments
+        (assessment_id,token_mint,market_address,policy_hash,observed_at,available_at,gate,evidence)
+        VALUES ($1,$2,$3,$4,$5,$5,$6::jsonb,'{}')`,
+        [id, PAPER_TOKEN, market, hash, available, JSON.stringify(gate)]
+      );
+    }
+    await assessment('clear', now);
+    const later = new Date(now.getTime() + 1000);
+    await assessment('unavailable', later);
+    const feed = new PostgresPaperMarketFeed(harness.db, ['approved-rpc']);
+    const first = await feed.latest(PAPER_TOKEN, 'SOL', now);
+    expect(first.kind === 'success' ? first.value.tokenRisk?.status : null).toBe('clear');
+    now = later;
+    await assessment('clear', now, '44444444444444444444444444444444');
+    const second = await feed.latest(PAPER_TOKEN, 'SOL', now);
+    expect(second.kind).toBe('success');
+    expect(second.kind === 'success' ? second.value.tokenRisk?.status : null).toBe('unavailable');
+    if (first.kind === 'success' && second.kind === 'success') {
+      expect(first.value.snapshotId).not.toBe(second.value.snapshotId);
+      expect(second.value.availableAt).toEqual(later);
+      expect(first.value.tokenRisk?.status).toBe('clear');
+    }
+  });
   it('shares approved feed observations across portfolios and resumes with durable receipts', async () => {
     const ids = [await portfolio(), await portfolio()];
     await publish();

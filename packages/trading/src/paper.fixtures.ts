@@ -15,6 +15,7 @@ export function fixtureStrategy(
     fillBps?: number;
     failEveryNthOrder?: number;
     maxPositions?: number;
+    tokenRiskPolicyHash?: string;
   } = {}
 ): StrategySnapshot {
   const version = options.version ?? 1;
@@ -50,6 +51,9 @@ export function fixtureStrategy(
       policyId: 'R01',
       version,
       config: {
+        ...(options.tokenRiskPolicyHash === undefined
+          ? {}
+          : { tokenRiskPolicyHash: options.tokenRiskPolicyHash }),
         maxTradeCash: '20',
         maxExposureCash: '50',
         minLiquidityCash: '100',

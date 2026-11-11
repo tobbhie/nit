@@ -30,6 +30,8 @@ Commands:
 - `/ping` or `/test-alert`: an explicitly labelled delivery test, without creating
   synthetic market evidence or a trade.
 - `/outbox`: delivery states for the authorized operator.
+- `/risk <mint>`: latest captured native risk component coverage and policy identity;
+  expired evidence is marked stale and missing evidence is not labelled safe.
 
 Normal paper controls remain available in `mode: "paper"` (the existing default
 when mode is absent), with an explicit resolver policy, trader role and authorized

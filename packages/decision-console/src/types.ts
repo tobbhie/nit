@@ -2,6 +2,7 @@ import { EvidenceId, SignalId } from '@nit/domain';
 import { CandidateActionState, EvidenceStatus } from '@nit/signals';
 
 export interface ResolverPolicy {
+  readonly tokenRiskPolicyHash?: string;
   readonly minimumNarrativeStrengthBps: number;
   readonly minimumLinkConfidenceBps: number;
   readonly minimumSelectionMarginBps: number;

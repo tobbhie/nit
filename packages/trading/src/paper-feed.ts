@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import { DatabasePool } from '@nit/database-public';
-import { Result, failure, success } from '@nit/domain';
+import { Result, TokenRiskGate, failure, success } from '@nit/domain';
 import { PaperMarketSnapshot, validatePaperMarket } from './paper-market';
 import { paperRows } from './paper-store';
 
@@ -61,11 +62,18 @@ export class PostgresPaperMarketFeed implements PaperMarketFeed {
         raw_payload: Record<string, unknown>;
         market_address: string | null;
         market_active_from: Date;
+        token_risk: TokenRiskGate | null;
+        risk_available_at: Date | null;
       }>(
         this.db,
-        `SELECT s.snapshot_id,s.venue,s.observed_at,s.recorded_at,s.raw_payload,v.market_address,v.active_from AS market_active_from
+        `SELECT s.snapshot_id,s.venue,s.observed_at,s.recorded_at,s.raw_payload,v.market_address,v.active_from AS market_active_from,
+          risk.gate AS token_risk,risk.available_at AS risk_available_at
         FROM market_snapshots s JOIN tokens t ON t.token_id=s.token_id
         JOIN token_markets v ON v.token_id=t.token_id AND v.venue=s.venue
+        LEFT JOIN LATERAL (SELECT a.gate,a.available_at FROM token_risk_assessments a
+          WHERE a.token_mint=t.address AND a.market_address=v.market_address
+          AND a.available_at <= $3 AND a.observed_at <= $3
+          ORDER BY a.observed_at DESC,a.available_at DESC,a.assessment_id DESC LIMIT 1) risk ON TRUE
         WHERE t.chain='solana' AND t.address=$1 AND s.source=ANY($2::text[])
           AND s.observed_at <= $3 AND s.recorded_at <= $3
           AND v.active_from <= s.observed_at AND v.active_from <= $3
@@ -93,8 +101,22 @@ export class PostgresPaperMarketFeed implements PaperMarketFeed {
           : new Date(requiredText(facts['occurredAt']));
       if (occurredAt > row.observed_at || occurredAt < row.market_active_from)
         return failure(new Error('Execution state time is outside the captured market interval'));
+      const hasRisk = row.token_risk !== null && row.token_risk !== undefined;
+      const digest = hasRisk
+        ? createHash('sha256')
+            .update(JSON.stringify([row.snapshot_id, row.token_risk]))
+            .digest('hex')
+        : null;
+      const combinedId =
+        digest === null
+          ? row.snapshot_id
+          : `${digest.slice(0, 8)}-${digest.slice(8, 12)}-8${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
       const snapshot: PaperMarketSnapshot = {
-        snapshotId: row.snapshot_id,
+        marketAddress: row.market_address,
+        ...(row.token_risk === null || row.token_risk === undefined
+          ? {}
+          : { tokenRisk: row.token_risk }),
+        snapshotId: combinedId,
         tokenMint,
         venue: row.venue,
         cashAsset,
@@ -110,7 +132,10 @@ export class PostgresPaperMarketFeed implements PaperMarketFeed {
         criticalRisk: requiredBoolean(facts['criticalRisk']),
         occurredAt,
         observedAt: row.recorded_at,
-        availableAt: row.recorded_at,
+        availableAt:
+          row.risk_available_at === null || row.risk_available_at === undefined
+            ? row.recorded_at
+            : new Date(Math.max(row.recorded_at.getTime(), row.risk_available_at.getTime())),
       };
       validatePaperMarket(snapshot, asOf);
       return success(snapshot);

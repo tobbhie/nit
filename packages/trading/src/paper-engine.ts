@@ -10,6 +10,7 @@ import {
   generateOrderId,
   generatePositionEventId,
   generatePositionId,
+  tokenRiskEntryRejection,
 } from '@nit/domain';
 import { SignalEnvelope, SignalKind, parseSignalEnvelope, evidenceHash } from '@nit/signals';
 import { BPS, UNIT, amount, minimum, units } from './fixed';
@@ -594,6 +595,16 @@ function marketRejection(
   if (now.getTime() - market.occurredAt.getTime() > policy.maxMarketAgeMs) return 'STALE_MARKET';
   if (!market.verified || !market.tradable || !market.sellable) return 'MARKET_NOT_EXECUTABLE';
   if (entry && market.criticalRisk) return 'CRITICAL_TOKEN_RISK';
+  if (entry) {
+    const rejection = tokenRiskEntryRejection(
+      market.tokenRisk,
+      policy.tokenRiskPolicyHash,
+      market.tokenMint,
+      market.marketAddress,
+      now
+    );
+    if (rejection !== null) return rejection;
+  }
   if (entry && units(market.realCashReserves) < units(policy.minLiquidityCash))
     return 'INSUFFICIENT_LIQUIDITY';
   return null;

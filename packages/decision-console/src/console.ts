@@ -664,6 +664,49 @@ export class TelegramDecisionConsole {
           `Captured wallet swaps: ${status.wallet_swaps}\nSource observations: ${status.observations}\n` +
           `Last token discovery: ${status.last_discovery?.toISOString() ?? 'unavailable'}\n` +
           'Persisted counts do not establish worker health or complete source coverage.\nLive execution is unavailable in this console.';
+      } else if (command === '/risk') {
+        if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(arg)) throw new Error('Use /risk <Solana mint>.');
+        const rows = await paperRows<{
+          gate: Record<string, unknown>;
+          evidence: Record<string, unknown>;
+          current_market: boolean;
+        }>(
+          db,
+          `SELECT a.gate,a.evidence,EXISTS (SELECT 1 FROM tokens t JOIN token_markets v USING(token_id)
+            WHERE t.chain='solana' AND t.address=a.token_mint AND v.market_address=a.market_address
+            AND v.active_from<=$2 AND (v.active_until IS NULL OR v.active_until>$2)) AS current_market
+          FROM token_risk_assessments a WHERE token_mint=$1
+          AND available_at<=$2 AND observed_at<=$2 ORDER BY observed_at DESC,available_at DESC,assessment_id DESC LIMIT 1`,
+          [arg, this.clock.now()]
+        );
+        const row = rows[0];
+        if (row === undefined)
+          response =
+            'No token-risk evidence captured for this mint. Collection may be disabled; this is not a safe rating.';
+        else {
+          const components = object(row.evidence['components']);
+          const lines = [
+            'authorities',
+            'holders',
+            'liquidity',
+            'developer',
+            'coordination',
+            'clusters',
+          ].map((name) => {
+            const component = object(components[name]);
+            return `${name}: ${String(component['status'])}; coverage ${String(component['coverage'])}`;
+          });
+          const expiry =
+            typeof row.gate['expiresAt'] === 'string' ? Date.parse(row.gate['expiresAt']) : NaN;
+          const status = !row.current_market
+            ? 'HISTORICAL MARKET'
+            : !Number.isFinite(expiry) || expiry <= this.clock.now().getTime()
+              ? 'STALE'
+              : String(row.gate['status']).toUpperCase();
+          response =
+            `TOKEN RISK: ${status}\n${arg}\nMarket: ${String(row.gate['marketAddress'])}\n${lines.join('\n')}\nPolicy: ${String(row.gate['policyHash'])}\n` +
+            'Policy clearance is limited to required checks. No guarantee of rug safety; native checks do not supply developer reputation or full bundle/cluster analysis.';
+        }
       } else if (command === '/ping' || command === '/test-alert') {
         response =
           'NIT TEST ALERT: Telegram command received and delivery queued. No trade or source ingestion was triggered.';
@@ -837,8 +880,8 @@ export class TelegramDecisionConsole {
           'Dataset creation and bounded replay scheduling use @nit/app-research-worker. Use /run-report <experiment> for authorized results. No backtest has been started by this command.';
       } else
         response = this.options.monitorOnly
-          ? '/status · /health · /ping · /test-alert · /outbox\nMONITOR ONLY: paper trading controls are disabled.'
-          : '/candidates <narrative> · /strategies · /strategy <portfolio> · /use <portfolio> · /portfolio · /positions · /pause <portfolio> · /resume <portfolio> · /stop <position> <price> · /outbox\nPaper only; no live execution.';
+          ? '/status · /health · /risk <mint> · /ping · /test-alert · /outbox\nMONITOR ONLY: paper trading controls are disabled.'
+          : '/risk <mint> · /candidates <narrative> · /strategies · /strategy <portfolio> · /use <portfolio> · /portfolio · /positions · /pause <portfolio> · /resume <portfolio> · /stop <position> <price> · /outbox\nPaper only; no live execution.';
       await this.enqueue(db, operator, { text: response.slice(0, 4000) }, `command:${updateId}`);
     });
     if (result.kind === 'failure') throw result.error;

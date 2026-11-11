@@ -1,6 +1,6 @@
 import { DatabasePool, PostgresSignalStore } from '@nit/database-public';
 import { TestDatabase, createTestDatabase, hasTestDatabase } from '@nit/database-public/testing';
-import { PortfolioId, SignalId } from '@nit/domain';
+import { PortfolioId, SignalId, TokenRiskGate } from '@nit/domain';
 import { SignalKind } from '@nit/signals';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { amount, units } from './fixed';
@@ -62,6 +62,70 @@ describe.skipIf(!hasTestDatabase())('persisted standalone paper trader', () => {
     return rows[0];
   }
 
+  function riskGate(): TokenRiskGate {
+    return {
+      assessmentId: '00000000-0000-4000-8000-000000000001',
+      tokenMint: PAPER_TOKEN,
+      marketAddress: PAPER_TOKEN,
+      policyHash: 'a'.repeat(64),
+      status: 'clear',
+      reasonCodes: [],
+      observedAt: now.toISOString(),
+      availableAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + 60000).toISOString(),
+    };
+  }
+  it('requires pinned risk for entries but permits protective sells when risk evidence is lost', async () => {
+    now = new Date(PAPER_START);
+    const missing = await run({ version: 1000, tokenRiskPolicyHash: 'a'.repeat(64) });
+    const good = await run({ version: 1000, tokenRiskPolicyHash: 'a'.repeat(64) });
+    const trader = new PostgresPaperTrader(db, clock);
+    await trader.tick(missing, fixtureMarket(now), await signal());
+    expect(
+      await paperRows(db, 'SELECT 1 FROM orders WHERE portfolio_id=$1', [missing])
+    ).toHaveLength(0);
+    const gate = riskGate();
+    await trader.tick(
+      good,
+      { ...fixtureMarket(now), marketAddress: PAPER_TOKEN, tokenRisk: gate },
+      await signal()
+    );
+    expect(await paperRows(db, 'SELECT 1 FROM orders WHERE portfolio_id=$1', [good])).toHaveLength(
+      1
+    );
+    now = new Date(now.getTime() + 1000);
+    await trader.tick(good, { ...fixtureMarket(now), marketAddress: PAPER_TOKEN, tokenRisk: gate });
+    expect((await position(good))['open_quantity']).not.toBe('0');
+    now = new Date(now.getTime() + 1000);
+    await trader.tick(good, fixtureMarket(now, '3000'));
+    expect(
+      await paperRows(db, "SELECT 1 FROM orders WHERE portfolio_id=$1 AND side='sell'", [good])
+    ).toHaveLength(1);
+  });
+  it('rechecks risk expiry before delayed buy settlement', async () => {
+    now = new Date(PAPER_START);
+    const id = await run({ version: 1000, tokenRiskPolicyHash: 'a'.repeat(64) });
+    const trader = new PostgresPaperTrader(db, clock);
+    const gate = { ...riskGate(), expiresAt: new Date(now.getTime() + 500).toISOString() };
+    await trader.tick(
+      id,
+      { ...fixtureMarket(now), marketAddress: PAPER_TOKEN, tokenRisk: gate },
+      await signal()
+    );
+    now = new Date(now.getTime() + 1000);
+    await trader.tick(id, { ...fixtureMarket(now), marketAddress: PAPER_TOKEN, tokenRisk: gate });
+    expect(
+      await paperRows(db, 'SELECT 1 FROM positions WHERE portfolio_id=$1 AND open_quantity>0', [id])
+    ).toHaveLength(0);
+    expect(
+      await paperRows(
+        db,
+        `SELECT e.detail->>'reason' AS reason FROM order_events e JOIN orders o USING(order_id)
+      WHERE o.portfolio_id=$1 AND e.status='failed'`,
+        [id]
+      )
+    ).toEqual([{ reason: 'TOKEN_RISK_STALE_OR_FUTURE' }]);
+  });
   it('isolates exit-child portfolios and protects the actual original-quantity moonbag', async () => {
     now = new Date(PAPER_START);
     const first = await run();

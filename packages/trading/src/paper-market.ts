@@ -1,10 +1,12 @@
-import { ValidationError } from '@nit/domain';
+import { ValidationError, TokenRiskGate } from '@nit/domain';
 import { BPS, UNIT, amount, minimum, quantize, units } from './fixed';
 import { PaperPolicy } from './paper-policy';
 import { OrderSide } from './runtime';
 
 /** Reserve-model evidence, not an executable route or a guarantee of real fills. */
 export interface PaperMarketSnapshot {
+  readonly marketAddress?: string;
+  readonly tokenRisk?: TokenRiskGate;
   readonly snapshotId: string;
   readonly tokenMint: string;
   readonly cashAsset: string;
