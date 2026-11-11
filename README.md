@@ -69,6 +69,22 @@ scans repair reconnect gaps. A cursor advances only after selected transactions
 are fetched, parsed, persisted, and published, so restart recovery safely repeats
 the configured overlap window.
 
+Wallet RPC reads request parsed transactions through version 1, matching market
+intake. Transient transport, overload, interrupted response bodies and delayed
+transaction indexing receive bounded retries; permanent authorization failures
+remain failures. Provider error text is not forwarded into application errors.
+The shared socket checks subscription acknowledgements and bounds pending work
+to 128 notifications. In-flight/recent duplicate signatures share one read;
+overload or a failed handler reconnects and relies on finalized reconciliation.
+`Wallet health` logs expose subscription coverage, backlog/errors and how many
+configured wallets have persisted cursors, including during the initial scan.
+Reconciliation gives each wallet a bounded page/transaction budget per cycle,
+retains unfinished work between cycles, and processes its selected transactions
+oldest first. A busy wallet yields to the remaining watchlist. Its durable cursor
+advances only after the entire selected window completes; a restart re-reads
+unfinished work from that cursor. The pending-work cap fails closed rather than
+skipping history. A completed cycle can still report deferred wallets warming up.
+
 The existing `ws` dependency is reused; no additional network dependency is
 introduced. The configured RPC provider receives watched public addresses,
 transaction signatures, and parsed public transactions solely for attribution

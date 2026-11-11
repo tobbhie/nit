@@ -50,6 +50,7 @@ export interface SolanaWalletSubscriberOptions {
   reconnectMaxMs?: number;
   onProcessed?: (summary: WalletProcessingSummary) => void;
   onError?: (error: Error) => void;
+  maxPendingNotifications?: number;
 }
 
 /** One physical socket with one `mentions` subscription per watched wallet. */
@@ -68,6 +69,14 @@ export class SolanaWalletSubscriber {
   private stopped = true;
   private reconnectAttempt = 0;
   private tail: Promise<void> = Promise.resolve();
+  private pending = 0;
+  private duplicates = 0;
+  private errors = 0;
+  private overflows = 0;
+  private readonly inFlight = new Set<string>();
+  private readonly recent = new Set<string>();
+  private readonly acknowledged = new Set<number>();
+  private readonly maxPending: number;
 
   constructor(options: SolanaWalletSubscriberOptions) {
     this.endpoint = websocketEndpoint(options.endpoint);
@@ -80,6 +89,27 @@ export class SolanaWalletSubscriber {
     this.reconnectMaxMs = options.reconnectMaxMs ?? 30_000;
     this.onProcessed = options.onProcessed;
     this.onError = options.onError;
+    this.maxPending = options.maxPendingNotifications ?? 128;
+    if (!Number.isSafeInteger(this.maxPending) || this.maxPending < 1 || this.maxPending > 10000)
+      throw new Error('Invalid wallet notification backlog limit');
+  }
+
+  getStats(): {
+    pending: number;
+    duplicates: number;
+    errors: number;
+    overflows: number;
+    acknowledged: number;
+    expected: number;
+  } {
+    return {
+      pending: this.pending,
+      duplicates: this.duplicates,
+      errors: this.errors,
+      overflows: this.overflows,
+      acknowledged: this.acknowledged.size,
+      expected: this.walletAddresses.length,
+    };
   }
 
   start(): void {
@@ -109,7 +139,7 @@ export class SolanaWalletSubscriber {
     this.connection = connection;
     connection.onOpen(() => {
       if (this.connection !== connection || this.stopped) return;
-      this.reconnectAttempt = 0;
+      this.acknowledged.clear();
       this.walletAddresses.forEach((wallet, index) =>
         connection.send(
           JSON.stringify({
@@ -127,7 +157,7 @@ export class SolanaWalletSubscriber {
     connection.onError((error) => {
       if (this.connection !== connection || this.stopped) return;
       this.report(error);
-      connection.close();
+      this.disconnect(connection);
     });
     connection.onClose(() => {
       if (this.connection !== connection) return;
@@ -142,35 +172,80 @@ export class SolanaWalletSubscriber {
       decoded = JSON.parse(data) as unknown;
     } catch {
       this.report(new Error('Solana wallet WebSocket returned invalid JSON'));
-      connection.close();
+      this.disconnect(connection);
+      return;
+    }
+    const response = record(decoded);
+    const requestId = response?.['id'];
+    if (
+      typeof requestId === 'number' &&
+      Number.isInteger(requestId) &&
+      requestId >= 1 &&
+      requestId <= this.walletAddresses.length
+    ) {
+      if (typeof response?.['result'] !== 'number' || response['error'] !== undefined) {
+        this.report(new Error('Wallet log subscription rejected'));
+        this.disconnect(connection);
+      } else this.acknowledged.add(requestId);
       return;
     }
     const notification = parseWalletLogNotification(decoded);
     if (notification.kind === 'failure') {
       this.report(notification.error);
-      connection.close();
+      this.disconnect(connection);
       return;
     }
     if (notification.value === null) return;
-    this.tail = this.tail.then(async () => {
-      const transaction = await this.rpc.fetchTransaction(
-        notification.value!.signature,
-        notification.value!.slot,
-        'confirmed'
-      );
-      if (transaction.kind === 'failure') {
-        this.report(transaction.error);
-        connection.close();
-        return;
-      }
-      const processed = await this.service.process(transaction.value);
-      if (processed.kind === 'failure') {
-        this.report(processed.error);
-        connection.close();
-        return;
-      }
-      this.onProcessed?.(processed.value);
-    });
+    const item = notification.value;
+    if (this.inFlight.has(item.signature) || this.recent.has(item.signature)) {
+      this.duplicates++;
+      return;
+    }
+    if (this.pending >= this.maxPending) {
+      this.overflows++;
+      this.report(new Error('Wallet notification backlog full; finalized reconciliation required'));
+      this.disconnect(connection);
+      return;
+    }
+    this.pending++;
+    this.inFlight.add(item.signature);
+    this.tail = this.tail
+      .then(async () => {
+        const transaction = await this.rpc.fetchTransaction(item.signature, item.slot, 'confirmed');
+        if (transaction.kind === 'failure') {
+          this.report(transaction.error);
+          this.disconnect(connection);
+          return;
+        }
+        const processed = await this.service.process(transaction.value);
+        if (processed.kind === 'failure') {
+          this.report(processed.error);
+          this.disconnect(connection);
+          return;
+        }
+        this.onProcessed?.(processed.value);
+        this.recent.add(item.signature);
+        if (this.recent.size > 1024) this.recent.delete(this.recent.values().next().value!);
+        if (this.connection === connection) this.reconnectAttempt = 0;
+      })
+      .catch(() => {
+        this.report(
+          new Error('Wallet ingestion handler failed; finalized reconciliation required')
+        );
+        this.disconnect(connection);
+      })
+      .finally(() => {
+        this.pending--;
+        this.inFlight.delete(item.signature);
+      });
+  }
+
+  private disconnect(connection: WalletWebSocketConnection): void {
+    if (this.connection !== connection) return;
+    this.connection = undefined;
+    this.acknowledged.clear();
+    connection.close();
+    this.scheduleReconnect();
   }
 
   private scheduleReconnect(): void {
@@ -187,12 +262,13 @@ export class SolanaWalletSubscriber {
   }
 
   private report(error: Error): void {
+    this.errors++;
     this.onError?.(error);
   }
 }
 
 function defaultConnectionFactory(endpoint: string): WalletWebSocketConnection {
-  const socket = new WebSocketClient(endpoint);
+  const socket = new WebSocketClient(endpoint, { maxPayload: 1048576, handshakeTimeout: 15000 });
   return {
     onOpen: (listener) => socket.on('open', listener),
     onMessage: (listener) => socket.on('message', (data: RawData) => listener(rawDataText(data))),

@@ -56,39 +56,65 @@ async function main(): Promise<void> {
   });
 
   let reconciling = false;
+  let lastReconciliationSuccessAt: Date | null = null;
+  let reconciliationErrors = 0;
   const reconcile = async (): Promise<void> => {
     if (reconciling) return;
     reconciling = true;
     try {
       const outcome = await reconciler.reconcile();
       if (outcome.kind === 'failure') {
+        reconciliationErrors++;
         logger.error('Wallet reconciliation failed', { error: outcome.error.message });
       } else {
-        logger.info('Wallet reconciliation completed', { ...outcome.value });
+        lastReconciliationSuccessAt = new Date();
+        logger.info('Wallet reconciliation cycle completed', { ...outcome.value });
       }
+    } catch {
+      reconciliationErrors++;
+      logger.error('Wallet reconciliation failed unexpectedly');
     } finally {
       reconciling = false;
     }
   };
 
-  subscriber.start();
-  await reconcile();
   const timer = setInterval(() => void reconcile(), walletConfig.reconciliation.intervalMs);
-  logger.info('Wallet worker started', {
-    watchedWalletCount: walletConfig.watchedWallets.length,
-    websocketConnections: 1,
-  });
+  const healthTimer = setInterval(() => {
+    void db
+      .query<{ count: string }>(
+        'SELECT COUNT(*)::text count FROM wallet_reconciliation_cursors WHERE wallet_address=ANY($1::text[])',
+        [walletConfig.watchedWallets]
+      )
+      .then((result) =>
+        logger.info('Wallet health', {
+          watchedWalletCount: walletConfig.watchedWallets.length,
+          cursorCount: result.kind === 'success' ? Number(result.value[0]?.count ?? 0) : -1,
+          reconciling,
+          lastReconciliationSuccessAt,
+          reconciliationErrors,
+          subscriptions: subscriber.getStats(),
+        })
+      )
+      .catch(() => logger.error('Wallet health query failed'));
+  }, 30000);
 
   let stopped = false;
   const shutdown = (): void => {
     if (stopped) return;
     stopped = true;
     clearInterval(timer);
+    clearInterval(healthTimer);
     subscriber.stop();
     void db.close();
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
+  subscriber.start();
+  logger.info('Wallet worker started', {
+    watchedWalletCount: walletConfig.watchedWallets.length,
+    websocketConnections: 1,
+  });
+  await reconcile();
 }
 
 main().catch((error: unknown) => {

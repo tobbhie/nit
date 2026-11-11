@@ -8,6 +8,109 @@ import { WalletSignaturePage } from './solana-rpc';
 const wallet = '11111111111111111111111111111111';
 
 describe('SolanaWalletReconciler', () => {
+  it('yields a busy wallet between page budgets so other wallet cursors can advance', async () => {
+    const other = '22222222222222222222222222222222';
+    const advanced: string[] = [];
+    const beforeValues: (string | undefined)[] = [];
+    const reconciler = new SolanaWalletReconciler(
+      {
+        getFinalizedSlot: (): Promise<Result<number, Error>> => Promise.resolve(success(120)),
+        getSignaturesForAddress: (address, before): Promise<Result<WalletSignaturePage, Error>> => {
+          if (address !== wallet) return Promise.resolve(success({ entries: [] }));
+          beforeValues.push(before);
+          return Promise.resolve(
+            success(
+              before === undefined
+                ? { entries: [{ signature: 'new', slot: 119, failed: false }], nextBefore: 'older' }
+                : { entries: [{ signature: 'old', slot: 90, failed: false }] }
+            )
+          );
+        },
+        fetchTransaction: (signature, slot): Promise<Result<SolanaWalletTransaction, Error>> =>
+          Promise.resolve(success({ signature, slot, observedAt: new Date(), transaction: {} })),
+      },
+      {
+        getCursor: (): Promise<Result<number | null, Error>> => Promise.resolve(success(100)),
+        advanceCursor: (address): Promise<Result<void, Error>> => {
+          advanced.push(address);
+          return Promise.resolve(success(undefined));
+        },
+      },
+      {
+        process: (): Promise<Result<WalletProcessingSummary, Error>> =>
+          Promise.resolve(success(emptySummary())),
+      },
+      [wallet, other],
+      { overlapSlots: 5, initialLookbackSlots: 20, pageSize: 1, maxPagesPerWalletPerCycle: 1 }
+    );
+    expect(await reconciler.reconcile()).toMatchObject({
+      kind: 'success',
+      value: { deferredWallets: 1 },
+    });
+    expect(advanced).toEqual([other]);
+    expect(await reconciler.reconcile()).toMatchObject({
+      kind: 'success',
+      value: { deferredWallets: 0 },
+    });
+    expect(beforeValues).toEqual([undefined, 'older']);
+    expect(advanced).toContain(wallet);
+  });
+  it('retains chronological work across processing budgets without advancing early', async () => {
+    const processed: string[] = [];
+    const advanced: number[] = [];
+    let pages = 0;
+    const reconciler = new SolanaWalletReconciler(
+      {
+        getFinalizedSlot: (): Promise<Result<number, Error>> => Promise.resolve(success(120)),
+        getSignaturesForAddress: (): Promise<Result<WalletSignaturePage, Error>> => {
+          pages++;
+          return Promise.resolve(
+            success({
+              entries: [
+                { signature: 'new', slot: 119, failed: false },
+                { signature: 'old', slot: 118, failed: false },
+              ],
+            })
+          );
+        },
+        fetchTransaction: (signature, slot): Promise<Result<SolanaWalletTransaction, Error>> =>
+          Promise.resolve(success({ signature, slot, observedAt: new Date(), transaction: {} })),
+      },
+      {
+        getCursor: (): Promise<Result<number | null, Error>> => Promise.resolve(success(120)),
+        advanceCursor: (_address, slot): Promise<Result<void, Error>> => {
+          advanced.push(slot);
+          return Promise.resolve(success(undefined));
+        },
+      },
+      {
+        process: (tx): Promise<Result<WalletProcessingSummary, Error>> => {
+          processed.push(tx.signature);
+          return Promise.resolve(success(emptySummary()));
+        },
+      },
+      [wallet],
+      {
+        overlapSlots: 5,
+        initialLookbackSlots: 20,
+        pageSize: 100,
+        maxTransactionsPerWalletPerCycle: 1,
+      }
+    );
+    expect(await reconciler.reconcile()).toMatchObject({
+      kind: 'success',
+      value: { deferredWallets: 1 },
+    });
+    expect(processed).toEqual(['old']);
+    expect(advanced).toEqual([]);
+    expect(await reconciler.reconcile()).toMatchObject({
+      kind: 'success',
+      value: { deferredWallets: 0 },
+    });
+    expect(processed).toEqual(['old', 'new']);
+    expect(pages).toBe(1);
+    expect(advanced).toEqual([120]);
+  });
   it('does not advance a cursor when transaction repair fails', async () => {
     const advanced: number[] = [];
     const reconciler = new SolanaWalletReconciler(

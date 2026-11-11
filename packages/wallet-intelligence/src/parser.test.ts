@@ -71,7 +71,9 @@ describe('SolanaWalletSwapParser', () => {
   });
 
   it('classifies an exact signer-owned token/SOL delta as a buy and adjusts the fee', () => {
-    const parsed = parser.parse(transaction('1000000', 899_995_000));
+    const input = transaction('1000000', 899_995_000);
+    input.transaction['version'] = 1;
+    const parsed = parser.parse(input);
     expect(parsed.kind).toBe('success');
     if (parsed.kind === 'failure') throw parsed.error;
     expect(parsed.value.swaps).toHaveLength(1);

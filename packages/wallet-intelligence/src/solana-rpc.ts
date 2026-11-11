@@ -4,6 +4,16 @@ import { SolanaWalletTransaction } from './contracts';
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MIN_INTERVAL_MS = 200;
 
+class WalletRpcFailure extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean
+  ) {
+    super(message);
+    this.name = 'WalletRpcFailure';
+  }
+}
+
 interface RpcHttpResponse {
   readonly ok: boolean;
   readonly status: number;
@@ -116,10 +126,15 @@ export class SolanaWalletRpc {
     expectedSlot: number,
     commitment: 'confirmed' | 'finalized'
   ): Promise<Result<SolanaWalletTransaction, Error>> {
-    const response = await this.rpc('getTransaction', [
-      signature,
-      { encoding: 'jsonParsed', commitment, maxSupportedTransactionVersion: 0 },
-    ]);
+    let response: Result<unknown, Error> = success(null);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      response = await this.rpc('getTransaction', [
+        signature,
+        { encoding: 'jsonParsed', commitment, maxSupportedTransactionVersion: 1 },
+      ]);
+      if (response.kind === 'failure' || response.value !== null) break;
+      if (attempt < 2) await this.sleep(250 * 2 ** attempt);
+    }
     if (response.kind === 'failure') return response;
     const value = record(response.value);
     if (value === null)
@@ -136,6 +151,24 @@ export class SolanaWalletRpc {
   }
 
   private async rpc(method: string, params: readonly unknown[]): Promise<Result<unknown, Error>> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const result = await this.rpcOnce(method, params);
+      if (
+        result.kind === 'success' ||
+        !(result.error instanceof WalletRpcFailure) ||
+        !result.error.retryable ||
+        attempt === 2
+      )
+        return result;
+      await this.sleep(250 * 2 ** attempt);
+    }
+    return failure(new Error('Wallet RPC retry budget exhausted'));
+  }
+
+  private async rpcOnce(
+    method: string,
+    params: readonly unknown[]
+  ): Promise<Result<unknown, Error>> {
     await this.rateLimit();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
@@ -147,19 +180,27 @@ export class SolanaWalletRpc {
         signal: controller.signal,
       });
       if (!response.ok)
-        return failure(new Error(`Solana RPC HTTP request failed with status ${response.status}`));
+        return failure(
+          new WalletRpcFailure(
+            `Solana RPC HTTP request failed with status ${response.status}`,
+            response.status === 429 || response.status >= 500
+          )
+        );
       let decoded: unknown;
       try {
         decoded = await response.json();
       } catch {
-        return failure(new Error('Solana RPC returned invalid JSON'));
+        return failure(new WalletRpcFailure('Solana RPC returned invalid JSON', true));
       }
       const envelope = record(decoded);
       if (envelope === null) return failure(new Error('Solana RPC returned a malformed response'));
       const rpcError = record(envelope['error']);
       if (rpcError !== null) {
         return failure(
-          new Error(`Solana RPC error: ${String(rpcError['message'] ?? 'unknown error')}`)
+          new WalletRpcFailure(
+            `Solana RPC error ${typeof rpcError['code'] === 'number' ? rpcError['code'] : 'unknown'}`,
+            [-32004, -32005, -32007, -32009, -32603, 429].includes(Number(rpcError['code']))
+          )
         );
       }
       if (!Object.prototype.hasOwnProperty.call(envelope, 'result')) {
@@ -169,8 +210,11 @@ export class SolanaWalletRpc {
     } catch (error) {
       return failure(
         controller.signal.aborted
-          ? new Error(`Solana RPC request timed out after ${this.requestTimeoutMs}ms`)
-          : new Error('Solana RPC request failed', { cause: error })
+          ? new WalletRpcFailure(
+              `Solana RPC request timed out after ${this.requestTimeoutMs}ms`,
+              true
+            )
+          : new WalletRpcFailure('Solana RPC request failed', true)
       );
     } finally {
       clearTimeout(timer);
