@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { Chain, LaunchSource, Result, failure, success } from '@nit/domain';
 import {
   ConfirmedIngestionSummary,
+  DeferredConfirmedIngestionError,
   PreparedConfirmedIngestion,
   SolanaConfirmedProgramIngestor,
   SolanaConfirmedLogSubscriber,
@@ -203,6 +204,35 @@ describe('SolanaConfirmedOccurrenceIngestor', () => {
 });
 
 describe('confirmed Solana log subscription', () => {
+  it('keeps a healthy socket open when a failed notification is durably deferred', async () => {
+    const connection = new FakeConnection();
+    const deferred: string[] = [];
+    let reconnects = 0;
+    const subscriber = new SolanaConfirmedLogSubscriber({
+      endpoint: 'wss://rpc.example.test',
+      programAddress: OCCURRENCE.programAddress,
+      connectionFactory: (): SolanaWebSocketConnection => connection,
+      setTimer: (): ReturnType<typeof setTimeout> => {
+        reconnects++;
+        return setTimeout(() => undefined, 0);
+      },
+      onDeferred: (n): void => {
+        deferred.push(n.signature);
+      },
+      ingestor: {
+        ingest: (): Promise<Result<ConfirmedIngestionSummary, Error>> =>
+          Promise.resolve(failure(new DeferredConfirmedIngestionError())),
+      },
+    });
+    subscriber.start();
+    connection.open();
+    connection.message(JSON.stringify(notification('saved', 42, null)));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(subscriber.getStats()).toMatchObject({ pending: 0, errors: 0, deferred: 1 });
+    expect(deferred).toEqual(['saved']);
+    expect(reconnects).toBe(0);
+    subscriber.stop();
+  });
   it('bounds independent mint commits, keeps same-mint order and lets empty decodes drain', async () => {
     const connection = new FakeConnection();
     const started: string[] = [];

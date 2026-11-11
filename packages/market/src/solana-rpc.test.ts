@@ -6,6 +6,7 @@ import {
   SolanaLaunchTransactionDecoder,
   SolanaRpcFetch,
   SolanaRpcReconciliationSource,
+  CreationHistoryProgress,
 } from './solana-rpc';
 
 interface RpcCall {
@@ -73,6 +74,196 @@ function source(
 }
 
 describe('SolanaRpcReconciliationSource', () => {
+  it('retries an interrupted JSON response body with the same bounded policy', async () => {
+    let calls = 0;
+    const reader = new SolanaRpcReconciliationSource({
+      endpoint: 'https://rpc.example.test',
+      programAddress: 'program',
+      launchSource: LaunchSource.PUMP_FUN,
+      decoder: new RecordingDecoder(),
+      minRequestIntervalMs: 0,
+      sleep: (): Promise<void> => Promise.resolve(),
+      fetch: (): ReturnType<SolanaRpcFetch> => {
+        calls++;
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: (): Promise<unknown> =>
+            calls === 1
+              ? Promise.reject(new Error('untrusted response body'))
+              : Promise.resolve({ result: 42 }),
+        });
+      },
+    });
+    expect(await reader.getFinalizedSlot()).toEqual(success(42));
+    expect(calls).toBe(2);
+    expect(reader.getRetryCount()).toBe(1);
+  });
+  it('resumes a persisted creation search instead of starting again at the newest page', async () => {
+    let progress: CreationHistoryProgress | null = null;
+    const store = {
+      get: (): Promise<Result<CreationHistoryProgress | null, Error>> =>
+        Promise.resolve(success(progress)),
+      put: (_mint: string, value: CreationHistoryProgress): Promise<Result<void, Error>> => {
+        progress = value;
+        return Promise.resolve(success(undefined));
+      },
+    };
+    const entries = Array.from({ length: 1000 }, (_, i) => ({
+      signature: 'sig-' + i,
+      slot: 2000 - i,
+      err: null,
+    }));
+    let calls = 0;
+    const first = new SolanaRpcReconciliationSource({
+      endpoint: 'https://rpc.example.test',
+      programAddress: 'program',
+      launchSource: LaunchSource.PUMP_FUN,
+      decoder: new RecordingDecoder(),
+      minRequestIntervalMs: 0,
+      creationHistoryProgress: store,
+      fetch: (): ReturnType<SolanaRpcFetch> => {
+        calls++;
+        return Promise.resolve({
+          ok: calls === 1,
+          status: calls === 1 ? 200 : 401,
+          json: (): Promise<unknown> => Promise.resolve({ result: entries }),
+        });
+      },
+    });
+    const mint = 'Mint111111111111111111111111111111111111111';
+    expect((await first.findCreation(mint, 3000)).kind).toBe('failure');
+    const rpc = rpcHarness([], { slot: 1001 });
+    const restarted = new SolanaRpcReconciliationSource({
+      endpoint: 'https://rpc.example.test',
+      programAddress: 'program',
+      launchSource: LaunchSource.PUMP_FUN,
+      decoder: new RecordingDecoder(),
+      minRequestIntervalMs: 0,
+      creationHistoryProgress: store,
+      fetch: rpc.fetch,
+    });
+    expect((await restarted.findCreation(mint, 3000)).kind).toBe('success');
+    expect(rpc.calls[0]?.params[1]).toMatchObject({ before: 'sig-999' });
+    expect(rpc.calls).toHaveLength(2);
+  });
+  it('retries transport failures without exposing provider text', async () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const reader = new SolanaRpcReconciliationSource({
+      endpoint: 'https://rpc.example.test',
+      programAddress: 'program',
+      launchSource: LaunchSource.PUMP_FUN,
+      decoder: new RecordingDecoder(),
+      minRequestIntervalMs: 0,
+      sleep: (ms): Promise<void> => {
+        sleeps.push(ms);
+        return Promise.resolve();
+      },
+      fetch: (): ReturnType<SolanaRpcFetch> => {
+        if (++calls < 3) throw new Error('https://secret.invalid/?api-key=private');
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: (): Promise<unknown> => Promise.resolve({ result: 42 }),
+        });
+      },
+    });
+    expect(await reader.getFinalizedSlot()).toEqual(success(42));
+    expect(calls).toBe(3);
+    expect(sleeps).toEqual([250, 500]);
+    expect(reader.getRetryCount()).toBe(2);
+  });
+  it.each([401, 403, 400])('does not retry permanent HTTP %s failures', async (status) => {
+    let calls = 0;
+    const fetch: SolanaRpcFetch = () => {
+      calls++;
+      return Promise.resolve({
+        ok: false,
+        status,
+        json: (): Promise<unknown> => Promise.resolve({}),
+      });
+    };
+    expect((await source(fetch).getFinalizedSlot()).kind).toBe('failure');
+    expect(calls).toBe(1);
+  });
+  it('bounds retries for service overload and never forwards RPC error text', async () => {
+    let calls = 0;
+    const reader = new SolanaRpcReconciliationSource({
+      endpoint: 'https://rpc.example.test',
+      programAddress: 'program',
+      launchSource: LaunchSource.PUMP_FUN,
+      decoder: new RecordingDecoder(),
+      minRequestIntervalMs: 0,
+      sleep: (): Promise<void> => Promise.resolve(),
+      fetch: (): ReturnType<SolanaRpcFetch> => {
+        calls++;
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: (): Promise<unknown> =>
+            Promise.resolve({ error: { code: -32005, message: 'private-provider-details' } }),
+        });
+      },
+    });
+    const result = await reader.getFinalizedSlot();
+    expect(result.kind).toBe('failure');
+    expect(calls).toBe(3);
+    if (result.kind === 'failure') expect(result.error.message).toBe('Solana RPC error -32005');
+  });
+  it('retries temporarily unindexed transactions but rejects slot mismatches immediately', async () => {
+    const rpc = rpcHarness(null, null, { slot: 42 });
+    const reader = source(rpc.fetch);
+    expect(await reader.readConfirmedTransaction('sig', 42)).toEqual(success({ slot: 42 }));
+    expect(reader.getRetryCount()).toBe(2);
+    const wrong = rpcHarness({ slot: 43 });
+    expect((await source(wrong.fetch).readConfirmedTransaction('sig', 42)).kind).toBe('failure');
+    expect(wrong.calls).toHaveLength(1);
+  });
+  it('recovers the matching original creation from oldest successful mint history', async () => {
+    const mint = 'Mint111111111111111111111111111111111111111';
+    const rpc = rpcHarness(
+      [
+        { signature: 'new', slot: 100, err: null },
+        { signature: 'creation', slot: 5, err: null },
+        { signature: 'prefund', slot: 1, err: null },
+      ],
+      { slot: 1 },
+      { slot: 5 }
+    );
+    const decoder: SolanaLaunchTransactionDecoder = {
+      decode: (tx): Result<readonly DecodedMarketOccurrence[], Error> =>
+        success(tx.signature === 'creation' ? [{ kind: 'launch', launch: decodedLaunch(tx) }] : []),
+    };
+    const result = await source(rpc.fetch, decoder).findCreation(mint, 50);
+    expect(result.kind).toBe('success');
+    if (result.kind === 'success')
+      expect(
+        result.value.kind === 'launch' &&
+          result.value.launch.market.origin.position.transactionSignature
+      ).toBe('creation');
+    expect(rpc.calls.map((c) => c.method)).toEqual([
+      'getSignaturesForAddress',
+      'getTransaction',
+      'getTransaction',
+    ]);
+    expect(rpc.calls[0]?.params[0]).toBe(mint);
+  });
+  it('refuses to certify incomplete or looping creation history', async () => {
+    const entries = Array.from({ length: 1000 }, (_, i) => ({
+      signature: 'sig-' + i,
+      slot: 2000 - i,
+      err: null,
+    }));
+    const rpc = rpcHarness(entries, entries);
+    const result = await source(rpc.fetch).findCreation(
+      'Mint111111111111111111111111111111111111111',
+      3000
+    );
+    expect(result.kind).toBe('failure');
+    if (result.kind === 'failure') expect(result.error.message).toContain('cursor did not advance');
+    expect(rpc.calls).toHaveLength(2);
+  });
   it('reads the durable head at finalized commitment', async () => {
     const rpc = rpcHarness(42_001);
     const result = await source(rpc.fetch).getFinalizedSlot();
@@ -145,7 +336,7 @@ describe('SolanaRpcReconciliationSource', () => {
   });
 
   it('fails closed when an in-range transaction is unavailable', async () => {
-    const rpc = rpcHarness([{ signature: 'missing', slot: 101, err: null }], null);
+    const rpc = rpcHarness([{ signature: 'missing', slot: 101, err: null }], null, null, null);
     const result = await source(rpc.fetch).fetchReconciliationPage({
       fromSlotInclusive: 100,
       throughFinalizedSlot: 110,

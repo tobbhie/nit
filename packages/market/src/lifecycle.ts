@@ -150,7 +150,10 @@ export class PostgresTokenMarketRepository implements TokenMarketRepository {
       `WITH closed AS (
          UPDATE token_markets
             SET active_until = $5
-          WHERE token_id = $2 AND active_until IS NULL AND active_from < $5
+          WHERE token_id = $2 AND active_until IS NULL AND (
+            active_from < $5 OR (active_from = $5 AND source_event_kind='chain' AND $6='chain'
+              AND venue='pump_fun_bonding_curve' AND $3='pumpswap' AND slot <= $12
+              AND source_event_key <> $7))
           RETURNING token_market_id
        )
        INSERT INTO token_markets (

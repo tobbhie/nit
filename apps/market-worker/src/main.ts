@@ -20,6 +20,11 @@ import {
   SolanaReconciliationHandler,
   SolanaReconciliationScheduler,
   SolanaRpcReconciliationSource,
+  RecoverableConfirmedIngestor,
+  MissingTokenCreationRecovery,
+  SolanaMarketRecoveryHandler,
+  seedStoredMigrationRecovery,
+  PostgresCreationHistoryProgress,
 } from '@nit/market';
 import { HealthReporter, Logger } from '@nit/observability';
 import { JobQueue, Worker } from '@nit/queue';
@@ -67,6 +72,15 @@ async function main(): Promise<void> {
     defaultMaxAttempts: config.queue.maxRetries,
     backoff: { baseMs: config.queue.retryBackoffMs, maxMs: config.queue.maxBackoffMs },
   });
+  const recoveryQueue = new JobQueue(db, {
+    leaseTimeoutMs: Math.max(
+      config.queue.leaseTimeoutMs,
+      120000,
+      46000 + 3 * (marketConfig.requestTimeoutMs + 6 * marketConfig.minRequestIntervalMs)
+    ),
+    defaultMaxAttempts: 10,
+    backoff: { baseMs: config.queue.retryBackoffMs, maxMs: config.queue.maxBackoffMs },
+  });
   const discovery = new MarketDiscoveryService(new PostgresUnitOfWork(db, queue), {
     producer: 'market-worker',
   });
@@ -93,6 +107,7 @@ async function main(): Promise<void> {
       decoder,
       requestTimeoutMs: marketConfig.requestTimeoutMs,
       minRequestIntervalMs: marketConfig.minRequestIntervalMs,
+      creationHistoryProgress: new PostgresCreationHistoryProgress(db, programAddress),
     });
     reconcilers.set(
       launchSource,
@@ -124,6 +139,26 @@ async function main(): Promise<void> {
       logger.error('Failed to schedule reconciliation', { error: error.message }),
   });
   let lastLiveSuccessAt: Date | null = null;
+  const creationTarget = ingestorsByProgram.get(marketConfig.pumpFunProgramAddress)![0]!;
+  const missingCreations = new MissingTokenCreationRecovery(
+    db,
+    creationTarget.source,
+    creationTarget.ingestor
+  );
+  const recoveryPrograms = new Map(
+    [...ingestorsByProgram.entries()].map(([programAddress, targets]) => [
+      programAddress,
+      new SolanaConfirmedProgramIngestor(targets, (items) => missingCreations.ensure(items)),
+    ])
+  );
+  const recoveryWorker = new Worker(
+    recoveryQueue,
+    new SolanaMarketRecoveryHandler(recoveryPrograms),
+    {
+      workerId: `market-recovery-${process.pid}`,
+      pollIntervalMs: config.queue.pollIntervalMs,
+    }
+  );
   const subscribers = [...ingestorsByProgram.entries()].map(
     ([programAddress, ingestors]) =>
       new SolanaConfirmedLogSubscriber({
@@ -131,7 +166,12 @@ async function main(): Promise<void> {
         programAddress,
         notificationFilter: (message): boolean =>
           isPumpLifecycleNotification(message, programAddress),
-        ingestor: new SolanaConfirmedProgramIngestor(ingestors),
+        ingestor: new RecoverableConfirmedIngestor(
+          new SolanaConfirmedProgramIngestor(ingestors),
+          recoveryQueue,
+          programAddress
+        ),
+        onDeferred: (): void => logger.warn('Confirmed notification queued for durable recovery'),
         onIngested: (summary): void => {
           lastLiveSuccessAt = new Date();
           logger.info('Confirmed Solana transaction ingested', { ...summary });
@@ -148,12 +188,28 @@ async function main(): Promise<void> {
     createVersion(config.version.schemaVersion, config.version.buildId),
     {
       queueDepth: async (): Promise<number> => {
-        const depth = await queue.pendingDepth(QueueName.TOKEN_RECONCILIATION);
-        return depth.kind === 'success' ? depth.value : -1;
+        const depths = await Promise.all([
+          queue.pendingDepth(QueueName.TOKEN_RECONCILIATION),
+          recoveryQueue.pendingDepth(QueueName.TOKEN_MARKET_RECOVERY),
+        ]);
+        return depths.every((d) => d.kind === 'success')
+          ? depths.reduce((n, d) => n + (d.kind === 'success' ? d.value : 0), 0)
+          : -1;
       },
-      lastSuccessfulCycleAt: () => lastLiveSuccessAt ?? worker.getStats().lastSuccessAt,
+      lastSuccessfulCycleAt: (): Date | null => {
+        const dates = [
+          lastLiveSuccessAt,
+          worker.getStats().lastSuccessAt,
+          recoveryWorker.getStats().lastSuccessAt,
+        ].filter((date): date is Date => date !== null);
+        return dates.length === 0
+          ? null
+          : new Date(Math.max(...dates.map((date) => date.getTime())));
+      },
       errorCount: () =>
-        worker.getStats().errorCount + subscribers.reduce((n, s) => n + s.getStats().errors, 0),
+        worker.getStats().errorCount +
+        recoveryWorker.getStats().errorCount +
+        subscribers.reduce((n, s) => n + s.getStats().errors, 0),
     }
   );
   const healthTimer = setInterval(() => {
@@ -166,6 +222,10 @@ async function main(): Promise<void> {
           ? 'live_and_repair'
           : 'live_only_unrepaired_gaps',
         subscriptions: subscribers.map((s) => s.getStats()),
+        recovery: recoveryWorker.getStats(),
+        rpcRetries: [...ingestorsByProgram.values()]
+          .flat()
+          .reduce((n, t) => n + t.source.getRetryCount(), 0),
       })
     );
   }, 30_000);
@@ -181,6 +241,7 @@ async function main(): Promise<void> {
     scheduler.stop();
     for (const subscriber of subscribers) subscriber.stop();
     worker.stop();
+    recoveryWorker.stop();
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
@@ -211,9 +272,26 @@ async function main(): Promise<void> {
   const live = new Promise<void>((resolve) =>
     abort.signal.addEventListener('abort', () => resolve(), { once: true })
   );
+  const recoverySeeds = async (): Promise<void> => {
+    while (!abort.signal.aborted) {
+      try {
+        const count = await seedStoredMigrationRecovery(db, recoveryQueue);
+        if (count > 0) logger.info('Stored migrations scheduled for recovery', { count });
+      } catch {
+        logger.error('Stored migration recovery scheduling failed');
+      }
+      try {
+        await delay(30000, undefined, { signal: abort.signal });
+      } catch {
+        break;
+      }
+    }
+  };
   const workloads = [
     live,
     refresh(),
+    recoveryWorker.run(),
+    recoverySeeds(),
     ...(marketConfig.reconciliation.enabled ? [worker.run()] : []),
   ];
   try {

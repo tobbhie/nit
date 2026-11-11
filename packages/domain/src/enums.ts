@@ -168,6 +168,7 @@ export enum QueueName {
    */
   TOKEN_DISCOVERY_POLL = 'token_discovery_poll',
   TOKEN_RECONCILIATION = 'token_reconciliation',
+  TOKEN_MARKET_RECOVERY = 'token_market_recovery',
   TOKEN_ARTWORK = 'token_artwork',
   TOKEN_LIQUIDITY = 'token_liquidity',
   TOKEN_CREATOR = 'token_creator',

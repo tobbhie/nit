@@ -84,6 +84,14 @@ export interface ConfirmedNotificationIngestor {
   prepare?(signature: string, slot: number): Promise<Result<PreparedConfirmedIngestion, Error>>;
 }
 
+/** A failed notification was persisted for retry; it must not tear down a healthy socket. */
+export class DeferredConfirmedIngestionError extends Error {
+  constructor() {
+    super('Confirmed notification saved for durable recovery');
+    this.name = 'DeferredConfirmedIngestionError';
+  }
+}
+
 /** One HTTP read, multiple decoders; preparation performs no database writes. */
 export class SolanaConfirmedProgramIngestor implements ConfirmedNotificationIngestor {
   constructor(
@@ -93,7 +101,10 @@ export class SolanaConfirmedProgramIngestor implements ConfirmedNotificationInge
         'readConfirmedTransaction' | 'decodeConfirmedTransaction'
       >;
       ingestor: Pick<SolanaConfirmedOccurrenceIngestor, 'apply'>;
-    }[]
+    }[],
+    private readonly beforeApply?: (
+      occurrences: readonly ReconciledMarketOccurrence[]
+    ) => Promise<Result<void, Error>>
   ) {
     if (targets.length === 0) throw new Error('At least one lifecycle decoder is required');
   }
@@ -110,6 +121,10 @@ export class SolanaConfirmedProgramIngestor implements ConfirmedNotificationInge
       decoded.push(result.value);
     }
     const apply: PreparedConfirmedIngestion = async () => {
+      if (this.beforeApply !== undefined) {
+        const ready = await this.beforeApply(decoded.flat());
+        if (ready.kind === 'failure') return ready;
+      }
       const combined = { signature, slot, fetched: 0, discovered: 0, graduated: 0, duplicates: 0 };
       for (const [index, target] of this.targets.entries()) {
         const result = await target.ingestor.apply(signature, slot, decoded[index]!);
@@ -190,6 +205,7 @@ export interface SolanaConfirmedLogSubscriberOptions {
   clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
   onIngested?: (summary: ConfirmedIngestionSummary) => void;
   onError?: (error: Error) => void;
+  onDeferred?: (notification: ConfirmedLogNotification) => void;
   maxPendingNotifications?: number;
   maxConcurrentPreparations?: number;
   maxConcurrentCommits?: number;
@@ -217,6 +233,8 @@ export class SolanaConfirmedLogSubscriber {
   private filtered = 0;
   private overflows = 0;
   private errors = 0;
+  private deferred = 0;
+  private readonly onDeferred: SolanaConfirmedLogSubscriberOptions['onDeferred'];
   private readonly maxPending: number;
   private readonly maxPreparations: number;
   private activePreparations = 0;
@@ -241,6 +259,7 @@ export class SolanaConfirmedLogSubscriber {
     this.clearTimer = options.clearTimer ?? clearTimeout;
     this.onIngested = options.onIngested;
     this.onError = options.onError;
+    this.onDeferred = options.onDeferred;
     this.maxPending = positive(options.maxPendingNotifications, 128, 'notification backlog');
     if (this.maxPending > 10000) throw new Error('Notification backlog limit exceeds hard cap');
     this.maxPreparations = positive(
@@ -253,12 +272,19 @@ export class SolanaConfirmedLogSubscriber {
     if (this.maxCommits > 16) throw new Error('Commit concurrency exceeds hard cap');
     this.notificationFilter = options.notificationFilter;
   }
-  getStats(): { pending: number; filtered: number; overflows: number; errors: number } {
+  getStats(): {
+    pending: number;
+    filtered: number;
+    overflows: number;
+    errors: number;
+    deferred: number;
+  } {
     return {
       pending: this.pending,
       filtered: this.filtered,
       overflows: this.overflows,
       errors: this.errors,
+      deferred: this.deferred,
     };
   }
 
@@ -374,6 +400,11 @@ export class SolanaConfirmedLogSubscriber {
         )
           .then((ingested) => {
             if (ingested.kind === 'failure') {
+              if (ingested.error instanceof DeferredConfirmedIngestionError) {
+                this.deferred++;
+                this.onDeferred?.(notification);
+                return;
+              }
               this.report(ingested.error);
               if (this.connection === connection) this.disconnect(connection);
             } else {

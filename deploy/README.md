@@ -77,6 +77,38 @@ an earlier creation. Empty decodes do not hold a database slot. The 128-notifica
 backlog cap remains in force. Measure sustained backlog and RPC latency before
 leaving the worker unattended; increasing the cap does not increase throughput.
 
+Transport/timeouts, HTTP 429/5xx and transient node responses get at most three
+rate-limited attempts with bounded backoff. Temporarily unindexed confirmed
+transactions also get a bounded retry. Provider error text is not retained.
+When live preparation or persistence still fails, the worker must save a
+`token_market_recovery` job before reporting the notification as deferred. A
+successfully deferred notification does not disconnect the healthy subscription;
+health exposes deferred counts, pending recovery depth, retry counts and recovery
+worker failures/dead letters. Recovery uses the existing leased, idempotent queue
+with ten attempts and a minimum two-minute lease. It runs even when broad
+historical reconciliation is disabled.
+
+For migrations whose mint is not yet canonical, recovery queries that mint's
+`getSignaturesForAddress` history, then decodes the original Pump creation event
+before applying the migration. Only the mint, transaction identities and timing
+go to the existing configured RPC provider. No other external endpoint is added.
+Each attempt is bounded to 20 pages, 16 oldest successful transactions and a
+45-second search budget checked between calls. `solana_creation_searches` stores
+page/candidate progress so a later attempt or restart resumes rather than
+repeating the scan. Missing/pruned/incomplete history
+remains a failed retry/dead-letter item; the worker never fabricates metadata or
+advances the broad historical watermark. A periodic bounded scan also schedules
+stored, unapplied migrations from earlier local runs. This repairs known failed
+notifications and stored occurrences, not transactions never observed during a
+disconnect. Full historical coverage still needs validated reconciliation.
+
+Migration `0027_targeted_market_recovery` also permits an empty initial Pump
+market interval when creation and migration have the exact same timestamp.
+The repository requires chain provenance, a Pump-to-PumpSwap transition and a
+non-regressing slot; earlier slots and legacy timestamp ties still fail closed.
+The original timestamps are retained, and half-open interval lookup selects the
+new pool at that instant. Other immutable market fields remain protected.
+
 Set `NIT_EXECUTION_FACTS_CONFIG_PATH` to JSON with explicit `pumpProgram`,
 `swapProgram`, `swapGlobalConfig`, `intervalMs`, `maxTargets`, `maxSlotAgeMs` and
 `candidateMaxAgeMs`. Program addresses must match discovery. Keep polling limits

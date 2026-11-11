@@ -3,6 +3,7 @@ import { ProviderIdentity } from '@nit/provider-interfaces';
 import {
   DecodedMarketOccurrence,
   ReconciledMarketOccurrence,
+  ReconciledLaunch,
   SolanaReconciliationPage,
   SolanaReconciliationPageRequest,
   SolanaReconciliationSource,
@@ -11,6 +12,16 @@ import {
 const MAX_SIGNATURE_PAGE_SIZE = 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_MIN_REQUEST_INTERVAL_MS = 200;
+
+export class SolanaRpcError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean
+  ) {
+    super(message);
+    this.name = 'SolanaRpcError';
+  }
+}
 
 interface RpcHttpResponse {
   readonly ok: boolean;
@@ -64,6 +75,18 @@ export interface SolanaRpcReconciliationOptions {
   minRequestIntervalMs?: number;
   clock?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
+  creationHistoryProgress?: CreationHistoryProgressStore;
+}
+
+export interface CreationHistoryProgress {
+  beforeSignature?: string;
+  oldest: SignatureInfo[];
+  complete: boolean;
+  nextCandidate: number;
+}
+export interface CreationHistoryProgressStore {
+  get(mint: string): Promise<Result<CreationHistoryProgress | null, Error>>;
+  put(mint: string, progress: CreationHistoryProgress): Promise<Result<void, Error>>;
 }
 
 export interface SolanaConfirmedTransactionSource extends ProviderIdentity {
@@ -106,8 +129,15 @@ export class SolanaRpcReconciliationSource implements SolanaReconciliationSource
   private requestId = 0;
   private nextRequestAt = 0;
   private rateLimitTail: Promise<void> = Promise.resolve();
+  private retryCount = 0;
+  private readonly creationHistoryProgress: CreationHistoryProgressStore | undefined;
+
+  getRetryCount(): number {
+    return this.retryCount;
+  }
 
   constructor(options: SolanaRpcReconciliationOptions) {
+    this.creationHistoryProgress = options.creationHistoryProgress;
     this.endpoint = validEndpoint(options.endpoint);
     this.programAddress = required(options.programAddress, 'Solana program address');
     if (!Object.values(LaunchSource).includes(options.launchSource)) {
@@ -217,14 +247,22 @@ export class SolanaRpcReconciliationSource implements SolanaReconciliationSource
     if (signature.trim() === '' || !isSlot(expectedSlot)) {
       return failure(new Error('Solana confirmed transaction identity is invalid'));
     }
-    const transactionResponse = await this.rpc('getTransaction', [
-      signature,
-      {
-        commitment: 'confirmed',
-        encoding: 'jsonParsed',
-        maxSupportedTransactionVersion: 1,
-      },
-    ]);
+    let transactionResponse: Result<unknown, Error> = success(null);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      transactionResponse = await this.rpc('getTransaction', [
+        signature,
+        {
+          commitment: 'confirmed',
+          encoding: 'jsonParsed',
+          maxSupportedTransactionVersion: 1,
+        },
+      ]);
+      if (transactionResponse.kind === 'failure' || transactionResponse.value !== null) break;
+      if (attempt < 2) {
+        this.retryCount++;
+        await this.sleep(250 * 2 ** attempt);
+      }
+    }
     if (transactionResponse.kind === 'failure') return transactionResponse;
     if (transactionResponse.value === null) {
       return failure(new Error(`Solana RPC did not return transaction '${signature}'`));
@@ -239,6 +277,87 @@ export class SolanaRpcReconciliationSource implements SolanaReconciliationSource
     }
 
     return success(transactionResponse.value);
+  }
+
+  /** Bounded mint-specific history; never scan every trade of the emitting program. */
+  async findCreation(
+    mint: string,
+    throughSlot: number
+  ): Promise<Result<ReconciledMarketOccurrence, Error>> {
+    if (
+      this.launchSource !== LaunchSource.PUMP_FUN ||
+      !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint) ||
+      !isSlot(throughSlot)
+    )
+      return failure(new Error('Invalid creation recovery target'));
+    const deadline = this.clock() + 45000;
+    const stored =
+      this.creationHistoryProgress === undefined
+        ? success(null)
+        : await this.creationHistoryProgress.get(mint);
+    if (stored.kind === 'failure') return stored;
+    let before = stored.value?.beforeSignature;
+    let oldest: SignatureInfo[] = stored.value?.oldest ?? [];
+    const cursors = new Set<string>();
+    let complete = stored.value?.complete ?? false;
+    let nextCandidate = stored.value?.nextCandidate ?? 0;
+    const checkpoint = (): Promise<Result<void, Error>> =>
+      this.creationHistoryProgress?.put(mint, {
+        ...(before === undefined ? {} : { beforeSignature: before }),
+        oldest,
+        complete,
+        nextCandidate,
+      }) ?? Promise.resolve(success(undefined));
+    if (before !== undefined) cursors.add(before);
+    for (let page = 0; page < 20 && !complete; page++) {
+      if (this.clock() > deadline)
+        return failure(new Error('Creation history recovery budget exhausted'));
+      const response = await this.rpc('getSignaturesForAddress', [
+        mint,
+        { commitment: 'confirmed', limit: 1000, ...(before === undefined ? {} : { before }) },
+      ]);
+      if (response.kind === 'failure') return response;
+      const parsed = parseSignatures(response.value);
+      if (parsed.kind === 'failure') return parsed;
+      const entries = parsed.value;
+      oldest = [...oldest, ...entries.filter((e) => e.err === null && e.slot <= throughSlot)].slice(
+        -16
+      );
+      if (entries.length < 1000) {
+        complete = true;
+        const saved = await checkpoint();
+        if (saved.kind === 'failure') return saved;
+        break;
+      }
+      const next = entries.at(-1)!.signature;
+      if (cursors.has(next)) return failure(new Error('Creation history cursor did not advance'));
+      cursors.add(next);
+      before = next;
+      const saved = await checkpoint();
+      if (saved.kind === 'failure') return saved;
+    }
+    if (!complete) return failure(new Error('Creation history exceeds recovery page budget'));
+    const candidates = [...oldest].reverse();
+    for (; nextCandidate < candidates.length; nextCandidate++) {
+      const entry = candidates[nextCandidate]!;
+      if (this.clock() > deadline)
+        return failure(new Error('Creation history recovery budget exhausted'));
+      const result = await this.fetchConfirmedTransaction(entry.signature, entry.slot);
+      if (result.kind === 'failure') return result;
+      const found = result.value.find(
+        (o): o is ReconciledMarketOccurrence & { kind: 'launch'; launch: ReconciledLaunch } =>
+          o.kind === 'launch' && o.launch.address === mint
+      );
+      if (found !== undefined) return success(found);
+      const saved = await this.creationHistoryProgress?.put(mint, {
+        ...(before === undefined ? {} : { beforeSignature: before }),
+        oldest,
+        complete,
+        nextCandidate: nextCandidate + 1,
+      });
+      if (saved?.kind === 'failure') return saved;
+    }
+    return failure(new Error('Original creation event unavailable in bounded mint history'));
   }
 
   decodeConfirmedTransaction(
@@ -290,6 +409,25 @@ export class SolanaRpcReconciliationSource implements SolanaReconciliationSource
   }
 
   private async rpc(method: string, params: readonly unknown[]): Promise<Result<unknown, Error>> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const result = await this.rpcOnce(method, params);
+      if (
+        result.kind === 'success' ||
+        !(result.error instanceof SolanaRpcError) ||
+        !result.error.retryable ||
+        attempt === 2
+      )
+        return result;
+      this.retryCount++;
+      await this.sleep(250 * 2 ** attempt);
+    }
+    return failure(new Error('RPC retry budget exhausted'));
+  }
+
+  private async rpcOnce(
+    method: string,
+    params: readonly unknown[]
+  ): Promise<Result<unknown, Error>> {
     const controller = new AbortController();
     let timeout: ReturnType<typeof setTimeout> | undefined;
 
@@ -304,22 +442,38 @@ export class SolanaRpcReconciliationSource implements SolanaReconciliationSource
         signal: controller.signal,
       });
       if (!response.ok) {
-        return failure(new Error(`Solana RPC HTTP request failed with status ${response.status}`));
+        return failure(
+          new SolanaRpcError(
+            `Solana RPC HTTP request failed with status ${response.status}`,
+            response.status === 429 || response.status >= 500
+          )
+        );
       }
 
       let body: unknown;
       try {
         body = await response.json();
       } catch {
-        return failure(new Error('Solana RPC returned invalid JSON'));
+        return failure(
+          new SolanaRpcError(
+            controller.signal.aborted
+              ? 'Solana RPC response body timed out'
+              : 'Solana RPC returned invalid JSON',
+            true
+          )
+        );
       }
       if (!isRecord(body)) {
         return failure(new Error('Solana RPC returned a malformed response'));
       }
       if (isRecord(body.error)) {
         const code = typeof body.error.code === 'number' ? ` ${body.error.code}` : '';
-        const message = typeof body.error.message === 'string' ? `: ${body.error.message}` : '';
-        return failure(new Error(`Solana RPC error${code}${message}`));
+        return failure(
+          new SolanaRpcError(
+            `Solana RPC error${code}`,
+            [-32004, -32005, -32007, -32009, -32603, 429].includes(Number(body.error.code))
+          )
+        );
       }
       if (!Object.prototype.hasOwnProperty.call(body, 'result')) {
         return failure(new Error('Solana RPC response did not contain a result'));
@@ -327,9 +481,11 @@ export class SolanaRpcReconciliationSource implements SolanaReconciliationSource
       return success(body.result);
     } catch (error) {
       if (controller.signal.aborted) {
-        return failure(new Error(`Solana RPC request timed out after ${this.requestTimeoutMs}ms`));
+        return failure(
+          new SolanaRpcError(`Solana RPC request timed out after ${this.requestTimeoutMs}ms`, true)
+        );
       }
-      return failure(new Error('Solana RPC request failed', { cause: error }));
+      return failure(new SolanaRpcError('Solana RPC request failed', true));
     } finally {
       if (timeout !== undefined) clearTimeout(timeout);
     }

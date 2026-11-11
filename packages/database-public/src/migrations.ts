@@ -1732,9 +1732,60 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE TRIGGER nit_media_identity_immutable BEFORE UPDATE OR DELETE ON nit_media_objects FOR EACH ROW EXECUTE FUNCTION nit_media_identity_immutable();
     `,
   },
+  {
+    id: '0027_targeted_market_recovery',
+    description: 'Persistent mint history searches and same-second chain migrations',
+    up: `
+      CREATE TABLE IF NOT EXISTS solana_creation_searches (
+        program_address TEXT NOT NULL,
+        mint TEXT NOT NULL,
+        progress JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY(program_address,mint)
+      );
+      ALTER TABLE token_markets DROP CONSTRAINT IF EXISTS token_markets_interval_valid;
+      ALTER TABLE token_markets ADD CONSTRAINT token_markets_interval_valid CHECK (
+        active_until IS NULL OR active_until > active_from OR
+        (active_until = active_from AND source_event_kind='chain' AND venue='pump_fun_bonding_curve')
+      );
+      CREATE OR REPLACE FUNCTION token_market_allow_close_only()
+        RETURNS TRIGGER AS $$
+      BEGIN
+        IF TG_OP = 'DELETE' THEN
+          RAISE EXCEPTION 'token market intervals cannot be deleted'
+            USING ERRCODE = 'restrict_violation';
+        END IF;
+        IF OLD.active_until IS NOT NULL
+          OR NEW.active_until IS NULL
+          OR NEW.active_until < OLD.active_from
+          OR (NEW.active_until = OLD.active_from AND (OLD.source_event_kind <> 'chain' OR OLD.venue <> 'pump_fun_bonding_curve'))
+          OR NEW.token_market_id IS DISTINCT FROM OLD.token_market_id
+          OR NEW.token_id IS DISTINCT FROM OLD.token_id
+          OR NEW.venue IS DISTINCT FROM OLD.venue
+          OR NEW.market_address IS DISTINCT FROM OLD.market_address
+          OR NEW.active_from IS DISTINCT FROM OLD.active_from
+          OR NEW.source_event_kind IS DISTINCT FROM OLD.source_event_kind
+          OR NEW.source_event_key IS DISTINCT FROM OLD.source_event_key
+          OR NEW.transaction_signature IS DISTINCT FROM OLD.transaction_signature
+          OR NEW.instruction_index IS DISTINCT FROM OLD.instruction_index
+          OR NEW.inner_instruction_index IS DISTINCT FROM OLD.inner_instruction_index
+          OR NEW.log_index IS DISTINCT FROM OLD.log_index
+          OR NEW.slot IS DISTINCT FROM OLD.slot
+          OR NEW.provenance IS DISTINCT FROM OLD.provenance
+          OR NEW.recorded_at IS DISTINCT FROM OLD.recorded_at THEN
+          RAISE EXCEPTION 'token market intervals may only be closed once'
+            USING ERRCODE = 'restrict_violation';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+    `,
+  },
 ];
 
 export const REQUIRED_TABLES: readonly string[] = [
+  'solana_creation_searches',
   'nit_semantic_nodes',
   'nit_semantic_members',
   'nit_media_objects',
