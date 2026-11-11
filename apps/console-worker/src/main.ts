@@ -2,6 +2,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { bootstrap } from '@nit/composition';
+import { failure } from '@nit/domain';
 import {
   CandidateResolver,
   ConsoleOptions,
@@ -9,21 +10,25 @@ import {
   TelegramBotApi,
   TelegramDecisionConsole,
 } from '@nit/decision-console';
-import { PostgresPaperMarketFeed, PostgresPaperTrader } from '@nit/trading';
+import { PaperMarketFeed, PostgresPaperMarketFeed, PostgresPaperTrader } from '@nit/trading';
 
 async function main(): Promise<void> {
   const path = process.env['NIT_CONSOLE_CONFIG_PATH'];
-  const token = process.env['NIT_TELEGRAM_BOT_TOKEN'];
+  const token = process.env['NIT_TELEGRAM_BOT_TOKEN']?.trim();
   if (path === undefined || extname(path).toLowerCase() !== '.json' || token === undefined)
     throw new Error('Configure NIT_CONSOLE_CONFIG_PATH and NIT_TELEGRAM_BOT_TOKEN');
   if ((await stat(path)).size > 1_048_576) throw new Error('Console configuration exceeds 1 MiB');
   const config = JSON.parse(await readFile(path, 'utf8')) as {
+    mode?: 'monitor' | 'paper';
     console: ConsoleOptions;
     resolver: ResolverPolicy;
     cashAsset: string;
     approvedMarketSources: string[];
     cycleIntervalMs: number;
   };
+  const monitorOnly = config.mode === 'monitor';
+  if (config.mode !== undefined && !['monitor', 'paper'].includes(config.mode))
+    throw new Error('Invalid console mode');
   if (
     !Number.isSafeInteger(config.cycleIntervalMs) ||
     config.cycleIntervalMs < 100 ||
@@ -31,7 +36,7 @@ async function main(): Promise<void> {
   )
     throw new Error('Console cycleIntervalMs must be between 100 and 60000');
   const api = new TelegramBotApi(token);
-  const { db } = await bootstrap(process.env['NIT_CONFIG_PATH'], {
+  const { db, logger } = await bootstrap(process.env['NIT_CONFIG_PATH'], {
     bindDevelopmentToyProviders: false,
     requiredProviderSlots: [],
   });
@@ -41,16 +46,27 @@ async function main(): Promise<void> {
   process.on('SIGTERM', stop);
   try {
     const clock = { now: (): Date => new Date() };
-    const feed = new PostgresPaperMarketFeed(db, config.approvedMarketSources);
-    const resolver = new CandidateResolver(db, feed, clock, config.resolver, config.cashAsset);
+    const feed: PaperMarketFeed = monitorOnly
+      ? {
+          latest: () =>
+            Promise.resolve(failure(new Error('Paper market access disabled in monitoring mode'))),
+        }
+      : new PostgresPaperMarketFeed(db, config.approvedMarketSources);
+    const resolver = monitorOnly
+      ? null
+      : new CandidateResolver(db, feed, clock, config.resolver, config.cashAsset);
     const consoleService = new TelegramDecisionConsole(
       db,
       api,
       feed,
       new PostgresPaperTrader(db, clock),
       clock,
-      config.console
+      { ...config.console, monitorOnly }
     );
+    logger.info('Telegram console started', {
+      mode: monitorOnly ? 'monitor' : 'paper',
+      operatorCount: config.console.operators.length,
+    });
     // Polling waits independently; it cannot delay resolver coalescing or protection notifications.
     const loop = async (operation: () => Promise<void>, interval: number): Promise<void> => {
       while (!shutdown.signal.aborted) {
@@ -71,8 +87,10 @@ async function main(): Promise<void> {
       loop(() => consoleService.poll(shutdown.signal), 1000),
       loop(async () => {
         await consoleService.flush();
-        await resolver.cycle();
-        await consoleService.executeTrades();
+        if (resolver !== null) {
+          await resolver.cycle();
+          await consoleService.executeTrades();
+        }
         try {
           await consoleService.notify();
         } finally {

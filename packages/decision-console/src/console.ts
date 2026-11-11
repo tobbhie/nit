@@ -33,6 +33,7 @@ export interface ConsoleOptions {
   readonly operators: readonly ConsoleOperator[];
   readonly actionTtlMs: number;
   readonly maxOutbox: number;
+  readonly monitorOnly?: boolean;
 }
 interface Action {
   action_token: string;
@@ -82,6 +83,8 @@ export class TelegramDecisionConsole {
       throw new Error('Configure 1 to 16 Telegram operators');
     const identities = new Set<string>();
     for (const operator of options.operators) {
+      if (options.monitorOnly && (operator.role !== 'viewer' || operator.portfolioIds.length !== 0))
+        throw new Error('Monitoring requires viewers without paper portfolios');
       if (
         !/^\d+$/.test(operator.userId) ||
         !/^-?\d+$/.test(operator.chatId) ||
@@ -358,6 +361,7 @@ export class TelegramDecisionConsole {
   }
 
   async executeTrades(limit = 4): Promise<void> {
+    if (this.options.monitorOnly) return;
     integer(limit, 1, 16);
     const rows = await paperRows<Action>(
       this.db,
@@ -637,7 +641,33 @@ export class TelegramDecisionConsole {
       );
       if (inserted.length === 0) return;
       let response: string;
-      if (command === '/candidates') {
+      if (command === '/status' || command === '/health') {
+        const [status] = await paperRows<{
+          tokens: string;
+          wallet_cursors: string;
+          wallet_swaps: string;
+          observations: string;
+          last_discovery: Date | null;
+        }>(
+          db,
+          `SELECT
+          (SELECT COUNT(*)::text FROM tokens) AS tokens,
+          (SELECT COUNT(*)::text FROM wallet_reconciliation_cursors) AS wallet_cursors,
+          (SELECT COUNT(*)::text FROM wallet_swaps) AS wallet_swaps,
+          (SELECT COUNT(*)::text FROM observations) AS observations,
+          (SELECT MAX(discovered_at) FROM tokens) AS last_discovery`
+        );
+        if (status === undefined) throw new Error('Status unavailable');
+        response =
+          `NIT console online\nMode: ${this.options.monitorOnly ? 'MONITOR ONLY' : 'PAPER'}\n` +
+          `Database: reachable\nPersisted tokens: ${status.tokens}\nWallet cursors: ${status.wallet_cursors}\n` +
+          `Captured wallet swaps: ${status.wallet_swaps}\nSource observations: ${status.observations}\n` +
+          `Last token discovery: ${status.last_discovery?.toISOString() ?? 'unavailable'}\n` +
+          'Persisted counts do not establish worker health or complete source coverage.\nLive execution is unavailable in this console.';
+      } else if (command === '/ping' || command === '/test-alert') {
+        response =
+          'NIT TEST ALERT: Telegram command received and delivery queued. No trade or source ingestion was triggered.';
+      } else if (command === '/candidates') {
         const rows = await paperRows<{ report: CandidateReport }>(
           db,
           'SELECT report FROM candidate_scenarios WHERE narrative_id=$1',
@@ -806,8 +836,9 @@ export class TelegramDecisionConsole {
         response =
           'Dataset creation and bounded replay scheduling use @nit/app-research-worker. Use /run-report <experiment> for authorized results. No backtest has been started by this command.';
       } else
-        response =
-          '/candidates <narrative> · /strategies · /strategy <portfolio> · /use <portfolio> · /portfolio · /positions · /pause <portfolio> · /resume <portfolio> · /stop <position> <price> · /outbox\nPaper only; no live execution.';
+        response = this.options.monitorOnly
+          ? '/status · /health · /ping · /test-alert · /outbox\nMONITOR ONLY: paper trading controls are disabled.'
+          : '/candidates <narrative> · /strategies · /strategy <portfolio> · /use <portfolio> · /portfolio · /positions · /pause <portfolio> · /resume <portfolio> · /stop <position> <price> · /outbox\nPaper only; no live execution.';
       await this.enqueue(db, operator, { text: response.slice(0, 4000) }, `command:${updateId}`);
     });
     if (result.kind === 'failure') throw result.error;
@@ -1008,6 +1039,7 @@ export class TelegramDecisionConsole {
   }
   private requireTrader(operator: ConsoleOperator, portfolio: PortfolioId | null): void {
     if (
+      this.options.monitorOnly ||
       operator.role !== 'trader' ||
       (portfolio !== null && !operator.portfolioIds.includes(portfolio))
     )

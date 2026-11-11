@@ -157,6 +157,81 @@ describe.skipIf(!hasTestDatabase())(
       return Number(rows[0]?.count);
     }
 
+    function monitoring(): TelegramDecisionConsole {
+      return new TelegramDecisionConsole(db, api, feed, new PostgresPaperTrader(db, clock), clock, {
+        botName,
+        monitorOnly: true,
+        actionTtlMs: 10000,
+        maxOutbox: 64,
+        operators: [{ userId: '1', chatId: '10', role: 'viewer', portfolioIds: [] }],
+      });
+    }
+    it('provides authenticated monitoring status and delivery checks without mutating paper runs', async () => {
+      consoleService = monitoring();
+      await command('/status', 2);
+      await consoleService.flush();
+      expect(api.sent).toHaveLength(0);
+      await command('/status');
+      await consoleService.flush();
+      expect(api.sent.at(-1)?.body.text).toContain('Mode: MONITOR ONLY');
+      expect(api.sent.at(-1)?.body.text).toContain('Database: reachable');
+      const before = await paperRows(db, 'SELECT status FROM strategy_runs ORDER BY run_id');
+      await command(`/pause ${portfolioId}`);
+      await consoleService.flush();
+      expect(api.sent.at(-1)?.body.text).toContain('not authorized');
+      expect(await paperRows(db, 'SELECT status FROM strategy_runs ORDER BY run_id')).toEqual(
+        before
+      );
+      await command('/test-alert');
+      await consoleService.flush();
+      expect(api.sent.at(-1)?.body.text).toContain('NIT TEST ALERT');
+      await consoleService.handleUpdate({
+        update_id: updateId,
+        message: {
+          message_id: updateId,
+          from: { id: 1 },
+          chat: { id: 10 },
+          text: '/test-alert',
+        },
+      });
+      const sent = api.sent.length;
+      await consoleService.flush();
+      expect(api.sent).toHaveLength(sent);
+      expect(await count('orders')).toBe(0);
+    });
+    it('does not process previously confirmed paper requests in monitoring mode', async () => {
+      const id = await narrative();
+      await resolve(id);
+      await report(id);
+      await click(button('Buy (paper)'));
+      await consoleService.flush(16);
+      const confirm = button('Confirm paper request');
+      await click(confirm);
+      consoleService = monitoring();
+      await consoleService.executeTrades();
+      expect(await count('orders')).toBe(0);
+      expect(
+        await paperRows(db, 'SELECT status FROM console_trade_requests WHERE action_token=$1', [
+          confirm.token,
+        ])
+      ).toEqual([{ status: 'pending' }]);
+    });
+    it('refuses trader permissions or paper portfolio scope in monitoring mode', () => {
+      for (const operator of [
+        { userId: '1', chatId: '10', role: 'trader' as const, portfolioIds: [] },
+        { userId: '1', chatId: '10', role: 'viewer' as const, portfolioIds: [portfolioId] },
+      ])
+        expect(
+          () =>
+            new TelegramDecisionConsole(db, api, feed, new PostgresPaperTrader(db, clock), clock, {
+              botName,
+              monitorOnly: true,
+              actionTtlMs: 10000,
+              maxOutbox: 64,
+              operators: [operator],
+            })
+        ).toThrow('Monitoring requires viewers');
+    });
     it('preserves competing mints and separates narrative qualification from wallet confirmation', async () => {
       const id = await narrative([
         { tokenMint: TOKEN, linkConfidenceBps: 9000, reasonCodes: ['LINK'] },
